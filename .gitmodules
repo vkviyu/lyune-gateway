@@ -1,0 +1,6 @@
+[submodule "libs/picoquic"]
+	path = libs/picoquic
+	url = https://github.com/private-octopus/picoquic.git
+[submodule "libs/picotls"]
+	path = libs/picotls
+	url = https://github.com/h2o/picotls.git
