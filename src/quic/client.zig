@@ -18,7 +18,7 @@ pub const Client = struct {
     connection: ?Connection = null,
 
     /// 配置
-    config: Config.ClientConfig,
+    config: Config.QuicConfig,
 
     /// 内存分配器
     allocator: std.mem.Allocator,
@@ -27,7 +27,7 @@ pub const Client = struct {
     callback_ctx: *CallbackContext,
 
     /// 创建 QUIC 客户端
-    pub fn init(allocator: std.mem.Allocator, config: Config.ClientConfig) Error!Client {
+    pub fn init(allocator: std.mem.Allocator, config: Config.QuicConfig) Error!Client {
         // 创建回调上下文
         const callback_ctx = try allocator.create(CallbackContext);
         callback_ctx.* = .{
@@ -92,14 +92,14 @@ pub const Client = struct {
     }
 
     /// 连接到服务器
-    pub fn connect(self: *Client) Error!*Connection {
+    pub fn connect(self: *Client, host: [:0]const u8, port: u16, sni: [:0]const u8) Error!*Connection {
         // 解析服务器地址
         var server_addr: quic_c.SockAddrStorage = undefined;
         var is_name: c_int = 0;
 
         const rc = quic_c.getServerAddress(
-            self.config.server_host.ptr,
-            @intCast(self.config.server_port),
+            host,
+            @intCast(port),
             &server_addr,
             &is_name,
         );
@@ -108,7 +108,6 @@ pub const Client = struct {
         }
 
         const now = quic_c.currentTime();
-        const sni = self.config.sni orelse self.config.server_host;
 
         // 创建连接
         const cnx = quic_c.c.picoquic_create_cnx(
@@ -237,7 +236,7 @@ fn clientStreamCallback(
 ) callconv(.c) c_int {
     _ = stream_ctx;
 
-    const ctx: *CallbackContext = @alignCast(@ptrCast(callback_ctx orelse return 0));
+    const ctx: *CallbackContext = @ptrCast(@alignCast(callback_ctx orelse return 0));
     const conn_ptr = cnx orelse return 0;
 
     var connection = Connection.fromRaw(conn_ptr);
@@ -309,7 +308,7 @@ fn clientLoopCallback(
     _ = quic;
     _ = callback_arg;
 
-    const ctx: *CallbackContext = @alignCast(@ptrCast(callback_ctx orelse return 0));
+    const ctx: *CallbackContext = @ptrCast(@alignCast(callback_ctx orelse return 0));
 
     return switch (cb_mode) {
         quic_c.c.picoquic_packet_loop_after_receive,

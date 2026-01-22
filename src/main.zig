@@ -1,7 +1,8 @@
 const std = @import("std");
 const xev = @import("xev");
 const builtin = @import("builtin");
-const quic = @import("quic.zig");
+const quic = @import("quic/mod.zig"); // 注意这里路径可能需要根据你的实际情况调整
+const gateway = @import("gateway/mod.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
@@ -15,9 +16,20 @@ pub fn main() !void {
     if (args.len > 1) {
         const cmd = args[1];
         if (std.mem.eql(u8, cmd, "server")) {
-            // 检查是否有 --legacy 参数
-            const use_legacy = args.len > 2 and std.mem.eql(u8, args[2], "--legacy");
-            try runServer(allocator, use_legacy);
+            var threads: ?usize = null;
+
+            var i: usize = 2;
+            while (i < args.len) : (i += 1) {
+                const arg = args[i];
+                if (std.mem.eql(u8, arg, "--threads")) {
+                    if (i + 1 < args.len) {
+                        threads = std.fmt.parseInt(usize, args[i + 1], 10) catch null;
+                        i += 1;
+                    }
+                }
+            }
+
+            try runServer(allocator, threads);
         } else if (std.mem.eql(u8, cmd, "client")) {
             try runClient(allocator);
         } else if (std.mem.eql(u8, cmd, "xev-demo")) {
@@ -35,11 +47,9 @@ fn printUsage() void {
         \\Lyune Gateway - High Performance IM Gateway
         \\
         \\Usage:
-        \\  lyune-gateway server [--legacy]  - 启动 QUIC 服务端
-        \\                                     默认使用 libxev 高性能事件循环
-        \\                                     --legacy 使用 picoquic 原生循环
-        \\  lyune-gateway client             - 运行 QUIC 客户端示例
-        \\  lyune-gateway xev-demo           - 运行 libxev 演示
+        \\  lyune-gateway server [--threads N]  - 启动 QUIC 服务端
+        \\  lyune-gateway client                - 运行 QUIC 客户端示例 (Blocking)
+        \\  lyune-gateway xev-demo              - 运行 libxev 演示
         \\
         \\需要先生成测试证书:
         \\  openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
@@ -48,80 +58,65 @@ fn printUsage() void {
     , .{});
 }
 
-/// QUIC 服务端示例
-fn runServer(allocator: std.mem.Allocator, use_legacy: bool) !void {
-    if (use_legacy) {
-        std.log.info("Starting QUIC server on port 4433 (legacy mode: picoquic event loop)...", .{});
+/// QUIC 服务端
+fn runServer(allocator: std.mem.Allocator, threads: ?usize) !void {
+    const num_threads = threads orelse std.Thread.getCpuCount() catch 1;
+    std.log.info("Starting Gateway on port 4433 (libxev: {s}) with {} threads...", .{ @tagName(builtin.os.tag), num_threads });
+
+    if (num_threads <= 1) {
+        try runSingleWorker(allocator, 0);
     } else {
-        std.log.info("Starting QUIC server on port 4433 (libxev: {s})...", .{@tagName(builtin.os.tag)});
-    }
+        // 多线程模式：Thread-per-Core
+        const handles = try allocator.alloc(std.Thread, num_threads);
+        defer allocator.free(handles);
 
-    var server = quic.Server.init(allocator, .{
-        .cert_file = "server.crt",
-        .key_file = "server.key",
-        .port = 4433,
-        .base = .{
-            .alpn = "lyune-im",
-            .max_connections = 1000,
-        },
-    }) catch |err| {
-        std.log.err("Failed to create server: {}", .{err});
-        std.log.err("Make sure server.crt and server.key exist.", .{});
-        std.log.err("Generate with: openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes -subj \"/CN=localhost\"", .{});
-        return err;
-    };
-    defer server.deinit();
-
-    // 设置连接回调
-    server.onConnection(struct {
-        fn callback(conn: *quic.Connection) void {
-            const cid = conn.getConnectionIdBytes();
-            std.log.info("New connection: {x}", .{cid});
+        for (handles, 0..) |*handle, i| {
+            // 每个线程运行一个独立的 GatewayWorker
+            handle.* = try std.Thread.spawn(.{}, runSingleWorker, .{ allocator, @as(u8, @intCast(i)) });
         }
-    }.callback);
 
-    // 设置数据接收回调
-    server.onStreamData(struct {
-        fn callback(conn: *quic.Connection, stream_id: u64, data: []const u8, is_fin: bool) void {
-            std.log.info("Stream {}: received {} bytes, fin={}", .{ stream_id, data.len, is_fin });
-
-            if (data.len > 0) {
-                std.log.info("Data: {s}", .{data});
-
-                // Echo 回复
-                const response = "Hello from Lyune Gateway!";
-                conn.streamWrite(stream_id, response, true) catch |err| {
-                    std.log.err("Failed to send response: {}", .{err});
-                };
-            }
+        for (handles) |t| {
+            t.join();
         }
-    }.callback);
-
-    // 设置断开回调
-    server.onConnectionClose(struct {
-        fn callback(conn: *quic.Connection) void {
-            const cid = conn.getConnectionIdBytes();
-            std.log.info("Connection closed: {x}", .{cid});
-        }
-    }.callback);
-
-    std.log.info("Server ready, waiting for connections...", .{});
-
-    // 根据参数选择事件循环
-    if (use_legacy) {
-        try server.run();
-    } else {
-        try server.runWithXev();
     }
 }
 
+/// 运行单个 Worker 实例 (原 Server)
+fn runSingleWorker(allocator: std.mem.Allocator, thread_id: u8) !void {
+    // 使用 GatewayWorker 而不是 Server
+    // 确保 gateway/mod.zig 中导出了 GatewayWorker
+    var worker = gateway.GatewayWorker.init(allocator, .{
+        .cert_file = "server.crt",
+        .key_file = "server.key",
+        .bind_address = .{ 0, 0, 0, 0 },
+        .bind_port = 4433,
+        .base = .{
+            .alpn = "lyune-im",
+            .max_connections = 10000,
+            .idle_timeout_ms = 30000,
+        },
+    }, thread_id) catch |err| {
+        std.log.err("Failed to create gateway worker: {}", .{err});
+        std.log.err("Make sure server.crt and server.key exist.", .{});
+        return err;
+    };
+    defer worker.deinit();
+
+    // 启动 Worker (阻塞直到停止)
+    // Worker 内部会初始化 ServerDriver 并驱动事件循环
+    try worker.run();
+}
+
 /// QUIC 客户端示例
+/// 注意：这是用于测试的同步阻塞客户端 (基于 quic/client.zig)，
+/// 不是 Gateway 内部使用的异步客户端 (driver/client.zig)。
 fn runClient(allocator: std.mem.Allocator) !void {
     std.log.info("Connecting to QUIC server at localhost:4433...", .{});
 
+    // 假设 quic.zig 导出了同步 Client (原 Client 封装)
     var client = quic.Client.init(allocator, .{
-        .server_host = "localhost",
-        .server_port = 4433,
+        .bind_address = .{ 127, 0, 0, 1 },
+        .bind_port = 4433,
         .base = .{
             .alpn = "lyune-im",
         },
@@ -131,17 +126,16 @@ fn runClient(allocator: std.mem.Allocator) !void {
     };
     defer client.deinit();
 
-    // 连接到服务器
-    const conn = client.connect() catch |err| {
+    const conn = client.connect("127.0.0.1", 4433, "localhost") catch |err| {
         std.log.err("Failed to connect: {}", .{err});
         return err;
     };
 
     std.log.info("Connected! Connection ID: {x}", .{conn.getConnectionIdBytes()});
 
-    // 发送请求并等待响应
     var response_buf: [4096]u8 = undefined;
-    const response = client.sendAndReceive("Hello, Server!", &response_buf) catch |err| {
+    // 发送 hello 并等待回响
+    const response = client.sendAndReceive("Hello from Client!", &response_buf) catch |err| {
         std.log.err("Failed to send/receive: {}", .{err});
         return err;
     };
@@ -149,7 +143,7 @@ fn runClient(allocator: std.mem.Allocator) !void {
     std.log.info("Received response: {s}", .{response});
 }
 
-/// libxev 演示
+/// libxev 演示 (保持不变，用于测试环境)
 fn runXevDemo() !void {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();

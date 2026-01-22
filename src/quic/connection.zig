@@ -18,7 +18,7 @@ pub const Connection = struct {
     }
 
     /// 获取连接状态
-    /// 
+    ///
     /// 调用 C 函数获取链接状态，然后用 @enumFromInt 把整数转换为我们定义的枚举类型
     pub fn getState(self: *const Connection) quic_c.ConnectionState {
         const state = quic_c.c.picoquic_get_cnx_state(self.inner);
@@ -46,7 +46,7 @@ pub const Connection = struct {
     }
 
     /// 获取连接 ID 的字节表示
-    /// 
+    ///
     /// 直接调用 picoquic C 函数获取连接 ID
     pub fn getConnectionIdBytes(self: *const Connection) []const u8 {
         const cid = self.getLocalConnectionId();
@@ -73,7 +73,7 @@ pub const Connection = struct {
     }
 
     /// 标记 stream 为活跃状态
-    /// 
+    ///
     /// picoquic 会在下次发送时处理该 stream
     pub fn markStreamActive(
         self: *Connection,
@@ -93,7 +93,7 @@ pub const Connection = struct {
     }
 
     /// 关闭 stream
-    /// 
+    ///
     /// 发送 RESET_STREAM 帧关闭 stream
     pub fn closeStream(self: *Connection, stream_id: u64) void {
         _ = quic_c.c.picoquic_reset_stream(self.inner, stream_id, 0);
@@ -124,83 +124,3 @@ pub const Connection = struct {
         ConnectionClosed,
     };
 };
-
-/// 连接管理器
-/// 用于管理多个连接，通过 Connection ID 查找
-pub fn ConnectionManager(comptime Context: type) type {
-    return struct {
-        const Self = @This();
-        // 存储分配器
-        allocator: std.mem.Allocator,
-        // AutoHashMap 是自动选择哈希函数的哈希表
-        connections: std.AutoHashMap(u64, *ManagedConnection),
-
-        /// 嵌套结构体，包含连接和用户上下文
-        pub const ManagedConnection = struct {
-            connection: Connection,
-            context: Context,
-        };
-
-        /// 初始化连接管理器
-        pub fn init(allocator: std.mem.Allocator) Self {
-            return .{
-                .allocator = allocator,
-                .connections = std.AutoHashMap(u64, *ManagedConnection).init(allocator),
-            };
-        }
-
-        /// 销毁连接管理器：遍历释放所有连接，然后释放哈希表
-        pub fn deinit(self: *Self) void {
-            var iter = self.connections.valueIterator();
-            while (iter.next()) |managed| {
-                self.allocator.destroy(managed.*);
-            }
-            self.connections.deinit();
-        }
-
-        /// 添加连接
-        /// 
-        /// 分配新的 ManagedConnection，用 Connection ID 哈希值作为 key 存入哈希表
-        pub fn add(self: *Self, conn: Connection, context: Context) !*ManagedConnection {
-            const managed = try self.allocator.create(ManagedConnection);
-            managed.* = .{
-                .connection = conn,
-                .context = context,
-            };
-
-            const cid_bytes = conn.getConnectionIdBytes();
-            const key = hashConnectionId(cid_bytes);
-            try self.connections.put(key, managed);
-
-            return managed;
-        }
-
-        /// 通过连接 ID 字节查找连接
-        pub fn get(self: *Self, cid_bytes: []const u8) ?*ManagedConnection {
-            const key = hashConnectionId(cid_bytes);
-            return self.connections.get(key);
-        }
-
-        /// 释放并移除连接
-        pub fn remove(self: *Self, cid_bytes: []const u8) void {
-            const key = hashConnectionId(cid_bytes);
-            if (self.connections.fetchRemove(key)) |entry| {
-                self.allocator.destroy(entry.value);
-            }
-        }
-
-        /// 返回当前管理的连接数
-        pub fn count(self: *const Self) usize {
-            return self.connections.count();
-        }
-
-        /// 简单的哈希函数，把 Connection ID 字节转为 u64。*% 和 +% 是溢出包装运算符（溢出时回绕而不是报错）。
-        fn hashConnectionId(cid: []const u8) u64 {
-            var hash: u64 = 0;
-            for (cid) |byte| {
-                hash = hash *% 31 +% byte;
-            }
-            return hash;
-        }
-    };
-}

@@ -64,32 +64,21 @@ pub const Config = struct {
 };
 
 /// 服务端配置（包含证书）
-pub const ServerConfig = struct {
+pub const QuicConfig = struct {
     base: Config = .{},
 
     /// 证书文件路径（必需）
-    cert_file: [:0]const u8,
+    cert_file: ?[:0]const u8 = null,
 
     /// 私钥文件路径（必需）
-    key_file: [:0]const u8,
+    key_file: ?[:0]const u8 = null,
 
-    /// 监听端口
-    port: u16 = 4433,
+    /// 绑定端口
+    /// 默认为 0 (由操作系统随机分配)，适用于客户端
+    /// 服务端初始化时应显式指定为 4433 等
+    bind_port: u16 = 0,
 
-    /// 监听地址（null 表示所有地址）
-    bind_address: ?[:0]const u8 = null,
-};
-
-/// 客户端配置
-pub const ClientConfig = struct {
-    base: Config = .{},
-
-    /// 服务器主机名
-    server_host: [:0]const u8,
-
-    /// 服务器端口
-    server_port: u16 = 4433,
-
-    /// SNI 名称（默认使用 server_host）
-    sni: ?[:0]const u8 = null,
+    /// 绑定地址
+    /// 默认为 0.0.0.0 (IPv4 Any)，适用于客户端或默认服务端
+    bind_address: [4]u8 = .{ 0, 0, 0, 0 },
 };
