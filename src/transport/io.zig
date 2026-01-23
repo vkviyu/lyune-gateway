@@ -289,13 +289,6 @@ pub const IoLoop = struct {
         std.log.info("IoLoop started on port {}", .{self.local_addr.getPort()});
     }
 
-    /// 运行事件循环
-    pub fn run(self: *Self) Error!void {
-        self.start();
-        self.loop.run(.until_done) catch return Error.LoopRunFailed;
-        self.running = false;
-    }
-
     /// 停止事件循环
     pub fn stop(self: *Self) void {
         self.running = false;

@@ -48,24 +48,16 @@ pub const AsyncClient = struct {
     /// loop: 外部传入的 xev.Loop（通常是 GatewayWorker 的 loop）
     pub fn init(
         allocator: std.mem.Allocator,
-        config: Config.ClientConfig,
+        config: Config.QuicConfig,
         loop: *xev.Loop,
     ) Error!Self {
-        // 1. 适配配置：将 ClientConfig 转换为 Endpoint 需要的 ServerConfig
-        // Endpoint 本身是通用的，但在 init 时目前需要 ServerConfig。
-        // 我们构造一个仅包含必要字段的配置。
-        var quic_config: Config.QuicConfig = undefined;
-        quic_config.base = config.base;
-        quic_config.port = 0; // 客户端绑定随机端口
-        quic_config.bind_address = [4]u8{ 0, 0, 0, 0 };
-
         // 2. 初始化 Endpoint
         // thread_id 传 0 即可，客户端通常不需要复杂的 CID 路由
-        var endpoint = try Endpoint.init(allocator, quic_config, 0, null);
+        var endpoint = try Endpoint.init(allocator, config, 0, null);
         errdefer endpoint.deinit();
 
         // 3. 初始化 IoLoop (绑定随机端口)
-        var io_loop = try IoLoop.init(allocator, quic_config.bind_address, 0, loop);
+        var io_loop = try IoLoop.init(allocator, config.bind_address, config.bind_port, loop);
         errdefer io_loop.deinit();
 
         return .{
@@ -264,3 +256,13 @@ pub const AsyncClient = struct {
         return @as(*Self, @ptrCast(@alignCast(ctx)));
     }
 };
+
+// test "AsyncClient" {
+//     var loop = try xev.Loop.init(.{});
+//     var client = try AsyncClient.init(std.testing.allocator, .{ .base = .{ .alpn = "lyune-gateway", .root_cert_file = "server.crt" } }, loop);
+    
+//     client.setCallbacks(null, null)
+//     client.start();
+//     try loop.run(.until_done);
+
+// }
