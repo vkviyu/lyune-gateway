@@ -41,6 +41,7 @@ pub const Client = struct {
             .finished = false,
             .pending_data = null,
             .data_sent = false,
+            .handshake_success = false,
         };
 
         // 创建 reset seed
@@ -52,9 +53,9 @@ pub const Client = struct {
         // 创建 QUIC 上下文
         const quic_ctx = quic_c.c.picoquic_create(
             1, // max connections (客户端只需要1个)
-            null, // cert file (客户端不需要)
-            null, // key file
-            config.base.root_cert_file orelse null, // root cert
+            if (config.cert_file) |s| s.ptr else null,
+            if (config.key_file) |s| s.ptr else null,
+            if (config.base.root_cert_file) |s| s.ptr else null, // root cert
             config.base.alpn.ptr, // alpn
             clientStreamCallback, // callback
             callback_ctx, // callback context
@@ -174,6 +175,11 @@ pub const Client = struct {
             return Error.ReceiveFailed;
         }
 
+        // 如果循环结束了，但是握手从未成功，说明连接失败（超时或拒绝）
+        if (!self.callback_ctx.handshake_success) {
+            return Error.ConnectFailed; // 或者 Error.ConnectionRefused
+        }
+
         return response_buf[0..self.callback_ctx.response_len];
     }
 
@@ -222,6 +228,9 @@ const CallbackContext = struct {
     // 待发送的数据
     pending_data: ?[]const u8,
     data_sent: bool,
+
+    // 握手是否成功
+    handshake_success: bool = false,
 };
 
 /// 客户端 Stream 回调
@@ -263,6 +272,7 @@ fn clientStreamCallback(
             }
         },
         .ready => {
+            ctx.handshake_success = true;
             // 连接就绪，发送待发送的数据
             if (!ctx.data_sent) {
                 if (ctx.pending_data) |data| {
