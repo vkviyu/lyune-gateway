@@ -2,9 +2,6 @@
 //!
 //! 定义帧格式、消息类型和编解码逻辑。
 
-// 消息类型定义
-pub const MsgType = @import("message.zig").MsgType;
-
 // 帧格式
 pub const frame = @import("frame.zig");
 pub const FrameHeader = frame.FrameHeader;
