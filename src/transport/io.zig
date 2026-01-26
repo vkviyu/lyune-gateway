@@ -5,21 +5,31 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
 const xev = @import("xev");
+
 const err_handler = @import("../common/mod.zig").err;
 const quic_c = @import("../quic/c.zig");
 
 /// 最大数据包大小
 pub const MAX_PACKET_SIZE = 1500;
 
-/// 待发送的数据包结构
+/// 上层传入的待发送数据包结构（不拥有数据所有权）
 pub const Packet = struct {
     data: []const u8,
     dest: std.net.Address,
 };
 
-/// 收包回调类型
-/// timestamp: picoquic 时间戳（微秒），由 picoquic_current_time() 获取
+/// 内部队列使用的拥有数据所有权的包结构
+const OwnedPacket = struct {
+    data: []u8,
+    dest: std.net.Address,
+
+    fn deinit(self: *const OwnedPacket, allocator: std.mem.Allocator) void {
+        allocator.free(self.data);
+    }
+};
+
 pub const RecvCallback = *const fn (
     ctx: *anyopaque,
     data: []const u8,
@@ -27,98 +37,86 @@ pub const RecvCallback = *const fn (
     timestamp: u64,
 ) void;
 
-/// I/O 事件循环
-///
-/// 纯粹的 UDP I/O 抽象，不包含任何协议逻辑。
-/// 上层（如 QUIC Endpoint）通过回调接收数据。
-///
-/// 需要外部传入 xev.Loop，支持多个组件共享同一事件循环。
 pub const IoLoop = struct {
     const Self = @This();
 
-    // libxev 组件
     loop: *xev.Loop,
-    socket: std.posix.socket_t,
+    udp: xev.UDP,
     timer: xev.Timer,
     async_notify: xev.Async,
 
-    // 状态
     running: bool = false,
     local_addr: std.net.Address,
     allocator: std.mem.Allocator,
 
-    // 回调
     recv_callback: ?RecvCallback = null,
     callback_ctx: ?*anyopaque = null,
     timer_callback: ?*const fn (ctx: *anyopaque) void = null,
+
+    // 当前生效的定时间隔
     timer_interval_ms: u64 = 1,
 
-    // 定时器状态
-    timer_pending: bool = false,
-    timer_needs_reschedule: bool = false,
+    recv_state: xev.UDP.State = undefined,
+    send_state: xev.UDP.State = undefined,
 
     // Completions
     recv_completion: xev.Completion = undefined,
+    send_completion: xev.Completion = undefined,
     timer_completion: xev.Completion = undefined,
     async_completion: xev.Completion = undefined,
+    cancel_completion: xev.Completion = undefined,
 
-    // 缓冲区
     recv_buf: [MAX_PACKET_SIZE]u8 = undefined,
-    send_buf: [MAX_PACKET_SIZE]u8 = undefined,
 
-    client_addr: std.posix.sockaddr = undefined,
-    client_addr_size: std.posix.socklen_t = undefined,
+    // 使用 Unmanaged 以便手动管理内存
+    send_queue: std.ArrayListUnmanaged(OwnedPacket) = .{},
+    is_sending: bool = false,
 
     pub const Error = error{
         SocketCreateFailed,
         BindFailed,
         TimerInitFailed,
         LoopRunFailed,
+        OutOfMemory,
     };
 
-    /// 初始化 I/O 循环
-    ///
-    /// @param allocator 内存分配器
-    /// @param port 监听端口（0 表示由系统分配）
-    /// @param loop 外部事件循环指针
     pub fn init(allocator: std.mem.Allocator, addr: [4]u8, port: u16, loop: *xev.Loop) Error!Self {
-        const socket = std.posix.socket(
+        const local_addr = std.net.Address.initIp4(addr, port);
+
+        const socket_fd = std.posix.socket(
             std.posix.AF.INET,
             std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK,
             0,
         ) catch return Error.SocketCreateFailed;
 
-        // SO_REUSEPORT 支持多线程
         std.posix.setsockopt(
-            socket,
+            socket_fd,
             std.posix.SOL.SOCKET,
             std.posix.SO.REUSEPORT,
             &std.mem.toBytes(@as(c_int, 1)),
         ) catch |err| {
-            std.log.warn("Failed to set SO_REUSEPORT: {}", .{err});
+            err_handler.reportError(.transport, "setsockopt reuseport failed", err);
         };
 
-        const local_addr = std.net.Address.initIp4(addr, port);
-
-        std.posix.bind(socket, &local_addr.any, local_addr.getOsSockLen()) catch {
-            std.posix.close(socket);
+        std.posix.bind(socket_fd, &local_addr.any, local_addr.getOsSockLen()) catch {
+            std.posix.close(socket_fd);
             return Error.BindFailed;
         };
 
+        const udp = xev.UDP.initFd(socket_fd);
         const timer = xev.Timer.init() catch {
-            std.posix.close(socket);
+            std.posix.close(socket_fd);
             return Error.TimerInitFailed;
         };
-
         const async_notify = xev.Async.init() catch {
             timer.deinit();
-            std.posix.close(socket);
+            std.posix.close(socket_fd);
             return Error.TimerInitFailed;
         };
 
         return .{
             .loop = loop,
-            .socket = socket,
+            .udp = udp,
             .timer = timer,
             .async_notify = async_notify,
             .local_addr = local_addr,
@@ -127,193 +125,233 @@ pub const IoLoop = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.send_queue.items) |pkt| {
+            pkt.deinit(self.allocator);
+        }
+        self.send_queue.deinit(self.allocator);
+
         self.async_notify.deinit();
         self.timer.deinit();
-        std.posix.close(self.socket);
-        // loop 由外部管理，不在这里释放
+        if (builtin.os.tag == .windows) {
+            std.os.windows.CloseHandle(self.udp.fd);
+        } else {
+            std.posix.close(self.udp.fd);
+        }
     }
 
-    /// 设置收包回调
+    pub fn getLocalAddr(self: *Self) std.net.Address {
+        return self.local_addr;
+    }
+
     pub fn onRecv(self: *Self, ctx: *anyopaque, callback: RecvCallback) void {
         self.callback_ctx = ctx;
         self.recv_callback = callback;
     }
 
-    /// 设置定时器回调
     pub fn onTimer(self: *Self, callback: *const fn (ctx: *anyopaque) void, interval_ms: u64) void {
         self.timer_callback = callback;
         self.timer_interval_ms = interval_ms;
     }
 
-    /// 更新定时器间隔
-    /// 如果新间隔比当前等待的更短，通过 Async 立即唤醒事件循环
     pub fn updateTimer(self: *Self, interval_ms: u64) void {
-        const old_interval = self.timer_interval_ms;
-        self.timer_interval_ms = interval_ms;
+        if (interval_ms < self.timer_interval_ms) {
+            self.timer_interval_ms = interval_ms;
 
-        // 如果时间变短了，使用 Async 立即唤醒事件循环
-        // 这比取消定时器更安全，避免了复杂的异步取消逻辑
-        if (interval_ms < old_interval) {
-            self.timer_needs_reschedule = true;
-            self.async_notify.notify() catch {};
+            self.loop.cancel(&self.cancel_completion, &self.timer_completion, void, null, cancelCallback);
+        } else {
+            self.timer_interval_ms = interval_ms;
         }
     }
 
-    /// 发送 UDP 数据包
-    pub fn send(self: *Self, data: []const u8, dest: std.net.Address) !void {
-        _ = try std.posix.sendto(
-            self.socket,
-            data,
-            0,
-            &dest.any,
-            dest.getOsSockLen(),
-        );
+    // <--- 修复：函数签名必须严格匹配
+    // 1. ud: ?*void (因为 loop.cancel 传入了 void 类型)
+    // 2. r: xev.CancelError!void (libxev 将底层 Result 转换为了具体的错误集)
+    fn cancelCallback(
+        ud: ?*void,
+        l: *xev.Loop,
+        c: *xev.Completion,
+        r: xev.CancelError!void,
+    ) xev.CallbackAction {
+        _ = ud;
+        _ = l;
+        _ = c;
+        // 忽略取消结果，如果是 NotFound 说明定时器刚好触发了，这也是符合预期的
+        _ = r catch {};
+        return .disarm;
     }
 
-    /// 批量发送 UDP 数据包
-    /// 在 Linux 上使用 sendmmsg 优化，在其他平台上回退到循环发送
+    pub fn send(self: *Self, data: []const u8, dest: std.net.Address) !void {
+        const pkt = Packet{ .data = data, .dest = dest };
+        try self.sendBatch(&.{pkt});
+    }
+
     pub fn sendBatch(self: *Self, packets: []const Packet) !void {
         if (packets.len == 0) return;
-
+        if (self.is_sending or self.send_queue.items.len > 0) {
+            try self.enqueuePackets(packets);
+            if (!self.is_sending) self.flushSendQueue();
+            return;
+        }
+        var sent_count: usize = 0;
         if (builtin.os.tag == .linux) {
-            const linux = std.os.linux;
-            // 限制单次系统调用的最大数量，防止栈爆炸
-            const BATCH_LIMIT = 32;
-
-            var msgs: [BATCH_LIMIT]linux.mmsghdr = undefined;
-            var iovecs: [BATCH_LIMIT]linux.iovec = undefined;
-            // 确保 sockaddr_storage 有足够的空间和对齐
-            var sockaddrs: [BATCH_LIMIT]std.posix.sockaddr.storage = undefined;
-
-            var i: usize = 0;
-            while (i < packets.len) {
-                const batch_len = @min(packets.len - i, BATCH_LIMIT);
-                const batch = packets[i .. i + batch_len];
-
-                // 1. 准备数据结构
-                for (batch, 0..) |pkt, j| {
-                    const addr_len = pkt.dest.getOsSockLen();
-
-                    // 安全地复制地址
-                    const dest_ptr = @as([*]u8, @ptrCast(&sockaddrs[j]));
-                    const src_ptr = @as([*]const u8, @ptrCast(&pkt.dest.any));
-                    @memcpy(dest_ptr[0..addr_len], src_ptr[0..addr_len]);
-
-                    iovecs[j] = .{
-                        .iov_base = @constCast(pkt.data.ptr),
-                        .iov_len = pkt.data.len,
-                    };
-
-                    msgs[j] = .{
-                        .msg_hdr = .{
-                            .msg_name = @ptrCast(&sockaddrs[j]),
-                            .msg_namelen = addr_len,
-                            .msg_iov = &iovecs[j],
-                            .msg_iovlen = 1,
-                            .msg_control = null,
-                            .msg_controllen = 0,
-                            .msg_flags = 0,
-                        },
-                        .msg_len = 0,
-                    };
-                }
-
-                // 2. 执行 sendmmsg
-                const rc = linux.sendmmsg(
-                    self.socket,
-                    &msgs,
-                    @intCast(batch_len),
-                    0,
-                );
-
-                // 3. 检查返回值 (Zig 的 raw syscall 返回 usize)
-                const errno = std.os.linux.getErrno(rc);
-
-                if (errno != .SUCCESS) {
-                    // 如果整个调用直接失败（比如 EBADF, EFAULT 等），尝试回退到逐个发送
-                    // 这里的 rc 在出错时是一个很大的 usize，不能直接作为数量
-                    // std.log.warn("sendmmsg sys-error: {}, fallback to loop", .{errno});
-                    for (batch) |pkt| {
-                        try self.send(pkt.data, pkt.dest);
-                    }
-                    i += batch_len;
-                } else {
-                    // 4. 处理发送结果
-                    // rc 是成功发送的数据包数量
-                    const sent_count = rc;
-
-                    if (sent_count > 0) {
-                        i += sent_count;
-                    }
-
-                    // 如果没发完（sent_count < batch_len），通常是因为 socket 缓冲区满了
-                    // 或者遇到了部分错误。
-                    // 策略：剩下的包回退到普通 send 尝试一下（普通 send 会处理 errno）
-                    // 或者直接进入下一次循环尝试（取决于你的重试策略，这里选择简单回退）
-                    if (sent_count < batch_len) {
-                        const remaining = batch[sent_count..];
-                        for (remaining) |pkt| {
-                            try self.send(pkt.data, pkt.dest);
-                        }
-                        // 手动补齐索引
-                        i += remaining.len;
-                    }
-                }
-            }
+            sent_count = self.trySendBatchLinux(packets);
         } else {
-            // 非 Linux 平台回退路径
-            for (packets) |pkt| {
-                try self.send(pkt.data, pkt.dest);
-            }
+            sent_count = self.trySendBatchFallback(packets);
+        }
+        if (sent_count < packets.len) {
+            const remaining = packets[sent_count..];
+            try self.enqueuePackets(remaining);
+            self.flushSendQueue();
         }
     }
 
-    /// 获取本地地址
-    pub fn getLocalAddr(self: *Self) std.net.Address {
-        return self.local_addr;
+    fn enqueuePackets(self: *Self, packets: []const Packet) !void {
+        try self.send_queue.ensureTotalCapacity(self.allocator, self.send_queue.items.len + packets.len);
+        for (packets) |pkt| {
+            const data_copy = try self.allocator.dupe(u8, pkt.data);
+            self.send_queue.appendAssumeCapacity(.{ .data = data_copy, .dest = pkt.dest });
+        }
+    }
+
+    fn trySendBatchLinux(self: *Self, packets: []const Packet) usize {
+        const linux = std.os.linux;
+        const BATCH_LIMIT = 32;
+        var total_sent: usize = 0;
+        while (total_sent < packets.len) {
+            const batch_size = @min(packets.len - total_sent, BATCH_LIMIT);
+            const batch = packets[total_sent .. total_sent + batch_size];
+            var msgs: [BATCH_LIMIT]linux.mmsghdr_const = undefined;
+            var iovecs: [BATCH_LIMIT]std.posix.iovec_const = undefined;
+            var sockaddrs: [BATCH_LIMIT]std.posix.sockaddr.storage = undefined;
+            for (batch, 0..) |pkt, i| {
+                const addr_len = pkt.dest.getOsSockLen();
+                const dest_ptr = @as([*]u8, @ptrCast(&sockaddrs[i]));
+                const src_ptr = @as([*]const u8, @ptrCast(&pkt.dest.any));
+                @memcpy(dest_ptr[0..addr_len], src_ptr[0..addr_len]);
+                iovecs[i] = .{ .base = pkt.data.ptr, .len = pkt.data.len };
+                msgs[i] = .{ .hdr = .{ .name = @ptrCast(&sockaddrs[i]), .namelen = addr_len, .iov = @as([*]const std.posix.iovec_const, @ptrCast(&iovecs[i])), .iovlen = 1, .control = null, .controllen = 0, .flags = 0 }, .len = 0 };
+            }
+            const rc = linux.sendmmsg(self.udp.fd, &msgs, @intCast(batch_size), 0);
+            if (rc > std.math.maxInt(usize) - 4096) {
+                const errno = std.posix.errno(rc);
+                if (errno == .AGAIN) return total_sent;
+                return total_sent;
+            }
+            const n = @as(usize, @intCast(rc));
+            total_sent += n;
+            if (n < batch_size) return total_sent;
+        }
+        return total_sent;
+    }
+
+    fn trySendBatchFallback(self: *Self, packets: []const Packet) usize {
+        var total_sent: usize = 0;
+        for (packets) |pkt| {
+            const rc = std.posix.sendto(self.udp.fd, pkt.data, 0, &pkt.dest.any, pkt.dest.getOsSockLen()) catch |err| {
+                if (err == error.WouldBlock) return total_sent;
+                return total_sent;
+            };
+            _ = rc;
+            total_sent += 1;
+        }
+        return total_sent;
+    }
+
+    fn flushSendQueue(self: *Self) void {
+        if (self.is_sending or self.send_queue.items.len == 0) return;
+        self.is_sending = true;
+        const pkt = self.send_queue.items[0];
+        self.udp.write(self.loop, &self.send_completion, &self.send_state, pkt.dest, .{ .slice = pkt.data }, Self, self, sendQueueCallback);
+    }
+
+    fn sendQueueCallback(ud: ?*Self, loop: *xev.Loop, c: *xev.Completion, s: *xev.UDP.State, udp: xev.UDP, buf: xev.WriteBuffer, r: xev.WriteError!usize) xev.CallbackAction {
+        _ = loop;
+        _ = c;
+        _ = s;
+        _ = udp;
+        _ = buf;
+        const self = ud.?;
+        if (self.send_queue.items.len > 0) {
+            const pkt = self.send_queue.orderedRemove(0);
+            pkt.deinit(self.allocator);
+        }
+        if (r) |_| {} else |err| std.log.warn("Async UDP send failed: {}", .{err});
+        self.is_sending = false;
+        if (self.send_queue.items.len > 0) self.flushSendQueue();
+        return .disarm;
     }
 
     pub fn start(self: *Self) void {
         if (self.running) return;
         self.running = true;
 
-        // 启动收包
         self.startRecv();
-        // 启动 Async 通知
         self.startAsync();
-
-        // 启动定时器
-        self.timer_pending = true;
         self.scheduleTimer(self.timer_interval_ms);
 
         std.log.info("IoLoop started on port {}", .{self.local_addr.getPort()});
     }
 
-    /// 停止事件循环
     pub fn stop(self: *Self) void {
+        if (!self.running) return;
         self.running = false;
+        self.async_notify.notify() catch {};
     }
 
-    // =========================================================================
-    // 内部实现
-    // =========================================================================
-
     fn startRecv(self: *Self) void {
-        self.recv_completion = .{
-            .op = .{
-                .recvfrom = .{
-                    .fd = self.socket,
-                    .buffer = .{ .slice = &self.recv_buf },
-                },
-            },
-            .userdata = self,
-            .callback = recvCallback,
+        self.udp.read(
+            self.loop,
+            &self.recv_completion,
+            &self.recv_state,
+            .{ .slice = &self.recv_buf },
+            Self,
+            self,
+            recvCallback,
+        );
+    }
+
+    fn recvCallback(
+        ud: ?*Self,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        s: *xev.UDP.State,
+        addr: std.net.Address,
+        udp: xev.UDP,
+        buf: xev.ReadBuffer,
+        r: xev.ReadError!usize,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = c;
+        _ = s;
+        _ = udp;
+        _ = buf;
+        const self = ud.?;
+        if (!self.running) return .disarm;
+
+        const len = r catch |e| {
+            if (e != error.WouldBlock and e != error.OperationCanceled) {
+                err_handler.reportError(.transport, "UDP recv error", e);
+            }
+            if (self.running) self.startRecv();
+            return .disarm;
         };
-        self.loop.add(&self.recv_completion);
+
+        if (len > 0) {
+            if (self.recv_callback) |cb| {
+                if (self.callback_ctx) |ctx| {
+                    const timestamp = quic_c.currentTime();
+                    cb(ctx, self.recv_buf[0..len], addr, timestamp);
+                }
+            }
+        }
+
+        if (self.running) {
+            self.startRecv();
+        }
+        return .disarm;
     }
 
     fn scheduleTimer(self: *Self, delay_ms: u64) void {
-        self.timer_pending = true;
         self.timer.run(self.loop, &self.timer_completion, delay_ms, Self, self, timerCallback);
     }
 
@@ -330,53 +368,8 @@ pub const IoLoop = struct {
         _ = loop;
         _ = c;
         _ = r catch {};
-
         const self = ud orelse return .disarm;
         if (!self.running) return .disarm;
-
-        // Async 被触发说明需要立即处理（如定时器时间缩短了）
-        if (self.timer_needs_reschedule) {
-            self.timer_needs_reschedule = false;
-
-            // 直接调用 timer_callback 处理紧急事件
-            if (self.timer_callback) |cb| {
-                if (self.callback_ctx) |ctx| {
-                    cb(ctx);
-                }
-            }
-        }
-
-        return if (self.running) .rearm else .disarm;
-    }
-
-    fn recvCallback(
-        ud: ?*anyopaque,
-        loop: *xev.Loop,
-        completion: *xev.Completion,
-        result: xev.Result,
-    ) xev.CallbackAction {
-        _ = loop;
-
-        const self = @as(*Self, @ptrCast(@alignCast(ud orelse return .disarm)));
-        if (!self.running) return .disarm;
-
-        const len = result.recvfrom catch |e| {
-            err_handler.reportError(.transport, "UDP recv error", e);
-            return if (self.running) .rearm else .disarm;
-        };
-
-        if (len > 0) {
-            if (self.recv_callback) |cb| {
-                if (self.callback_ctx) |ctx| {
-                    // 使用 picoquic 时间函数，确保时间戳与 QUIC 协议栈一致
-                    const timestamp = quic_c.currentTime();
-                    var src_sockaddr = completion.op.recvfrom.addr;
-                    const from_addr = std.net.Address.initPosix(@alignCast(&src_sockaddr));
-                    cb(ctx, self.recv_buf[0..len], from_addr, timestamp);
-                }
-            }
-        }
-
         return if (self.running) .rearm else .disarm;
     }
 
@@ -388,20 +381,25 @@ pub const IoLoop = struct {
     ) xev.CallbackAction {
         _ = loop;
         _ = completion;
-        _ = result catch {};
 
         const self = ud orelse return .disarm;
         if (!self.running) return .disarm;
 
-        // 定时器触发，调用上层回调驱动 QUIC 协议栈
-        if (self.timer_callback) |cb| {
-            if (self.callback_ctx) |ctx| {
-                cb(ctx);
+        if (result) |_| {
+            if (self.timer_callback) |cb| {
+                if (self.callback_ctx) |ctx| {
+                    cb(ctx);
+                }
+            }
+            self.scheduleTimer(self.timer_interval_ms);
+        } else |err| {
+            if (err == error.OperationCanceled) {
+                self.scheduleTimer(self.timer_interval_ms);
+            } else {
+                self.scheduleTimer(self.timer_interval_ms);
             }
         }
 
-        // 重新调度定时器
-        self.scheduleTimer(self.timer_interval_ms);
         return .disarm;
     }
 };
