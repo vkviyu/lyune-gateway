@@ -83,12 +83,14 @@ pub const IoLoop = struct {
     pub fn init(allocator: std.mem.Allocator, addr: [4]u8, port: u16, loop: *xev.Loop) Error!Self {
         const local_addr = std.net.Address.initIp4(addr, port);
 
+        // 创建非阻塞 Socket
         const socket_fd = std.posix.socket(
             std.posix.AF.INET,
             std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK,
             0,
         ) catch return Error.SocketCreateFailed;
 
+        // 设置 SO_REUSEPORT 允许多线程监听同一端口
         std.posix.setsockopt(
             socket_fd,
             std.posix.SOL.SOCKET,
@@ -98,6 +100,7 @@ pub const IoLoop = struct {
             err_handler.reportError(.transport, "setsockopt reuseport failed", err);
         };
 
+        // 端口绑定
         std.posix.bind(socket_fd, &local_addr.any, local_addr.getOsSockLen()) catch {
             std.posix.close(socket_fd);
             return Error.BindFailed;
@@ -287,7 +290,11 @@ pub const IoLoop = struct {
             const pkt = self.send_queue.orderedRemove(0);
             pkt.deinit(self.allocator);
         }
-        if (r) |_| {} else |err| std.log.warn("Async UDP send failed: {}", .{err});
+        if (r) |_| {} else |err| {
+            // 将 std.log.warn 替换为 err_handler.reportError
+            // 这会将 err 作为 context.raw_error 传递，通常会被 ErrorHandler 打印出来
+            err_handler.reportError(.transport, "Async UDP send failed", err);
+        }
         self.is_sending = false;
         if (self.send_queue.items.len > 0) self.flushSendQueue();
         return .disarm;
@@ -301,7 +308,18 @@ pub const IoLoop = struct {
         self.startAsync();
         self.scheduleTimer(self.timer_interval_ms);
 
-        std.log.info("IoLoop started on port {}", .{self.local_addr.getPort()});
+        // 将 std.log.info 替换为 err_handler.report
+        // 构造消息字符串
+        var msg_buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "IoLoop started on port {}", .{self.local_addr.getPort()}) catch "IoLoop started";
+
+        // 手动构造 Context 以支持 Severity.info
+        err_handler.report(.{
+            .source = .transport,
+            .severity = .info,
+            .message = msg,
+            .timestamp = std.time.microTimestamp(),
+        });
     }
 
     pub fn stop(self: *Self) void {
