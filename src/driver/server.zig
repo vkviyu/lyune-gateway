@@ -10,9 +10,18 @@
 //! 它不包含任何业务逻辑，只负责将协议事件 (Connect, Stream, Close) 向上回调。
 
 const std = @import("std");
+
 const xev = @import("xev");
+
 const quic = @import("../quic/mod.zig");
-const io = @import("../transport/io.zig");
+const endpoint = quic.endpoint;
+const QUICConnection = quic.connection.Connection;
+const QUICCallbackEvent = quic.c.CallbackEvent;
+const QUICConfig = quic.config.QUICConfig;
+const transport = @import("../transport/mod.zig");
+const io = transport.io;
+
+// const connection
 
 // 复用常量
 const GSO_BUFFER_SIZE = 64 * 1024;
@@ -22,7 +31,7 @@ pub const ServerDriver = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    endpoint: quic.Endpoint,
+    endpoint: endpoint.Endpoint,
     io_loop: io.IoLoop,
 
     // 发送缓冲区 (跟随 Driver 实例在堆上)
@@ -31,25 +40,25 @@ pub const ServerDriver = struct {
 
     // 用户回调接口
     user_context: ?*anyopaque = null,
-    on_connection: ?*const fn (ctx: ?*anyopaque, conn: *quic.Connection) void = null,
-    on_stream_data: ?*const fn (ctx: ?*anyopaque, conn: *quic.Connection, sid: u64, data: []const u8, fin: bool) void = null,
-    on_connection_close: ?*const fn (ctx: ?*anyopaque, conn: *quic.Connection, event: quic.CallbackEvent) void = null,
+    on_connection: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection) void = null,
+    on_stream_data: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, sid: u64, data: []const u8, fin: bool) void = null,
+    on_connection_close: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, event: QUICCallbackEvent) void = null,
 
     pub const Error = error{
         InitFailed,
         LoopInitFailed,
-    } || quic.Endpoint.Error || io.IoLoop.Error;
+    } || endpoint.Endpoint.Error || io.IoLoop.Error;
 
     /// 初始化驱动器
     pub fn init(
         allocator: std.mem.Allocator,
-        config: quic.QuicConfig,
+        config: QUICConfig,
         thread_id: u8,
         loop: *xev.Loop,
     ) Error!Self {
         // 初始化 Endpoint
-        var endpoint = try quic.Endpoint.init(allocator, config, thread_id, null);
-        errdefer endpoint.deinit();
+        var ed = try endpoint.Endpoint.init(allocator, config, thread_id, null);
+        errdefer ed.deinit();
 
         // 初始化 IO
         var io_loop = try io.IoLoop.init(allocator, config.bind_address, config.bind_port, loop);
@@ -57,7 +66,7 @@ pub const ServerDriver = struct {
 
         return .{
             .allocator = allocator,
-            .endpoint = endpoint,
+            .endpoint = ed,
             .io_loop = io_loop,
         };
     }
@@ -71,9 +80,9 @@ pub const ServerDriver = struct {
     pub fn setCallbacks(
         self: *Self,
         user_ctx: ?*anyopaque,
-        on_conn: ?*const fn (?*anyopaque, *quic.Connection) void,
-        on_data: ?*const fn (?*anyopaque, *quic.Connection, u64, []const u8, bool) void,
-        on_close: ?*const fn (?*anyopaque, *quic.Connection, quic.CallbackEvent) void,
+        on_conn: ?*const fn (?*anyopaque, *QUICConnection) void,
+        on_data: ?*const fn (?*anyopaque, *QUICConnection, u64, []const u8, bool) void,
+        on_close: ?*const fn (?*anyopaque, *QUICConnection, QUICCallbackEvent) void,
     ) void {
         self.user_context = user_ctx;
         self.on_connection = on_conn;
@@ -129,7 +138,7 @@ pub const ServerDriver = struct {
 
         // 2. 计算下一次唤醒时间
         const next_wake = self.endpoint.getNextWakeTime();
-        const now = quic.currentTime();
+        const now = quic.c.currentTime();
 
         var delta: u64 = 0;
         if (next_wake > now) {
@@ -182,17 +191,17 @@ pub const ServerDriver = struct {
     // 内部回调 -> 用户回调 转发器
     // ========================================================================
 
-    fn internalOnNewConn(ctx: ?*anyopaque, conn: *quic.Connection) void {
+    fn internalOnNewConn(ctx: ?*anyopaque, conn: *QUICConnection) void {
         const self = castSelf(ctx.?);
         if (self.on_connection) |cb| cb(self.user_context, conn);
     }
 
-    fn internalOnStreamData(ctx: ?*anyopaque, conn: *quic.Connection, sid: u64, data: []const u8, fin: bool) void {
+    fn internalOnStreamData(ctx: ?*anyopaque, conn: *QUICConnection, sid: u64, data: []const u8, fin: bool) void {
         const self = castSelf(ctx.?);
         if (self.on_stream_data) |cb| cb(self.user_context, conn, sid, data, fin);
     }
 
-    fn internalOnConnClose(ctx: ?*anyopaque, conn: *quic.Connection, event: quic.CallbackEvent) void {
+    fn internalOnConnClose(ctx: ?*anyopaque, conn: *QUICConnection, event: QUICCallbackEvent) void {
         const self = castSelf(ctx.?);
         if (self.on_connection_close) |cb| cb(self.user_context, conn, event);
     }

@@ -3,9 +3,10 @@
 //! 负责管理 picoquic 上下文 (picoquic_quic_t) 的生命周期。它是 Server 和 Client 的底层基类。
 
 const std = @import("std");
-const quic_c = @import("c.zig");
+
 const Config = @import("config.zig");
 const Connection = @import("connection.zig").Connection;
+const quic_c = @import("c.zig");
 
 pub const PacketInfo = struct {
     data: []const u8,
@@ -23,7 +24,7 @@ pub const Endpoint = struct {
     quic_ctx: quic_c.QuicCtx,
 
     /// 配置
-    config: Config.QuicConfig,
+    config: Config.QUICConfig,
 
     allocator: std.mem.Allocator,
 
@@ -43,7 +44,7 @@ pub const Endpoint = struct {
     /// callback_ctx_opt: 可选的回调上下文，如果为 null 则内部创建
     pub fn init(
         allocator: std.mem.Allocator,
-        config: Config.QuicConfig,
+        config: Config.QUICConfig,
         thread_id: u8,
         callback_ctx_opt: ?*CallbackContext,
     ) Error!Self {

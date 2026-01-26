@@ -1,10 +1,14 @@
 const std = @import("std");
-const xev = @import("xev");
 const builtin = @import("builtin");
-const quic = @import("quic/mod.zig"); // 注意这里路径可能需要根据你的实际情况调整
+
+const xev = @import("xev");
+
 const gateway = @import("gateway/mod.zig");
 const protocol = @import("protocol/mod.zig");
+const quic = @import("quic/mod.zig");
+const QUICClient = quic.client.Client;
 
+// 注意这里路径可能需要根据你的实际情况调整
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
@@ -86,7 +90,7 @@ fn runServer(allocator: std.mem.Allocator, threads: ?usize) !void {
 fn runSingleWorker(allocator: std.mem.Allocator, thread_id: u8) !void {
     // 使用 GatewayWorker 而不是 Server
     // 确保 gateway/mod.zig 中导出了 GatewayWorker
-    var worker = gateway.GatewayWorker.init(allocator, .{
+    var worker = gateway.worker.GatewayWorker.init(allocator, .{
         .cert_file = "server.crt",
         .key_file = "server.key",
         .bind_address = .{ 0, 0, 0, 0 },
@@ -115,7 +119,7 @@ fn runClient(allocator: std.mem.Allocator) !void {
     std.log.info("Connecting to QUIC server at localhost:8443...", .{});
 
     // 假设 quic.zig 导出了同步 Client (原 Client 封装)
-    var client = quic.Client.init(allocator, .{
+    var client = QUICClient.init(allocator, .{
         .base = .{ .alpn = "lyune-gateway", .root_cert_file = "server.crt" },
     }) catch |err| {
         std.log.err("Failed to create client: {}", .{err});

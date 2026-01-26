@@ -34,59 +34,20 @@
 
 /// 传输接口定义
 pub const client = @import("backend.zig");
-
-/// 传输注册表
-pub const registry = @import("registry.zig");
-
-/// 内存传输实现
-pub const memory = @import("memory.zig");
-
 /// 直连 QUIC 传输实现
 pub const direct = @import("direct.zig");
-
-// ============================================================================
-// 便捷导出
-// ============================================================================
-
-/// 后端传输接口
-pub const BackendTransport = client.BackendTransport;
-
-/// 传输错误类型
-pub const TransportError = client.TransportError;
-
+/// 内存传输实现
+pub const memory = @import("memory.zig");
+/// NATS 传输实现（待实现）
+pub const nats = @import("nats.zig");
+/// 消息发布器（待实现）
+pub const publisher = @import("publisher.zig");
 /// 传输注册表
-pub const TransportRegistry = registry.TransportRegistry;
-
-/// 传输路径类型（relay/direct）
-pub const TransportPath = registry.TransportPath;
-
-/// 内存传输（测试/开发用）
-pub const MemoryTransport = memory.MemoryTransport;
-
-/// 发送消息记录
-pub const SentMessage = memory.SentMessage;
-
-/// 直连 QUIC 传输
-pub const DirectTransport = direct.DirectTransport;
-
-/// 直连传输配置
-pub const DirectConfig = direct.DirectConfig;
-
-/// 获取全局注册表
-pub const getGlobalRegistry = registry.getGlobalRegistry;
-
-/// 重置全局注册表
-pub const resetGlobalRegistry = registry.resetGlobalRegistry;
+pub const registry = @import("registry.zig");
 
 // ============================================================================
 // 未来扩展（占位）
 // ============================================================================
-
-/// NATS 传输实现（待实现）
-pub const nats = @import("nats.zig");
-
-/// 消息发布器（待实现）
-pub const publisher = @import("publisher.zig");
 
 // ============================================================================
 // 测试

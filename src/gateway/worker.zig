@@ -8,21 +8,27 @@
 //! - 处理业务逻辑 (Stream Dispatch, Message Handling)
 
 const std = @import("std");
+
 const xev = @import("xev");
+
+const common = @import("../common/mod.zig");
+const err_handler = common.err;
+const driver = @import("../driver/mod.zig");
+const ServerDriver = driver.server.ServerDriver;
+const protocol = @import("../protocol/mod.zig");
 const quic = @import("../quic/mod.zig");
-const driver = @import("../driver/server.zig"); // 引入新的 Driver
-const connection_mod = @import("connection.zig");
-const stream_handler = @import("stream_handler.zig");
-const err_handler = @import("../common/mod.zig").err;
+const QUICConfig = quic.config.QUICConfig;
+const QUICConnection = quic.connection.Connection;
+const QUICCallbackEvent = quic.c.CallbackEvent;
+const connection = @import("connection.zig");
+const ConnectionManager = connection.ConnectionManager;
+const ConnectionContext = connection.ConnectionContext;
 
+// 引入新的 Driver
 // 类型别名
-const ConnectionManager = connection_mod.ConnectionManager;
-const ConnectionContext = connection_mod.ConnectionContext;
-const ServerDriver = driver.ServerDriver;
-
 // 泛型实例化
-const BufferedHandler = stream_handler.BufferedMessageHandler(ConnectionContext);
-const StreamDelegate = stream_handler.StreamDelegate(ConnectionContext);
+const BufferedHandler = protocol.handler.BufferedMessageHandler(ConnectionContext);
+const StreamDelegate = protocol.handler.StreamDelegate(ConnectionContext);
 
 pub const GatewayWorker = struct {
     const Self = @This();
@@ -30,7 +36,7 @@ pub const GatewayWorker = struct {
     allocator: std.mem.Allocator,
 
     // 底层驱动器 (替代了 endpoint, io_loop, gso_buffer 等)
-    server_driver: ServerDriver,
+    server_driver: driver.server.ServerDriver,
 
     // 业务组件
     conn_manager: ConnectionManager,
@@ -41,7 +47,7 @@ pub const GatewayWorker = struct {
     running: bool = false,
 
     /// 创建 Worker 实例
-    pub fn init(allocator: std.mem.Allocator, config: quic.QuicConfig, thread_id: u8) !Self {
+    pub fn init(allocator: std.mem.Allocator, config: QUICConfig, thread_id: u8) !Self {
         // 1. 创建 Event Loop
         const event_loop = try allocator.create(xev.Loop);
         event_loop.* = xev.Loop.init(.{}) catch {
@@ -102,7 +108,7 @@ pub const GatewayWorker = struct {
     // ========================================================================
 
     /// 新连接建立
-    fn handleNewConnection(ud: ?*anyopaque, conn: *quic.Connection) void {
+    fn handleNewConnection(ud: ?*anyopaque, conn: *QUICConnection) void {
         const self = castSelfOpt(ud) orelse return;
 
         // 业务逻辑：注册到管理器
@@ -114,7 +120,7 @@ pub const GatewayWorker = struct {
     }
 
     /// 连接关闭
-    fn handleConnectionClose(ud: ?*anyopaque, conn: *quic.Connection, event: quic.CallbackEvent) void {
+    fn handleConnectionClose(ud: ?*anyopaque, conn: *QUICConnection, event: QUICCallbackEvent) void {
         const self = castSelfOpt(ud) orelse return;
 
         // 业务逻辑：从管理器移除
@@ -123,7 +129,7 @@ pub const GatewayWorker = struct {
     }
 
     /// 流数据到达
-    fn handleStreamData(ud: ?*anyopaque, conn: *quic.Connection, stream_id: u64, data: []const u8, is_fin: bool) void {
+    fn handleStreamData(ud: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
         const self = castSelfOpt(ud) orelse return;
         const ctx = self.conn_manager.get(conn) orelse return;
 

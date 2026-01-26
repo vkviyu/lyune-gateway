@@ -34,8 +34,7 @@ pub const QuicCnx = *c.picoquic_cnx_t;
 /// QUIC Stream ID，64 位无符号整数。
 pub const StreamId = u64;
 
-/// 连接 ID
-///
+/// 连接 ID，
 /// 包含 ID 字节和长度。这是值类型，不是指针。
 pub const ConnectionId = c.picoquic_connection_id_t;
 

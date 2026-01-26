@@ -64,7 +64,7 @@ pub const Config = struct {
 };
 
 /// 服务端配置（包含证书）
-pub const QuicConfig = struct {
+pub const QUICConfig = struct {
     base: Config = .{},
 
     /// 证书文件路径（必需）

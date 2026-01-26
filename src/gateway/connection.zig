@@ -1,7 +1,10 @@
 const std = @import("std");
-const quic = @import("../quic/mod.zig");
-const StreamHandler = @import("stream_handler.zig").StreamHandler;
 
+const protocol = @import("../protocol/mod.zig");
+const quic = @import("../quic/mod.zig");
+const QUICConnection = quic.connection.Connection;
+
+// const StreamHandler = @import("stream_handler.zig").StreamHandler;
 /// 业务连接上下文：附加在 QUIC Connection 上的业务数据
 pub const ConnectionContext = struct {
     allocator: std.mem.Allocator,
@@ -11,14 +14,14 @@ pub const ConnectionContext = struct {
     connected_at: i64,
 
     // Stream 处理器映射表：stream_id -> Handler
-    stream_handlers: std.AutoHashMap(u64, StreamHandler),
+    stream_handlers: std.AutoHashMap(u64, protocol.handler.StreamHandler),
 
     pub fn init(allocator: std.mem.Allocator, cnx: quic.c.QuicCnx) ConnectionContext {
         return .{
             .allocator = allocator,
             .cnx_handle = cnx,
             .connected_at = std.time.timestamp(),
-            .stream_handlers = std.AutoHashMap(u64, StreamHandler).init(allocator),
+            .stream_handlers = std.AutoHashMap(u64, protocol.handler.StreamHandler).init(allocator),
         };
     }
 
@@ -31,12 +34,12 @@ pub const ConnectionContext = struct {
     }
 
     /// 获取 Stream 处理器
-    pub fn getStreamHandler(self: *ConnectionContext, stream_id: u64) ?StreamHandler {
+    pub fn getStreamHandler(self: *ConnectionContext, stream_id: u64) ?protocol.handler.StreamHandler {
         return self.stream_handlers.get(stream_id);
     }
 
     /// 注册 Stream 处理器
-    pub fn registerStreamHandler(self: *ConnectionContext, stream_id: u64, handler: StreamHandler) !void {
+    pub fn registerStreamHandler(self: *ConnectionContext, stream_id: u64, handler: protocol.handler.StreamHandler) !void {
         try self.stream_handlers.put(stream_id, handler);
     }
 
@@ -77,7 +80,7 @@ pub const ConnectionManager = struct {
     }
 
     /// 注册新连接
-    pub fn add(self: *ConnectionManager, conn: *quic.Connection) !*ConnectionContext {
+    pub fn add(self: *ConnectionManager, conn: *QUICConnection) !*ConnectionContext {
         const ctx = try self.allocator.create(ConnectionContext);
         ctx.* = ConnectionContext.init(self.allocator, conn.inner);
 
@@ -86,7 +89,7 @@ pub const ConnectionManager = struct {
     }
 
     /// 移除连接
-    pub fn remove(self: *ConnectionManager, conn: *quic.Connection) void {
+    pub fn remove(self: *ConnectionManager, conn: *QUICConnection) void {
         if (self.contexts.fetchRemove(conn.inner)) |kv| {
             kv.value.deinit();
             self.allocator.destroy(kv.value);
@@ -94,7 +97,7 @@ pub const ConnectionManager = struct {
     }
 
     /// 获取连接上下文
-    pub fn get(self: *ConnectionManager, conn: *quic.Connection) ?*ConnectionContext {
+    pub fn get(self: *ConnectionManager, conn: *QUICConnection) ?*ConnectionContext {
         return self.contexts.get(conn.inner);
     }
 };

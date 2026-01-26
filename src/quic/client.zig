@@ -6,9 +6,10 @@
 //! 服务端支持 libxev 高性能事件循环，详见 server.zig。
 
 const std = @import("std");
-const quic_c = @import("c.zig");
+
 const Config = @import("config.zig");
 const Connection = @import("connection.zig").Connection;
+const quic_c = @import("c.zig");
 
 pub const Client = struct {
     /// 底层 QUIC 上下文
@@ -18,7 +19,7 @@ pub const Client = struct {
     connection: ?Connection = null,
 
     /// 配置
-    config: Config.QuicConfig,
+    config: Config.QUICConfig,
 
     /// 内存分配器
     allocator: std.mem.Allocator,
@@ -27,7 +28,7 @@ pub const Client = struct {
     callback_ctx: *CallbackContext,
 
     /// 创建 QUIC 客户端
-    pub fn init(allocator: std.mem.Allocator, config: Config.QuicConfig) Error!Client {
+    pub fn init(allocator: std.mem.Allocator, config: Config.QUICConfig) Error!Client {
         // 创建回调上下文
         const callback_ctx = try allocator.create(CallbackContext);
         callback_ctx.* = .{
