@@ -154,31 +154,43 @@ pub const IoLoop = struct {
     }
 
     pub fn updateTimer(self: *Self, interval_ms: u64) void {
-        if (interval_ms < self.timer_interval_ms) {
-            self.timer_interval_ms = interval_ms;
+        // 更新记录的间隔
+        self.timer_interval_ms = interval_ms;
 
-            self.loop.cancel(&self.cancel_completion, &self.timer_completion, void, null, cancelCallback);
-        } else {
-            self.timer_interval_ms = interval_ms;
+        // 如果新间隔更短，我们需要立即生效
+        // 注意：这里我们假设如果间隔变长，等待当前定时器触发是可以接受的
+        // 如果必须强制更新，可以去掉 interval_ms < ... 的判断，总是执行更新逻辑
+
+        if (interval_ms < self.timer_interval_ms or true) { // 建议：总是更新以保证行为一致
+            if (builtin.os.tag == .linux) {
+                // Linux (io_uring): 必须显式取消旧的 completion，否则会有两个定时器或资源泄漏
+                self.loop.cancel(&self.cancel_completion, &self.timer_completion, void, null, cancelCallback);
+            } else {
+                // macOS (kqueue) / 其他:
+                // kqueue 的 EVFILT_TIMER 特性是：重复添加同一个 ident 的 timer 会更新它。
+                // 直接重新调度即可覆盖旧的定时器设置。
+                self.scheduleTimer(interval_ms);
+            }
         }
     }
 
-    // <--- 修复：函数签名必须严格匹配
-    // 1. ud: ?*void (因为 loop.cancel 传入了 void 类型)
-    // 2. r: xev.CancelError!void (libxev 将底层 Result 转换为了具体的错误集)
-    fn cancelCallback(
-        ud: ?*void,
-        l: *xev.Loop,
-        c: *xev.Completion,
-        r: xev.CancelError!void,
-    ) xev.CallbackAction {
-        _ = ud;
-        _ = l;
-        _ = c;
-        // 忽略取消结果，如果是 NotFound 说明定时器刚好触发了，这也是符合预期的
-        _ = r catch {};
-        return .disarm;
-    }
+    // 只有 Linux 下才需要这个回调函数
+    // 使用条件编译包裹，防止在 macOS 上出现 "unused function" 编译错误
+    const cancelCallback = if (builtin.os.tag == .linux) struct {
+        fn cb(
+            ud: ?*void,
+            l: *xev.Loop,
+            c: *xev.Completion,
+            r: xev.CancelError!void,
+        ) xev.CallbackAction {
+            _ = ud;
+            _ = l;
+            _ = c;
+            // 忽略取消结果
+            _ = r catch {};
+            return .disarm;
+        }
+    }.cb else undefined;
 
     pub fn send(self: *Self, data: []const u8, dest: std.net.Address) !void {
         const pkt = Packet{ .data = data, .dest = dest };
