@@ -181,3 +181,8 @@ fn runXevDemo() !void {
     try loop.run(.until_done);
     std.debug.print("Loop finished.\n", .{});
 }
+
+
+test {
+    _ = @import("./mq/direct.zig");
+}

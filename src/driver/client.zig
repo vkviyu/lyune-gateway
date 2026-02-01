@@ -1,14 +1,15 @@
-//! quic/client_async.zig
+//! driver/client.zig
 //!
 //! 基于 libxev 的异步 QUIC 客户端。
 //! 可以在单线程中与 Server 共享同一个事件循环。
 
 const std = @import("std");
 const xev = @import("xev");
-const quic_c = @import("../quic/c.zig");
-const Config = @import("../quic/config.zig");
-const Endpoint = @import("../quic/endpoint.zig").Endpoint;
-const Connection = @import("../quic/connection.zig").Connection;
+const quic = @import("../quic/mod.zig");
+const quic_c = quic.c;
+const QUICConfig = quic.config.QUICConfig;
+const Endpoint = quic.endpoint.Endpoint;
+const QUICConnection = quic.connection.Connection;
 const io = @import("../transport/io.zig"); // 引用上层 transport 目录
 
 const IoLoop = io.IoLoop;
@@ -30,13 +31,13 @@ pub const AsyncClient = struct {
     packet_batch: [MAX_BATCH_PACKETS]Packet = undefined,
 
     // 用户回调
-    on_connected: ?*const fn (ctx: ?*anyopaque, conn: *Connection) void = null,
-    on_stream_data: ?*const fn (ctx: ?*anyopaque, conn: *Connection, stream_id: u64, data: []const u8, is_fin: bool) void = null,
-    on_close: ?*const fn (ctx: ?*anyopaque, conn: *Connection, event: quic_c.CallbackEvent) void = null,
+    on_connected: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection) void = null,
+    on_stream_data: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void = null,
+    on_close: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, event: quic_c.CallbackEvent) void = null,
     user_context: ?*anyopaque = null,
 
     // 当前活跃连接（简单场景通常只维护一个与后端的连接，如需连接池可改为 HashMap）
-    active_connection: ?Connection = null,
+    active_connection: ?QUICConnection = null,
 
     pub const Error = error{
         InitFailed,
@@ -48,7 +49,7 @@ pub const AsyncClient = struct {
     /// loop: 外部传入的 xev.Loop（通常是 GatewayWorker 的 loop）
     pub fn init(
         allocator: std.mem.Allocator,
-        config: Config.QuicConfig,
+        config: QUICConfig,
         loop: *xev.Loop,
     ) Error!Self {
         // 2. 初始化 Endpoint
@@ -79,9 +80,9 @@ pub const AsyncClient = struct {
     pub fn setCallbacks(
         self: *Self,
         user_context: ?*anyopaque,
-        on_connected: ?*const fn (?*anyopaque, *Connection) void,
-        on_stream_data: ?*const fn (?*anyopaque, *Connection, u64, []const u8, bool) void,
-        on_close: ?*const fn (?*anyopaque, *Connection, quic_c.CallbackEvent) void,
+        on_connected: ?*const fn (?*anyopaque, *QUICConnection) void,
+        on_stream_data: ?*const fn (?*anyopaque, *QUICConnection, u64, []const u8, bool) void,
+        on_close: ?*const fn (?*anyopaque, *QUICConnection, quic_c.CallbackEvent) void,
     ) void {
         self.user_context = user_context;
         self.on_connected = on_connected;
@@ -110,7 +111,7 @@ pub const AsyncClient = struct {
     /// host: 目标 IP 字符串 (如 "127.0.0.1")
     /// port: 目标端口
     /// sni:  SNI (Server Name Indication)，通常同 host
-    pub fn connect(self: *Self, host: []const u8, port: u16, sni: []const u8) Error!*Connection {
+    pub fn connect(self: *Self, host: []const u8, port: u16, sni: []const u8) Error!*QUICConnection {
         // 简单的同步 DNS 解析（生产环境建议换成异步）
         const list = std.net.getAddressList(self.allocator, host, port) catch return Error.ResolveFailed;
         defer list.deinit();
@@ -142,7 +143,7 @@ pub const AsyncClient = struct {
         if (rc != 0) return Error.ConnectFailed;
 
         // 包装 Connection 对象
-        self.active_connection = Connection.fromRaw(cnx_ptr);
+        self.active_connection = QUICConnection.fromRaw(cnx_ptr);
 
         // 立即驱动一次事件循环（发送 Client Hello）
         self.processQuicEvents();
@@ -225,28 +226,28 @@ pub const AsyncClient = struct {
     // 内部回调 -> 用户回调 桥接
     // =========================================================================
 
-    fn internalOnConnected(ctx: ?*anyopaque, conn: *Connection) void {
+    fn internalOnConnected(ctx: ?*anyopaque, conn: *QUICConnection) void {
         const self = castSelf(ctx.?);
         if (self.on_connected) |cb| {
             cb(self.user_context, conn);
         }
     }
 
-    fn internalOnStreamData(ctx: ?*anyopaque, conn: *Connection, stream_id: u64, data: []const u8, is_fin: bool) void {
+    fn internalOnStreamData(ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
         const self = castSelf(ctx.?);
         if (self.on_stream_data) |cb| {
             cb(self.user_context, conn, stream_id, data, is_fin);
         }
     }
 
-    fn internalOnClose(ctx: ?*anyopaque, conn: *Connection, event: quic_c.CallbackEvent) void {
+    fn internalOnClose(ctx: ?*anyopaque, conn: *QUICConnection, event: quic_c.CallbackEvent) void {
         const self = castSelf(ctx.?);
         if (self.on_close) |cb| {
             cb(self.user_context, conn, event);
         }
         // 清理引用，但不 close，因为是回调里
         if (self.active_connection) |*c| {
-            if (c.ptr == conn.ptr) {
+            if (c.inner == conn.inner) {
                 self.active_connection = null;
             }
         }
@@ -260,7 +261,7 @@ pub const AsyncClient = struct {
 // test "AsyncClient" {
 //     var loop = try xev.Loop.init(.{});
 //     var client = try AsyncClient.init(std.testing.allocator, .{ .base = .{ .alpn = "lyune-gateway", .root_cert_file = "server.crt" } }, loop);
-    
+
 //     client.setCallbacks(null, null)
 //     client.start();
 //     try loop.run(.until_done);

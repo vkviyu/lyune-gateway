@@ -69,7 +69,7 @@ pub const IoLoop = struct {
     recv_buf: [MAX_PACKET_SIZE]u8 = undefined,
 
     // 使用 Unmanaged 以便手动管理内存
-    send_queue: std.ArrayListUnmanaged(OwnedPacket) = .{},
+    send_queue: std.ArrayList(OwnedPacket) = .{},
     is_sending: bool = false,
 
     pub const Error = error{
@@ -157,24 +157,22 @@ pub const IoLoop = struct {
     }
 
     pub fn updateTimer(self: *Self, interval_ms: u64) void {
-        // 更新记录的间隔
+        // 1. 总是更新这个记录值
+        // 这样当定时器下一次触发时，timerCallback 会使用这个最新的值来重新调度
         self.timer_interval_ms = interval_ms;
 
-        // 如果新间隔更短，我们需要立即生效
-        // 注意：这里我们假设如果间隔变长，等待当前定时器触发是可以接受的
-        // 如果必须强制更新，可以去掉 interval_ms < ... 的判断，总是执行更新逻辑
-
-        if (interval_ms < self.timer_interval_ms or true) { // 建议：总是更新以保证行为一致
-            if (builtin.os.tag == .linux) {
-                // Linux (io_uring): 必须显式取消旧的 completion，否则会有两个定时器或资源泄漏
-                self.loop.cancel(&self.cancel_completion, &self.timer_completion, void, null, cancelCallback);
-            } else {
-                // macOS (kqueue) / 其他:
-                // kqueue 的 EVFILT_TIMER 特性是：重复添加同一个 ident 的 timer 会更新它。
-                // 直接重新调度即可覆盖旧的定时器设置。
-                self.scheduleTimer(interval_ms);
-            }
+        // 2. 检查状态
+        // 如果定时器已经是 Active 状态，不要再次调用 scheduleTimer
+        // 否则 libxev 会报 "invalid state" 错误
+        if (self.timer_completion.state == .active) {
+            // 策略：直接返回，不做操作。
+            // 虽然这可能导致这一次的唤醒时间不够精确（还是按照旧的时间触发），
+            // 但能保证程序不崩，且定时器链条不断裂。
+            return;
         }
+
+        // 3. 只有在非 Active 状态下才启动新的定时器
+        self.scheduleTimer(interval_ms);
     }
 
     // 只有 Linux 下才需要这个回调函数

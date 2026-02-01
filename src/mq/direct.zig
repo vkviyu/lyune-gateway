@@ -1,43 +1,19 @@
 //! 直连 QUIC 传输实现
 //!
 //! 网关直连后端服务的 BackendTransport 实现。
-//! 基于 AsyncClient 实现真正的异步 QUIC 通信。
-//!
-//! ## 设计说明
-//!
-//! - `sendImpl`: 非阻塞发送，通过 AsyncClient 将数据加入发送队列
-//! - `receiveImpl`: 非阻塞接收，从接收队列读取数据
-//! - 实际的网络 I/O 由 AsyncClient 的事件循环驱动
-//!
-//! ## 使用方式
-//!
-//! ### 独立模式（测试/简单场景）
-//!
-//! ```zig
-//! var transport = try DirectTransport.init(allocator, .{...});
-//! defer transport.deinit();
-//!
-//! try transport.resolveImpl(0x01);  // 发起连接
-//! try transport.runOnce();          // 运行事件循环完成握手
-//!
-//! try transport.sendImpl(0x01, frame_data);  // 发送数据
-//! try transport.runOnce();                    // 运行事件循环发送
-//!
-//! if (try transport.receiveImpl()) |response| {
-//!     defer allocator.free(response);
-//! }
-//! ```
-//!
-//! ### 集成模式（网关场景）
-//!
-//! 在网关中，DirectTransport 会被集成到 GatewayWorker 的事件循环中。
+//! 负责将通用的 BackendTransport 接口调用转发给底层的 AsyncClient。
 
 const std = @import("std");
 const xev = @import("xev");
 const quic = @import("../quic/mod.zig");
-const client_mod = @import("backend.zig");
-const BackendTransport = client_mod.BackendTransport;
-const TransportError = client_mod.TransportError;
+const driver = @import("../driver/mod.zig");
+const AsyncClient = driver.client.AsyncClient;
+
+const backend_mod = @import("backend.zig");
+const BackendTransport = backend_mod.BackendTransport;
+const TransportError = backend_mod.TransportError;
+
+const QUICConnection = quic.connection.Connection;
 
 // ============================================================================
 // 配置
@@ -51,11 +27,11 @@ pub const DirectConfig = struct {
     server_port: u16,
     /// ALPN 协议标识
     alpn: [:0]const u8 = "lyune-gateway",
-    /// 接收队列最大容量
-    max_recv_queue: usize = 64,
+    /// 接收队列最大容量 (防止内存无限增长)
+    max_recv_queue: usize = 1024,
     /// 连接超时（毫秒）
     connect_timeout_ms: u32 = 5000,
-    /// 是否验证服务器证书
+    /// 是否验证服务器证书 (TODO: 传递给底层)
     verify_cert: bool = false,
     /// 根证书文件路径（可选）
     root_cert_file: ?[:0]const u8 = null,
@@ -65,252 +41,206 @@ pub const DirectConfig = struct {
 // 接收数据结构
 // ============================================================================
 
-/// 接收到的数据
-const ReceivedData = struct {
-    stream_id: u64,
-    data: []u8,
-    is_fin: bool,
+/// 内部队列使用的接收数据包
+const ReceivedPacket = struct {
+    data: []u8, // 拥有所有权
+
+    fn deinit(self: ReceivedPacket, allocator: std.mem.Allocator) void {
+        allocator.free(self.data);
+    }
 };
 
 // ============================================================================
 // 直连传输实现
 // ============================================================================
 
-/// 直连 QUIC 传输
-///
-/// 基于 AsyncClient 的异步直连传输。
-/// 实现 BackendTransport 接口，用于网关直连模式。
 pub const DirectTransport = struct {
     const Self = @This();
 
-    /// 内存分配器
     allocator: std.mem.Allocator,
-    /// 配置
     config: DirectConfig,
-    /// 外部事件循环
     event_loop: *xev.Loop,
-    /// 异步 QUIC 客户端
-    async_client: ?quic.AsyncClient,
-    /// 接收队列
-    recv_queue: std.ArrayList(ReceivedData),
-    /// 是否已连接
+
+    /// 异步客户端实例
+    async_client: ?AsyncClient,
+
+    /// 接收队列 (使用 Unmanaged，节省内存并手动管理 Allocator)
+    recv_queue: std.ArrayListUnmanaged(ReceivedPacket),
+
+    /// 状态标记
     connected: bool,
-    /// 是否已关闭
     closed: bool,
 
-    /// 初始化
-    ///
-    /// @param allocator 内存分配器
-    /// @param config 直连配置
-    /// @param event_loop 外部事件循环指针（与其他组件共享）
+    // ========================================================================
+    // 生命周期
+    // ========================================================================
+
     pub fn init(allocator: std.mem.Allocator, config: DirectConfig, event_loop: *xev.Loop) !Self {
         return .{
             .allocator = allocator,
             .config = config,
             .event_loop = event_loop,
             .async_client = null,
-            .recv_queue = .{},
+            .recv_queue = .{}, // Unmanaged 直接初始化为空结构体
             .connected = false,
             .closed = false,
         };
     }
 
-    /// 释放资源
     pub fn deinit(self: *Self) void {
-        // 释放接收队列中的数据
-        for (self.recv_queue.items) |item| {
-            self.allocator.free(item.data);
-        }
-        self.recv_queue.deinit(self.allocator);
-
-        // 释放客户端
+        // 1. 关闭客户端
         if (self.async_client) |*client| {
             client.deinit();
         }
         self.async_client = null;
 
-        self.connected = false;
+        // 2. 清理接收队列
+        for (self.recv_queue.items) |pkt| {
+            pkt.deinit(self.allocator);
+        }
+        // Unmanaged deinit 需要传入 allocator
+        self.recv_queue.deinit(self.allocator);
+
         self.closed = true;
+        self.connected = false;
     }
 
     // ========================================================================
     // BackendTransport 接口实现
     // ========================================================================
 
-    /// 解析/连接目标（接口实现）
-    ///
-    /// 发起到后端服务器的 QUIC 连接（非阻塞）。
-    /// 连接完成后通过回调通知，或者调用 run/runOnce 等待。
+    /// 建立连接
     pub fn resolveImpl(self: *Self, route_key: u8) TransportError!void {
         _ = route_key;
 
         if (self.closed) return TransportError.Closed;
-        if (self.connected) return; // 已连接
+        if (self.connected) return;
 
-        // 创建异步客户端（使用外部事件循环）
-        self.async_client = quic.AsyncClient.init(self.allocator, .{
-            .server_host = self.config.server_host,
-            .server_port = self.config.server_port,
-            .base = .{
-                .alpn = self.config.alpn,
-                .root_cert_file = self.config.root_cert_file,
-            },
-        }, self.event_loop) catch {
-            return TransportError.ConnectionFailed;
-        };
+        if (self.async_client == null) {
+            // 1. 构造底层 QUIC 配置
+            const quic_config = quic.config.QUICConfig{
+                .base = .{
+                    .alpn = self.config.alpn,
+                    .root_cert_file = self.config.root_cert_file,
+                },
+                .bind_port = 0,
+            };
 
-        // 设置回调
-        var client = &self.async_client.?;
-        client.setUserData(self);
-        client.onConnected(onConnected);
-        client.onStreamData(onStreamData);
-        client.onDisconnected(onDisconnected);
+            // 2. 初始化 AsyncClient
+            self.async_client = AsyncClient.init(
+                self.allocator,
+                quic_config,
+                self.event_loop,
+            ) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => TransportError.OutOfMemory,
+                    else => TransportError.ConnectionFailed,
+                };
+            };
 
-        // 发起连接
-        client.connect() catch {
-            self.async_client.?.deinit();
-            self.async_client = null;
-            return TransportError.ConnectionFailed;
-        };
+            // 3. 设置回调
+            var client = &self.async_client.?;
+            client.setCallbacks(
+                self,
+                onClientConnected,
+                onClientStreamData,
+                onClientClose,
+            );
+
+            // 4. 启动 IO
+            client.start();
+        }
+
+        // 5. 发起连接
+        _ = self.async_client.?.connect(
+            self.config.server_host,
+            self.config.server_port,
+            self.config.server_host,
+        ) catch return TransportError.ConnectionFailed;
     }
 
-    /// 发送数据（接口实现）
-    ///
-    /// 将数据加入发送队列（非阻塞）。
-    /// 注意：这里发送的是完整帧（帧头 + Body），实现全链路透传。
+    /// 发送数据
     pub fn sendImpl(self: *Self, route_key: u8, data: []const u8) TransportError!void {
         _ = route_key;
 
         if (self.closed) return TransportError.Closed;
-        if (!self.connected) return TransportError.ConnectionFailed;
+        if (self.async_client == null) return TransportError.ConnectionFailed;
 
-        var client = &(self.async_client orelse return TransportError.ConnectionFailed);
+        var client = &self.async_client.?;
+        if (client.active_connection) |*conn| {
+            if (!conn.isConnected()) return TransportError.ConnectionFailed;
 
-        // 使用默认 stream (0) 发送
-        client.sendDefault(data, true) catch {
-            return TransportError.SendFailed;
-        };
+            // streamWrite 可能需要根据最新的 connection.zig 调整签名
+            conn.streamWrite(0, data, false) catch return TransportError.SendFailed;
+        } else {
+            return TransportError.ConnectionFailed;
+        }
     }
 
-    /// 接收数据（接口实现）
-    ///
-    /// 从接收队列读取数据（非阻塞）。
-    /// 返回 null 表示当前没有数据。
-    /// 返回的数据由调用方负责释放。
+    /// 接收数据
     pub fn receiveImpl(self: *Self) TransportError!?[]const u8 {
         if (self.closed) return TransportError.Closed;
-        if (!self.connected) return TransportError.ConnectionFailed;
 
-        // 从队列取出数据
         if (self.recv_queue.items.len > 0) {
-            const item = self.recv_queue.orderedRemove(0);
-            return item.data;
+            // orderedRemove 不需要 allocator，它只是移动内存
+            const pkt = self.recv_queue.orderedRemove(0);
+            return pkt.data;
         }
 
         return null;
     }
 
-    /// 关闭（接口实现）
+    /// 关闭
     pub fn closeImpl(self: *Self) void {
-        if (self.async_client) |*client| {
-            client.stop();
-        }
-        self.connected = false;
-        self.closed = true;
+        self.deinit();
     }
 
-    // ========================================================================
-    // 事件循环控制
-    // ========================================================================
-
-    /// 运行事件循环（阻塞）
-    ///
-    /// 运行直到连接关闭或调用 stop()。
-    pub fn run(self: *Self) TransportError!void {
-        var client = &(self.async_client orelse return TransportError.ConnectionFailed);
-        client.run() catch {
-            return TransportError.ConnectionFailed;
-        };
-    }
-
-    /// 停止事件循环
-    pub fn stop(self: *Self) void {
-        if (self.async_client) |*client| {
-            client.stop();
-        }
-    }
-
-    // ========================================================================
-    // 辅助方法
-    // ========================================================================
-
-    /// 检查是否已连接
-    pub fn isConnected(self: *const Self) bool {
-        return self.connected and !self.closed;
-    }
-
-    /// 重新连接
-    pub fn reconnect(self: *Self) TransportError!void {
-        // 先关闭现有连接
-        if (self.async_client) |*client| {
-            client.deinit();
-        }
-        self.async_client = null;
-        self.connected = false;
-        self.closed = false;
-
-        // 重新连接
-        try self.resolveImpl(0);
-    }
-
-    /// 转换为 BackendTransport 接口
+    /// 转换为接口
     pub fn asTransport(self: *Self) BackendTransport {
         return BackendTransport.init(Self, self);
     }
 
     // ========================================================================
-    // 内部：回调处理
+    // 内部回调处理
     // ========================================================================
 
-    fn onConnected(ctx: ?*anyopaque, client: *quic.AsyncClient, conn: *quic.Connection) void {
-        _ = client;
+    fn onClientConnected(ctx: ?*anyopaque, conn: *QUICConnection) void {
         _ = conn;
-        const self = castSelf(ctx) orelse return;
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.connected = true;
-        std.log.info("[DirectTransport] Connected to backend", .{});
+        std.log.info("[DirectTransport] Connected to {s}:{}", .{ self.config.server_host, self.config.server_port });
     }
 
-    fn onStreamData(ctx: ?*anyopaque, client: *quic.AsyncClient, conn: *quic.Connection, stream_id: u64, data: []const u8, is_fin: bool) void {
-        _ = client;
+    fn onClientStreamData(ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
         _ = conn;
-        const self = castSelf(ctx) orelse return;
+        _ = is_fin;
+        _ = stream_id;
 
-        // 复制数据到队列
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        if (self.recv_queue.items.len >= self.config.max_recv_queue) {
+            std.log.warn("[DirectTransport] Recv queue full, dropping packet", .{});
+            return;
+        }
+
         const data_copy = self.allocator.dupe(u8, data) catch {
-            std.log.err("[DirectTransport] Failed to allocate recv buffer", .{});
+            std.log.err("[DirectTransport] OOM on recv", .{});
             return;
         };
 
-        self.recv_queue.append(self.allocator, .{
-            .stream_id = stream_id,
-            .data = data_copy,
-            .is_fin = is_fin,
-        }) catch {
+        // 【关键修改】：Unmanaged append 需要传入 allocator
+        self.recv_queue.append(self.allocator, .{ .data = data_copy }) catch {
             self.allocator.free(data_copy);
-            std.log.err("[DirectTransport] Failed to enqueue recv data", .{});
+            std.log.err("[DirectTransport] OOM on queue append", .{});
         };
     }
 
-    fn onDisconnected(ctx: ?*anyopaque, client: *quic.AsyncClient, conn: *quic.Connection) void {
-        _ = client;
+    fn onClientClose(ctx: ?*anyopaque, conn: *QUICConnection, event: quic.c.CallbackEvent) void {
         _ = conn;
-        const self = castSelf(ctx) orelse return;
+        _ = event;
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.connected = false;
-        std.log.info("[DirectTransport] Disconnected from backend", .{});
-    }
-
-    fn castSelf(ctx: ?*anyopaque) ?*Self {
-        return if (ctx) |c| @as(*Self, @ptrCast(@alignCast(c))) else null;
+        std.log.info("[DirectTransport] Connection closed", .{});
     }
 };
 
@@ -318,84 +248,120 @@ pub const DirectTransport = struct {
 // 测试
 // ============================================================================
 
-test "DirectTransport init/deinit" {
+test "DirectTransport init and state check" {
     const allocator = std.testing.allocator;
 
-    var event_loop = try xev.Loop.init(.{});
-    defer event_loop.deinit();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
 
     var transport = try DirectTransport.init(allocator, .{
         .server_host = "127.0.0.1",
         .server_port = 8443,
-    }, &event_loop);
+    }, &loop);
     defer transport.deinit();
 
-    try transport.run();
-
-    try transport.resolveImpl(0x01);
-
-    const data = try transport.receiveImpl();
-    _ = data.?;
-    // 发送数据
-    try transport.sendImpl(0x01, "你好");
-
-    try std.testing.expect(!transport.connected);
-    try std.testing.expect(!transport.closed);
+    try std.testing.expectEqual(false, transport.connected);
+    try std.testing.expectEqual(false, transport.closed);
     try std.testing.expect(transport.async_client == null);
 }
 
-test "DirectTransport as interface" {
+test "DirectTransport closed state logic" {
+    std.debug.print("\n=== 正在运行测试: DirectTransport closed state ===\n", .{});
     const allocator = std.testing.allocator;
-
-    var event_loop = try xev.Loop.init(.{});
-    defer event_loop.deinit();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
 
     var transport = try DirectTransport.init(allocator, .{
         .server_host = "127.0.0.1",
         .server_port = 8443,
-    }, &event_loop);
-    defer transport.deinit();
+    }, &loop);
 
-    // 转换为接口
-    const iface = transport.asTransport();
-    _ = iface;
-}
+    transport.deinit();
 
-test "DirectTransport closed state" {
-    const allocator = std.testing.allocator;
-
-    var event_loop = try xev.Loop.init(.{});
-    defer event_loop.deinit();
-
-    var transport = try DirectTransport.init(allocator, .{
-        .server_host = "127.0.0.1",
-        .server_port = 8443,
-    }, &event_loop);
-    defer transport.deinit();
-
-    // 关闭
-    transport.closeImpl();
-
-    // 关闭后操作返回错误
-    try std.testing.expectError(TransportError.Closed, transport.sendImpl(0x01, "test"));
+    try std.testing.expectError(TransportError.Closed, transport.resolveImpl(1));
+    try std.testing.expectError(TransportError.Closed, transport.sendImpl(1, "test"));
     try std.testing.expectError(TransportError.Closed, transport.receiveImpl());
-    try std.testing.expectError(TransportError.Closed, transport.resolveImpl(0x01));
 }
 
-test "DirectTransport resolve creates client" {
+test "DirectTransport integration test (Real Server)" {
+    // 只有当你确定本地 8443 跑着服务器时才运行此测试
+    // 为了防止在 CI 环境报错，如果你想跳过，可以 uncomment 下面这行
+    // if (true) return error.SkipZigTest;
+
+    std.debug.print("\n=== 集成测试: 连接本地 8443 服务器 ===\n", .{});
     const allocator = std.testing.allocator;
 
-    var event_loop = try xev.Loop.init(.{});
-    defer event_loop.deinit();
+    // 1. 初始化 Loop
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
 
+    // 2. 初始化 Transport
     var transport = try DirectTransport.init(allocator, .{
         .server_host = "127.0.0.1",
         .server_port = 8443,
-    }, &event_loop);
+        .alpn = "lyune-gateway", // 确保这里和你的服务器 ALPN 匹配
+        .verify_cert = false, // 开发环境通常忽略自签名证书验证
+    }, &loop);
     defer transport.deinit();
 
-    // 连接应该创建客户端
+    // 3. 发起连接
     try transport.resolveImpl(0x01);
+    std.debug.print("-> 正在发起连接...\n", .{});
 
-    try std.testing.expect(transport.async_client != null);
+    // 4. 【关键步骤】驱动事件循环等待连接成功
+    // 我们设置一个 2秒的超时时间，防止测试死锁
+    const timeout_ns = 6 * std.time.ns_per_s;
+    var elapsed: u64 = 0;
+    const step_ms = 10;
+
+    while (!transport.connected) {
+        // 运行一次事件循环（处理 UDP 收发、定时器）
+        // .no_wait 表示如果有事件就处理，没事件不阻塞立即返回
+        try loop.run(.no_wait);
+
+        // 稍微休眠一下避免 CPU 100%
+        std.Thread.sleep(step_ms * std.time.ns_per_ms);
+       
+        elapsed += step_ms * std.time.ns_per_ms;
+
+        if (elapsed > timeout_ns) {
+            std.debug.print("!! 连接超时 (2s) !!\n", .{});
+            return error.TestTimeout; // 如果连不上，这里会报错
+        }
+    }
+    std.debug.print("-> 连接成功!\n", .{});
+
+    // 5. 发送消息
+    const msg = "Hello from Zig Client!";
+    try transport.sendImpl(0x01, msg);
+    std.debug.print("-> 消息已发送: {s}\n", .{msg});
+
+    // 6. 继续驱动循环，让数据真正发出去，并等待可能的响应
+    // 运行 500ms 看看能不能收到回包
+    var i: usize = 0;
+    var received_any = false;
+    while (i < 50) : (i += 1) {
+        try loop.run(.no_wait);
+
+        // 尝试接收
+        // 如果你的 receiveImpl 返回 !?[]const u8
+        if (try transport.receiveImpl()) |data| {
+            std.debug.print("<- 收到服务器回包: {s}\n", .{data});
+            // 注意：receiveImpl 返回的数据在队列里，
+            // 按照我们之前的实现，所有权移交给了 data，需要我们释放
+            // 但如果 receiveImpl 返回的是 slice，请根据 receiveImpl 的具体实现决定是否 free
+            // 假设 recv_queue.orderedRemove 出来的 data 是调用者拥有的：
+            allocator.free(data);
+            received_any = true;
+            break; // 收到回应就退出
+        }
+
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    if (!received_any) {
+        std.debug.print("-> 未收到回包 (属正常现象，取决于服务器逻辑)\n", .{});
+    }
+
+    std.debug.print("=== 集成测试结束 ===\n", .{});
 }
