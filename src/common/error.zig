@@ -76,24 +76,24 @@ pub const ErrorContext = struct {
 /// 错误处理器函数类型
 pub const ErrorHandler = *const fn (ctx: ErrorContext) void;
 
-/// 默认错误处理器：输出到标准日志
+/// 默认错误处理器：根据严重级别输出到对应的标准日志
 fn defaultHandler(ctx: ErrorContext) void {
-    const severity_str = @tagName(ctx.severity);
     const source_str = @tagName(ctx.source);
 
     if (ctx.raw_error) |raw_err| {
-        std.log.err("[{s}][{s}] {s}: {}", .{
-            severity_str,
-            source_str,
-            ctx.message,
-            raw_err,
-        });
+        switch (ctx.severity) {
+            .debug => std.log.debug("[{s}] {s}: {}", .{ source_str, ctx.message, raw_err }),
+            .info => std.log.info("[{s}] {s}: {}", .{ source_str, ctx.message, raw_err }),
+            .warning => std.log.warn("[{s}] {s}: {}", .{ source_str, ctx.message, raw_err }),
+            .err, .critical => std.log.err("[{s}] {s}: {}", .{ source_str, ctx.message, raw_err }),
+        }
     } else {
-        std.log.err("[{s}][{s}] {s}", .{
-            severity_str,
-            source_str,
-            ctx.message,
-        });
+        switch (ctx.severity) {
+            .debug => std.log.debug("[{s}] {s}", .{ source_str, ctx.message }),
+            .info => std.log.info("[{s}] {s}", .{ source_str, ctx.message }),
+            .warning => std.log.warn("[{s}] {s}", .{ source_str, ctx.message }),
+            .err, .critical => std.log.err("[{s}] {s}", .{ source_str, ctx.message }),
+        }
     }
 }
 

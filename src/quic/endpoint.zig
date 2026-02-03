@@ -35,6 +35,9 @@ pub const Endpoint = struct {
     thread_id: u8,
     thread_id_ptr: *u8,
 
+     // 【新增】专门存转换格式后的 ALPN 数据，防止内存泄露
+    alpn_buffer: []u8,
+
     pub const Error = error{
         CreateFailed,
         OutOfMemory,
@@ -71,13 +74,24 @@ pub const Endpoint = struct {
         const thread_id_ptr = allocator.create(u8) catch return Error.OutOfMemory;
         thread_id_ptr.* = thread_id;
 
+        const raw_alpn = config.base.alpn;
+        const alpn_len = raw_alpn.len;
+        if (alpn_len > 255) return Error.CreateFailed;
+
+        const alpn_buffer = try allocator.alloc(u8, alpn_len + 2);
+        errdefer allocator.free(alpn_buffer);
+
+        alpn_buffer[0] = @intCast(alpn_len); // 第1个字节存长度
+        @memcpy(alpn_buffer[1 .. 1 + alpn_len], raw_alpn); // 后面存内容
+        alpn_buffer[1 + alpn_len] = 0; // 最后补个0安全点
+
         // 创建 picoquic 上下文
         const quic_ctx = quic_c.c.picoquic_create(
             config.base.max_connections,
             if (config.cert_file) |s| s.ptr else null,
             if (config.key_file) |s| s.ptr else null,
             if (config.base.root_cert_file) |s| s.ptr else null,
-            config.base.alpn.ptr,
+            alpn_buffer.ptr,
             streamCallback,
             callback_ctx,
             connectionIdCallback,
@@ -106,10 +120,17 @@ pub const Endpoint = struct {
         tp.initial_max_stream_id_unidir = config.base.initial_max_streams_uni * 4;
         tp.max_idle_timeout = config.base.idle_timeout_ms;
         tp.max_packet_size = quic_c.MAX_PACKET_SIZE;
+        // RFC 9000 要求 active_connection_id_limit 至少为 2
+        tp.active_connection_id_limit = 8;
         _ = quic_c.c.picoquic_set_default_tp(quic_ctx, &tp);
 
         // 设置空闲超时
         quic_c.c.picoquic_set_default_idle_timeout(quic_ctx, config.base.idle_timeout_ms);
+
+        // 如果禁用证书验证（用于自签名证书的开发环境）
+        if (!config.base.verify_cert) {
+            quic_c.c.picoquic_set_null_verifier(quic_ctx);
+        }
 
         return .{
             .quic_ctx = quic_ctx,
@@ -118,6 +139,7 @@ pub const Endpoint = struct {
             .callback_ctx = callback_ctx,
             .thread_id = thread_id,
             .thread_id_ptr = thread_id_ptr,
+            .alpn_buffer = alpn_buffer, // 【别忘了存起来】
         };
     }
 
@@ -125,6 +147,7 @@ pub const Endpoint = struct {
         quic_c.c.picoquic_free(self.quic_ctx);
         self.allocator.destroy(self.callback_ctx);
         self.allocator.destroy(self.thread_id_ptr);
+        self.allocator.free(self.alpn_buffer);
     }
 
     /// 设置连接回调（QUIC 握手完成，连接建立时）

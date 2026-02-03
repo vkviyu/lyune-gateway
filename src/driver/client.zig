@@ -115,8 +115,24 @@ pub const AsyncClient = struct {
         // 简单的同步 DNS 解析（生产环境建议换成异步）
         const list = std.net.getAddressList(self.allocator, host, port) catch return Error.ResolveFailed;
         defer list.deinit();
-        if (list.addrs.len == 0) return Error.ResolveFailed;
-        const server_addr = list.addrs[0];
+
+        var server_addr: std.net.Address = undefined;
+        var found_ipv4 = false;
+
+        // 遍历结果，只找 IPv4 的
+        for (list.addrs) |addr| {
+            if (addr.any.family == std.posix.AF.INET) {
+                server_addr = addr;
+                found_ipv4 = true;
+                break;
+            }
+        }
+
+        if (!found_ipv4) {
+            // 如果只有 IPv6 或者找不到地址，就报错，防止后面出错
+            return Error.ResolveFailed; 
+        }
+
 
         // 将 Zig Address 转为 C sockaddr
         var sockaddr_storage: quic_c.c.struct_sockaddr_storage = undefined;

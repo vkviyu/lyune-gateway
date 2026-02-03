@@ -21,6 +21,10 @@ pub const Config = struct {
     /// 根证书文件路径（用于验证对端证书）
     root_cert_file: ?[:0]const u8 = null,
 
+    /// 是否验证对端证书（客户端模式）
+    /// 如果为 false，将禁用证书验证（用于自签名证书的开发环境）
+    verify_cert: bool = true,
+
     /// ALPN 协议标识
     alpn: [:0]const u8 = "lyune-im",
 

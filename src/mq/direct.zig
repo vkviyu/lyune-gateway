@@ -32,7 +32,7 @@ pub const DirectConfig = struct {
     /// 连接超时（毫秒）
     connect_timeout_ms: u32 = 5000,
     /// 是否验证服务器证书 (TODO: 传递给底层)
-    verify_cert: bool = false,
+    verify_cert: bool = true,
     /// 根证书文件路径（可选）
     root_cert_file: ?[:0]const u8 = null,
 };
@@ -122,6 +122,7 @@ pub const DirectTransport = struct {
                 .base = .{
                     .alpn = self.config.alpn,
                     .root_cert_file = self.config.root_cert_file,
+                    .verify_cert = self.config.verify_cert,
                 },
                 .bind_port = 0,
             };
@@ -309,10 +310,10 @@ test "DirectTransport integration test (Real Server)" {
     std.debug.print("-> 正在发起连接...\n", .{});
 
     // 4. 【关键步骤】驱动事件循环等待连接成功
-    // 我们设置一个 2秒的超时时间，防止测试死锁
+    // 我们设置一个超时时间，防止测试死锁
     const timeout_ns = 6 * std.time.ns_per_s;
     var elapsed: u64 = 0;
-    const step_ms = 10;
+    const step_ms: u64 = 10; // 每 10ms 检查一次，保证 QUIC 握手能及时响应
 
     while (!transport.connected) {
         // 运行一次事件循环（处理 UDP 收发、定时器）
@@ -321,11 +322,11 @@ test "DirectTransport integration test (Real Server)" {
 
         // 稍微休眠一下避免 CPU 100%
         std.Thread.sleep(step_ms * std.time.ns_per_ms);
-       
+
         elapsed += step_ms * std.time.ns_per_ms;
 
         if (elapsed > timeout_ns) {
-            std.debug.print("!! 连接超时 (2s) !!\n", .{});
+            std.debug.print("!! 连接超时 (6s) !!\n", .{});
             return error.TestTimeout; // 如果连不上，这里会报错
         }
     }
