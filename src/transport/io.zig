@@ -164,7 +164,7 @@ pub const IoLoop = struct {
         // 2. 检查状态
         // 如果定时器已经是 Active 状态，不要再次调用 scheduleTimer
         // 否则 libxev 会报 "invalid state" 错误
-        if (self.timer_completion.state == .active) {
+        if (self.timer_completion.state() == .active) {
             // 策略：直接返回，不做操作。
             // 虽然这可能导致这一次的唤醒时间不够精确（还是按照旧的时间触发），
             // 但能保证程序不崩，且定时器链条不断裂。
