@@ -31,7 +31,7 @@ pub const DirectConfig = struct {
     max_recv_queue: usize = 1024,
     /// 连接超时（毫秒）
     connect_timeout_ms: u32 = 5000,
-    /// 是否验证服务器证书 (TODO: 传递给底层)
+    /// 是否验证服务器证书
     verify_cert: bool = true,
     /// 根证书文件路径（可选）
     root_cert_file: ?[:0]const u8 = null,
