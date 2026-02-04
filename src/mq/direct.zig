@@ -65,7 +65,7 @@ pub const DirectTransport = struct {
     async_client: ?AsyncClient,
 
     /// 接收队列 (使用 Unmanaged，节省内存并手动管理 Allocator)
-    recv_queue: std.ArrayListUnmanaged(ReceivedPacket),
+    recv_queue: std.ArrayList(ReceivedPacket),
 
     /// 状态标记
     connected: bool,
@@ -229,7 +229,6 @@ pub const DirectTransport = struct {
             return;
         };
 
-        // 【关键修改】：Unmanaged append 需要传入 allocator
         self.recv_queue.append(self.allocator, .{ .data = data_copy }) catch {
             self.allocator.free(data_copy);
             std.log.err("[DirectTransport] OOM on queue append", .{});

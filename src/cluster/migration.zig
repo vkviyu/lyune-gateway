@@ -15,7 +15,7 @@ pub const ForwardPacket = struct {
 /// 线程间的消息队列（简单互斥锁实现，适用于低频转发）
 pub const PacketQueue = struct {
     mutex: std.Thread.Mutex = .{},
-    queue: std.ArrayListUnmanaged(ForwardPacket) = .{},
+    queue: std.ArrayList(ForwardPacket) = .{},
     allocator: std.mem.Allocator,
     // 用于唤醒目标线程的 Async 句柄（这里简化，假设通过轮询或已有机制唤醒）
     // 在 xev 中，可以使用 async handle。
@@ -42,7 +42,7 @@ pub const PacketQueue = struct {
         try self.queue.append(self.allocator, pkt);
     }
 
-    pub fn popAll(self: *PacketQueue, out: *std.ArrayListUnmanaged(ForwardPacket)) !void {
+    pub fn popAll(self: *PacketQueue, out: *std.ArrayList(ForwardPacket)) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.queue.items.len == 0) return;
