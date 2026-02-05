@@ -45,6 +45,17 @@ pub const TransportError = error{
 };
 
 // ============================================================================
+// 回调类型
+// ============================================================================
+
+/// 连接就绪回调类型
+///
+/// 当 resolve 操作完成（成功或失败）时被调用。
+/// - ctx: 用户传入的上下文指针
+/// - err: 如果操作失败则包含错误码，成功时为 null
+pub const ResolveCallback = *const fn (ctx: ?*anyopaque, err: ?TransportError) void;
+
+// ============================================================================
 // 后端传输接口
 // ============================================================================
 
@@ -75,12 +86,23 @@ pub const BackendTransport = struct {
 
     /// 虚函数表定义
     pub const VTable = struct {
-        /// 解析/连接目标
+        /// 解析/连接目标（异步）
         ///
         /// 根据 RouteKey 建立到后端的连接或获取通信通道。
+        /// 此方法为异步操作，连接结果通过回调通知。
         /// - 中继模式：确保 MQ 连接就绪，订阅对应 topic
         /// - 直连模式：通过服务发现获取后端地址，建立连接
-        resolve: *const fn (ptr: *anyopaque, route_key: u8) TransportError!void,
+        /// 
+        /// 参数：
+        /// - route_key: 路由键
+        /// - on_ready: 连接就绪或失败时的回调（可为 null）
+        /// - ctx: 回调上下文
+        resolve: *const fn (
+            ptr: *anyopaque,
+            route_key: u8,
+            on_ready: ?ResolveCallback,
+            ctx: ?*anyopaque,
+        ) void,
 
         /// 发送数据到后端
         ///
@@ -102,9 +124,16 @@ pub const BackendTransport = struct {
         close: *const fn (ptr: *anyopaque) void,
     };
 
-    /// 解析/连接目标
-    pub fn resolve(self: BackendTransport, route_key: u8) TransportError!void {
-        return self.vtable.resolve(self.ptr, route_key);
+    /// 解析/连接目标（异步）
+    ///
+    /// 发起连接但不等待，连接结果通过回调通知。
+    pub fn resolve(
+        self: BackendTransport,
+        route_key: u8,
+        on_ready: ?ResolveCallback,
+        ctx: ?*anyopaque,
+    ) void {
+        return self.vtable.resolve(self.ptr, route_key, on_ready, ctx);
     }
 
     /// 发送数据到后端
@@ -126,15 +155,20 @@ pub const BackendTransport = struct {
     ///
     /// 用于将具体实现类型转换为统一的接口类型。
     /// 具体实现需要提供以下方法：
-    /// - `resolveImpl(self, route_key) !void`
+    /// - `resolveImpl(self, route_key, on_ready, ctx) void` (异步)
     /// - `sendImpl(self, route_key, data) !void`
     /// - `receiveImpl(self) !?[]const u8`
     /// - `closeImpl(self) void`
     pub fn init(comptime T: type, impl: *T) BackendTransport {
         const gen = struct {
-            fn resolveImpl(ptr: *anyopaque, route_key: u8) TransportError!void {
+            fn resolveImpl(
+                ptr: *anyopaque,
+                route_key: u8,
+                on_ready: ?ResolveCallback,
+                ctx: ?*anyopaque,
+            ) void {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                return self.resolveImpl(route_key);
+                return self.resolveImpl(route_key, on_ready, ctx);
             }
 
             fn sendImpl(ptr: *anyopaque, route_key: u8, data: []const u8) TransportError!void {
@@ -172,14 +206,24 @@ pub const BackendTransport = struct {
 // ============================================================================
 
 test "BackendTransport interface" {
-    // 测试用的简单实现
+    // 测试用的简单实现（同步模拟）
     const TestTransport = struct {
         resolved: bool = false,
         sent_data: ?[]const u8 = null,
         closed: bool = false,
+        callback_called: bool = false,
 
-        pub fn resolveImpl(self: *@This(), _: u8) TransportError!void {
+        pub fn resolveImpl(
+            self: *@This(),
+            _: u8,
+            on_ready: ?ResolveCallback,
+            ctx: ?*anyopaque,
+        ) void {
             self.resolved = true;
+            // 同步场景下立即调用回调
+            if (on_ready) |cb| {
+                cb(ctx, null); // 成功
+            }
         }
 
         pub fn sendImpl(self: *@This(), _: u8, data: []const u8) TransportError!void {
@@ -198,9 +242,22 @@ test "BackendTransport interface" {
     var impl = TestTransport{};
     const transport = BackendTransport.init(TestTransport, &impl);
 
-    // 测试 resolve
-    try transport.resolve(0x01);
+    // 测试 resolve（异步回调模式）
+    const TestCtx = struct {
+        called: bool = false,
+        
+        fn onReady(ctx: ?*anyopaque, err: ?TransportError) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+            // 验证没有错误
+            std.testing.expect(err == null) catch {};
+        }
+    };
+    
+    var test_ctx = TestCtx{};
+    transport.resolve(0x01, TestCtx.onReady, &test_ctx);
     try std.testing.expect(impl.resolved);
+    try std.testing.expect(test_ctx.called);
 
     // 测试 send
     const test_data = "hello";
