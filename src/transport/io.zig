@@ -90,6 +90,7 @@ pub const IoLoop = struct {
             0,
         ) catch return Error.SocketCreateFailed;
 
+
         // 设置 SO_REUSEPORT 允许多线程监听同一端口
         std.posix.setsockopt(
             socket_fd,
@@ -360,8 +361,7 @@ pub const IoLoop = struct {
             if (e != error.WouldBlock and e != error.OperationCanceled) {
                 err_handler.reportError(.transport, "UDP recv error", e);
             }
-            if (self.running) self.startRecv();
-            return .disarm;
+            return if (self.running) .rearm else .disarm;
         };
 
         if (len > 0) {
@@ -373,10 +373,7 @@ pub const IoLoop = struct {
             }
         }
 
-        if (self.running) {
-            self.startRecv();
-        }
-        return .disarm;
+        return if (self.running) .rearm else .disarm;
     }
 
     fn scheduleTimer(self: *Self, delay_ms: u64) void {
@@ -413,19 +410,19 @@ pub const IoLoop = struct {
         const self = ud orelse return .disarm;
         if (!self.running) return .disarm;
 
-        if (result) |_| {
-            if (self.timer_callback) |cb| {
-                if (self.callback_ctx) |ctx| {
-                    cb(ctx);
-                }
+        _ = result catch {};
+
+        if (self.timer_callback) |cb| {
+            if (self.callback_ctx) |ctx| {
+                cb(ctx);
             }
+        }
+
+        // cb(ctx) 内部会通过 processQuicEvents → updateTimer → scheduleTimer 重新注册 timer
+        // 只有当回调没有重新调度时（completion 仍为 .dead），才需要手动重新调度
+        // 避免同一个 timer_completion 被双重推入 submissions 队列
+        if (self.timer_completion.state() != .active) {
             self.scheduleTimer(self.timer_interval_ms);
-        } else |err| {
-            if (err == error.OperationCanceled) {
-                self.scheduleTimer(self.timer_interval_ms);
-            } else {
-                self.scheduleTimer(self.timer_interval_ms);
-            }
         }
 
         return .disarm;
