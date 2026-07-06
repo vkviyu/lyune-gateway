@@ -2,7 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const gateway = @import("gateway/mod.zig");
-
+const mq_direct = @import("mq/direct.zig");
+const mq_registry = @import("mq/registry.zig");
 
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}).init;
@@ -77,6 +78,8 @@ fn runServer(allocator: std.mem.Allocator, threads: ?usize) !void {
 
 /// 运行单个 Worker 实例
 fn runSingleWorker(allocator: std.mem.Allocator, thread_id: u8) !void {
+    const registry = mq_registry.TransportRegistry.init();
+
     var worker = gateway.worker.GatewayWorker.init(allocator, .{
         .cert_file = "server.crt",
         .key_file = "server.key",
@@ -87,12 +90,21 @@ fn runSingleWorker(allocator: std.mem.Allocator, thread_id: u8) !void {
             .max_connections = 10000,
             .idle_timeout_ms = 30000,
         },
-    }, thread_id) catch |err| {
+    }, thread_id, registry) catch |err| {
         std.log.err("Failed to create gateway worker: {}", .{err});
         std.log.err("Make sure server.crt and server.key exist.", .{});
         return err;
     };
     defer worker.deinit();
+
+    var direct_transport = try mq_direct.DirectTransport.init(allocator, .{
+        .server_host = "127.0.0.1",
+        .server_port = 8443,
+        .verify_cert = false,
+    }, worker.event_loop);
+    defer direct_transport.deinit();
+
+    worker.registerTransport(.direct, 0x01, direct_transport.asTransport());
 
     try worker.run();
 }

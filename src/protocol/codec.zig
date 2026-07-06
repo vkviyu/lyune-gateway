@@ -12,7 +12,7 @@
 //! ```zig
 //! // 编码
 //! var encoder = FrameEncoder.init(&buf);
-//! const frame_data = try encoder.encode(.buffered, RouteKey.DEFAULT, payload);
+//! const frame_data = try encoder.encode(.relay_buffered, RouteKey.DEFAULT, payload);
 //!
 //! // 解码（增量）
 //! var decoder = FrameDecoder.init(allocator);
@@ -248,12 +248,12 @@ pub const FrameDecoder = struct {
     pub fn init(allocator: std.mem.Allocator) FrameDecoder {
         return .{
             .allocator = allocator,
-            .buffer = std.ArrayList(u8).init(allocator),
+            .buffer = .{},
         };
     }
 
     pub fn deinit(self: *FrameDecoder) void {
-        self.buffer.deinit();
+        self.buffer.deinit(self.allocator);
     }
 
     /// 重置解码器状态
@@ -268,7 +268,7 @@ pub const FrameDecoder = struct {
     /// @param data 新收到的数据
     /// @return 解析出的帧，或 null（数据不完整）
     pub fn feed(self: *FrameDecoder, data: []const u8) !?Frame {
-        try self.buffer.appendSlice(data);
+        try self.buffer.appendSlice(self.allocator, data);
         return self.tryParse();
     }
 
@@ -360,13 +360,13 @@ test "FrameEncoder basic encode" {
     var encoder = FrameEncoder.init(&buf);
 
     const payload = "Hello, World!";
-    const frame_data = try encoder.encode(.buffered, 0, payload);
+    const frame_data = try encoder.encode(.relay_buffered, 0, payload);
 
     try std.testing.expectEqual(HEADER_SIZE + payload.len, frame_data.len);
 
     // 验证可以解码
     const header = try FrameHeader.decode(frame_data[0..HEADER_SIZE]);
-    try std.testing.expectEqual(TransportMode.buffered, header.mode);
+    try std.testing.expectEqual(TransportMode.relay_buffered, header.mode);
     try std.testing.expectEqual(payload.len, header.body_len);
 }
 
@@ -376,7 +376,7 @@ test "FrameDecoder incremental parse" {
     // 编码一个帧
     var encode_buf: [1024]u8 = undefined;
     var encoder = FrameEncoder.init(&encode_buf);
-    const frame_data = try encoder.encode(.buffered, 0, "Test");
+    const frame_data = try encoder.encode(.relay_buffered, 0, "Test");
 
     // 增量解码
     var decoder = FrameDecoder.init(allocator);

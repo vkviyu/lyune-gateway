@@ -13,6 +13,8 @@ const backend_mod = @import("backend.zig");
 const BackendTransport = backend_mod.BackendTransport;
 const TransportError = backend_mod.TransportError;
 const ResolveCallback = backend_mod.ResolveCallback;
+const TransportRecv = backend_mod.TransportRecv;
+const protocol = @import("../protocol/mod.zig");
 
 const QUICConnection = quic.connection.Connection;
 
@@ -27,7 +29,7 @@ pub const DirectConfig = struct {
     /// 后端服务器端口
     server_port: u16,
     /// ALPN 协议标识
-    alpn: [:0]const u8 = "lyune-gateway",
+    alpn: [:0]const u8 = "lyune-im",
     /// 接收队列最大容量 (防止内存无限增长)
     max_recv_queue: usize = 1024,
     /// 连接超时（毫秒）
@@ -42,9 +44,14 @@ pub const DirectConfig = struct {
 // 接收数据结构
 // ============================================================================
 
-/// 内部队列使用的接收数据包
+/// 内部队列使用的接收事件。
+///
+/// `stream_id` 和 `is_fin` 属于后端 QUIC stream 语义，上层需要用它们将后端响应
+/// 关联回客户端 stream，并正确处理流式结束。
 const ReceivedPacket = struct {
+    stream_id: u64,
     data: []u8, // 拥有所有权
+    is_fin: bool,
 
     fn deinit(self: ReceivedPacket, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
@@ -71,13 +78,17 @@ pub const DirectTransport = struct {
     /// 状态标记
     connected: bool,
     closed: bool,
-    
+
     /// 异步回调：连接就绪回调
     on_ready_callback: ?ResolveCallback,
     /// 异步回调：回调上下文
     on_ready_ctx: ?*anyopaque,
     /// 回调是否已触发（确保只调用一次）
     callback_fired: bool,
+
+    /// 下一个由客户端发起的后端双向 stream id。
+    /// QUIC 客户端发起的 bidi stream id 从 0 开始，每次递增 4。
+    next_bidi_stream_id: u64,
 
     // ========================================================================
     // 生命周期
@@ -95,6 +106,7 @@ pub const DirectTransport = struct {
             .on_ready_callback = null,
             .on_ready_ctx = null,
             .callback_fired = false,
+            .next_bidi_stream_id = 0,
         };
     }
 
@@ -114,7 +126,7 @@ pub const DirectTransport = struct {
 
         self.closed = true;
         self.connected = false;
-        
+
         // 3. 清理回调状态
         self.on_ready_callback = null;
         self.on_ready_ctx = null;
@@ -226,18 +238,18 @@ pub const DirectTransport = struct {
     fn fireCallback(self: *Self, err: ?TransportError) void {
         if (self.callback_fired) return;
         self.callback_fired = true;
-        
+
         if (self.on_ready_callback) |cb| {
             cb(self.on_ready_ctx, err);
         }
-        
+
         // 清理回调引用
         self.on_ready_callback = null;
         self.on_ready_ctx = null;
     }
 
-    /// 发送数据
-    pub fn sendImpl(self: *Self, route_key: u8, data: []const u8) TransportError!void {
+    /// 发送已经编码好的数据到后端，并返回后端 stream id。
+    pub fn sendImpl(self: *Self, route_key: u8, data: []const u8) TransportError!u64 {
         _ = route_key;
 
         if (self.closed) return TransportError.Closed;
@@ -247,21 +259,32 @@ pub const DirectTransport = struct {
         if (client.active_connection) |*conn| {
             if (!conn.isConnected()) return TransportError.ConnectionFailed;
 
-            // streamWrite 可能需要根据最新的 connection.zig 调整签名
-            conn.streamWrite(0, data, false) catch return TransportError.SendFailed;
+            const stream_id = self.nextBidiStreamId();
+            conn.streamWrite(stream_id, data, true) catch return TransportError.SendFailed;
+            return stream_id;
         } else {
             return TransportError.ConnectionFailed;
         }
     }
 
-    /// 接收数据
-    pub fn receiveImpl(self: *Self) TransportError!?[]const u8 {
+    fn nextBidiStreamId(self: *Self) u64 {
+        const stream_id = self.next_bidi_stream_id;
+        self.next_bidi_stream_id += 4;
+        return stream_id;
+    }
+
+    /// 接收后端返回的 stream-aware 事件。
+    pub fn receiveImpl(self: *Self) TransportError!?TransportRecv {
         if (self.closed) return TransportError.Closed;
 
         if (self.recv_queue.items.len > 0) {
             // orderedRemove 不需要 allocator，它只是移动内存
             const pkt = self.recv_queue.orderedRemove(0);
-            return pkt.data;
+            return .{
+                .stream_id = pkt.stream_id,
+                .data = pkt.data,
+                .is_fin = pkt.is_fin,
+            };
         }
 
         return null;
@@ -284,20 +307,20 @@ pub const DirectTransport = struct {
     fn onClientConnected(ctx: ?*anyopaque, conn: *QUICConnection) void {
         _ = conn;
         const self: *Self = @ptrCast(@alignCast(ctx));
-        
+
         self.connected = true;
         std.log.info("[DirectTransport] Connected to {s}:{}", .{ self.config.server_host, self.config.server_port });
-        
+
         // 连接成功，调用用户回调
         self.fireCallback(null);
     }
 
     fn onClientStreamData(ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
         _ = conn;
-        _ = is_fin;
-        _ = stream_id;
 
         const self: *Self = @ptrCast(@alignCast(ctx));
+
+        if (data.len == 0 and !is_fin) return;
 
         if (self.recv_queue.items.len >= self.config.max_recv_queue) {
             std.log.warn("[DirectTransport] Recv queue full, dropping packet", .{});
@@ -309,7 +332,11 @@ pub const DirectTransport = struct {
             return;
         };
 
-        self.recv_queue.append(self.allocator, .{ .data = data_copy }) catch {
+        self.recv_queue.append(self.allocator, .{
+            .stream_id = stream_id,
+            .data = data_copy,
+            .is_fin = is_fin,
+        }) catch {
             self.allocator.free(data_copy);
             std.log.err("[DirectTransport] OOM on queue append", .{});
         };
@@ -319,12 +346,12 @@ pub const DirectTransport = struct {
         _ = conn;
         _ = event;
         const self: *Self = @ptrCast(@alignCast(ctx));
-        
+
         const was_connected = self.connected;
         self.connected = false;
-        
+
         std.log.info("[DirectTransport] Connection closed", .{});
-        
+
         // 如果连接尚未建立就关闭了，表示连接失败
         if (!was_connected) {
             self.fireCallback(TransportError.ConnectionFailed);
@@ -369,18 +396,18 @@ test "DirectTransport closed state logic" {
     // 测试关闭状态下的回调行为
     const TestCtx = struct {
         error_received: ?TransportError = null,
-        
+
         fn onReady(ctx: ?*anyopaque, err: ?TransportError) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.error_received = err;
         }
     };
-    
+
     var test_ctx = TestCtx{};
     transport.resolveImpl(1, TestCtx.onReady, &test_ctx);
     try std.testing.expect(test_ctx.error_received != null);
     try std.testing.expect(test_ctx.error_received.? == TransportError.Closed);
-    
+
     try std.testing.expectError(TransportError.Closed, transport.sendImpl(1, "test"));
     try std.testing.expectError(TransportError.Closed, transport.receiveImpl());
 }
@@ -400,7 +427,7 @@ test "DirectTransport integration test (Real Server)" {
     var transport = try DirectTransport.init(allocator, .{
         .server_host = "127.0.0.1",
         .server_port = 8443,
-        .alpn = "lyune-gateway",
+        .alpn = "lyune-im",
         .verify_cert = false,
         .connect_timeout_ms = 6000, // 6秒超时
     }, &loop);
@@ -412,29 +439,37 @@ test "DirectTransport integration test (Real Server)" {
         allocator: std.mem.Allocator,
         connected: bool = false,
         connect_error: ?TransportError = null,
-        
+        sent_stream_id: ?u64 = null,
+
         fn onConnected(ctx: ?*anyopaque, err: ?TransportError) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            
+
             if (err) |e| {
                 self.connect_error = e;
                 std.debug.print("!! 连接失败: {}\n", .{e});
                 return;
             }
-            
+
             self.connected = true;
             std.debug.print("-> 连接成功!\n", .{});
-            
-            // 连接成功后发送消息
+
+            // 连接成功后发送完整的 Lyune Frame，而不是裸字符串。
             const msg = "Hello from Zig Client!";
-            self.transport.sendImpl(0x01, msg) catch |send_err| {
+            var frame_buf: [1024]u8 = undefined;
+            var encoder = protocol.codec.FrameEncoder.init(&frame_buf);
+            const frame_data = encoder.encode(.direct_buffered, 0x01, msg) catch |encode_err| {
+                std.debug.print("!! 编码失败: {}\n", .{encode_err});
+                return;
+            };
+            const stream_id = self.transport.sendImpl(0x01, frame_data) catch |send_err| {
                 std.debug.print("!! 发送失败: {}\n", .{send_err});
                 return;
             };
-            std.debug.print("-> 消息已发送: {s}\n", .{msg});
+            self.sent_stream_id = stream_id;
+            std.debug.print("-> 消息已发送: stream={}, body={s}\n", .{ stream_id, msg });
         }
     };
-    
+
     var test_ctx = TestContext{
         .transport = &transport,
         .allocator = allocator,
@@ -453,7 +488,7 @@ test "DirectTransport integration test (Real Server)" {
         try loop.run(.no_wait);
         std.Thread.sleep(step_ms * std.time.ns_per_ms);
         elapsed += step_ms * std.time.ns_per_ms;
-        
+
         if (elapsed > timeout_ns) {
             std.debug.print("!! 测试超时 (6s) !!\n", .{});
             return error.TestTimeout;
@@ -469,21 +504,40 @@ test "DirectTransport integration test (Real Server)" {
     // 6. 继续驱动循环，让数据发送出去并等待回复
     var received_any = false;
     var recv_attempts: usize = 0;
-    while (recv_attempts < 50) : (recv_attempts += 1) {
+    var decoder = protocol.codec.FrameDecoder.init(allocator);
+    defer decoder.deinit();
+
+    while (recv_attempts < 100) : (recv_attempts += 1) {
         try loop.run(.no_wait);
-        
-        if (try transport.receiveImpl()) |data| {
-            std.debug.print("<- 收到服务器回包: {s}\n", .{data});
-            allocator.free(data);
-            received_any = true;
-            break;
+
+        if (try transport.receiveImpl()) |event| {
+            defer event.deinit(allocator);
+            if (event.data.len == 0) continue;
+
+            if (test_ctx.sent_stream_id) |sent_stream_id| {
+                try std.testing.expectEqual(sent_stream_id, event.stream_id);
+            }
+
+            if (try decoder.feed(event.data)) |frame| {
+                const body = frame.body;
+                std.debug.print(
+                    "<- 收到服务器回包: stream={}, fin={}, mode=0x{x}, route=0x{x}, body={s}\n",
+                    .{ event.stream_id, event.is_fin, @intFromEnum(frame.header.mode), frame.header.route_key, body },
+                );
+                try std.testing.expectEqual(protocol.frame.TransportMode.direct_buffered, frame.header.mode);
+                try std.testing.expectEqual(@as(u8, 0x01), frame.header.route_key);
+                try std.testing.expect(std.mem.indexOf(u8, body, "Echo: Hello from Zig Client!") != null);
+                received_any = true;
+                break;
+            }
         }
-        
+
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
     if (!received_any) {
-        std.debug.print("-> 未收到回包 (属正常现象，取决于服务器逻辑)\n", .{});
+        std.debug.print("!! 未收到有效回包\n", .{});
+        return error.NoResponse;
     }
 
     std.debug.print("=== 集成测试结束 ===\n", .{});

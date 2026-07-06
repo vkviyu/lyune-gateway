@@ -16,10 +16,15 @@ const err_handler = common.err;
 const driver = @import("../driver/mod.zig");
 const ServerDriver = driver.server.ServerDriver;
 const protocol = @import("../protocol/mod.zig");
+const mq_backend = @import("../mq/backend.zig");
+const mq_registry = @import("../mq/registry.zig");
 const quic = @import("../quic/mod.zig");
 const QUICConfig = quic.config.QUICConfig;
 const QUICConnection = quic.connection.Connection;
 const QUICCallbackEvent = quic.c.CallbackEvent;
+const BackendTransport = mq_backend.BackendTransport;
+const TransportRegistry = mq_registry.TransportRegistry;
+const TransportPath = mq_registry.TransportPath;
 const connection = @import("connection.zig");
 const ConnectionManager = connection.ConnectionManager;
 const ConnectionContext = connection.ConnectionContext;
@@ -29,6 +34,11 @@ const ConnectionContext = connection.ConnectionContext;
 // 泛型实例化
 const BufferedHandler = protocol.handler.BufferedMessageHandler(ConnectionContext);
 const StreamDelegate = protocol.handler.StreamDelegate(ConnectionContext);
+
+const BackendStreamRoute = struct {
+    client_cnx: quic.c.QuicCnx,
+    client_stream_id: u64,
+};
 
 pub const GatewayWorker = struct {
     const Self = @This();
@@ -40,6 +50,12 @@ pub const GatewayWorker = struct {
 
     // 业务组件
     conn_manager: ConnectionManager,
+    transport_registry: TransportRegistry,
+    backend_routes: std.AutoHashMap(u64, BackendStreamRoute),
+
+    // Backend receive polling timer.
+    backend_timer: xev.Timer,
+    backend_timer_completion: xev.Completion = undefined,
 
     // 事件循环 (Worker 拥有所有权)
     event_loop: *xev.Loop,
@@ -47,7 +63,7 @@ pub const GatewayWorker = struct {
     running: bool = false,
 
     /// 创建 Worker 实例
-    pub fn init(allocator: std.mem.Allocator, config: QUICConfig, thread_id: u8) !Self {
+    pub fn init(allocator: std.mem.Allocator, config: QUICConfig, thread_id: u8, transport_registry: TransportRegistry) !Self {
         // 1. 创建 Event Loop
         const event_loop = try allocator.create(xev.Loop);
         event_loop.* = xev.Loop.init(.{}) catch {
@@ -64,16 +80,24 @@ pub const GatewayWorker = struct {
         var server_driver = try ServerDriver.init(allocator, config, thread_id, event_loop);
         errdefer server_driver.deinit();
 
+        const backend_timer = xev.Timer.init() catch return error.TimerInitFailed;
+        errdefer backend_timer.deinit();
+
         return .{
             .allocator = allocator,
             .server_driver = server_driver,
             .conn_manager = ConnectionManager.init(allocator),
+            .transport_registry = transport_registry,
+            .backend_routes = std.AutoHashMap(u64, BackendStreamRoute).init(allocator),
+            .backend_timer = backend_timer,
             .event_loop = event_loop,
         };
     }
 
     /// 释放资源
     pub fn deinit(self: *Self) void {
+        self.backend_routes.deinit();
+        self.backend_timer.deinit();
         self.conn_manager.deinit();
         self.server_driver.deinit();
         self.event_loop.deinit();
@@ -90,6 +114,8 @@ pub const GatewayWorker = struct {
 
         // 2. 启动 Driver (非阻塞)
         self.server_driver.start();
+        self.resolveRegisteredTransports();
+        self.scheduleBackendPoll(10);
 
         std.log.info("GatewayWorker loop running...", .{});
 
@@ -103,6 +129,22 @@ pub const GatewayWorker = struct {
         self.server_driver.stop();
     }
 
+    pub fn registerTransport(self: *Self, path: TransportPath, route_key: u8, transport: BackendTransport) void {
+        self.transport_registry.register(path, route_key, transport);
+    }
+
+    fn resolveRegisteredTransports(self: *Self) void {
+        for (0..256) |route_key| {
+            const key: u8 = @intCast(route_key);
+            if (self.transport_registry.getExact(.direct, key)) |transport| {
+                transport.resolve(key, onBackendReady, self);
+            }
+            if (self.transport_registry.getExact(.relay, key)) |transport| {
+                transport.resolve(key, onBackendReady, self);
+            }
+        }
+    }
+
     // ========================================================================
     // 业务逻辑回调 (由 Driver 触发)
     // ========================================================================
@@ -112,7 +154,7 @@ pub const GatewayWorker = struct {
         const self = castSelfOpt(ud) orelse return;
 
         // 业务逻辑：注册到管理器
-        _ = self.conn_manager.add(conn) catch |e| {
+        _ = self.conn_manager.add(conn, self) catch |e| {
             err_handler.reportError(.session, "Failed to register connection", e);
             return;
         };
@@ -172,10 +214,119 @@ pub const GatewayWorker = struct {
     }
 
     fn onMessageComplete(ctx: *ConnectionContext, stream_id: u64, message: []const u8, is_fin: bool) void {
-        _ = ctx;
-        // 这里可以处理完整的业务消息，比如解析 HTTP/JSON，或者转发给 Router
-        if (is_fin) {
-            std.log.info("[MSG] complete: stream={}, len={}", .{ stream_id, message.len });
+        const self = ctx.gateway_ctx orelse {
+            std.log.err("[MSG] missing worker context for stream={}", .{stream_id});
+            return;
+        };
+        const worker: *Self = @ptrCast(@alignCast(self));
+        worker.forwardClientMessage(ctx, stream_id, message, is_fin) catch |err| {
+            err_handler.reportError(.session, "Failed to forward client message", err);
+        };
+    }
+
+    fn forwardClientMessage(self: *Self, ctx: *ConnectionContext, client_stream_id: u64, message: []const u8, is_fin: bool) !void {
+        if (!is_fin) return;
+
+        var decoder = protocol.codec.FrameDecoder.init(self.allocator);
+        defer decoder.deinit();
+
+        const frame = (try decoder.feed(message)) orelse return error.IncompleteFrame;
+        const header = frame.header;
+        const path = transportPathForMode(header.mode) orelse {
+            std.log.warn("[ROUTE] unsupported mode=0x{x}", .{@intFromEnum(header.mode)});
+            return;
+        };
+
+        const transport = self.transport_registry.get(path, header.route_key) orelse {
+            std.log.warn("[ROUTE] route not found: path={s}, route=0x{x}", .{ @tagName(path), header.route_key });
+            return;
+        };
+
+        const backend_stream_id = try transport.send(header.route_key, message);
+        try self.backend_routes.put(backend_stream_id, .{
+            .client_cnx = ctx.cnx_handle,
+            .client_stream_id = client_stream_id,
+        });
+
+        std.log.info("[ROUTE] client_stream={} -> backend_stream={} mode=0x{x} route=0x{x}", .{ client_stream_id, backend_stream_id, @intFromEnum(header.mode), header.route_key });
+    }
+
+    fn drainBackendResponses(self: *Self) void {
+        self.drainTransportPath(.direct);
+        self.drainTransportPath(.relay);
+    }
+
+    fn drainTransportPath(self: *Self, path: TransportPath) void {
+        for (0..256) |route_key| {
+            const key: u8 = @intCast(route_key);
+            const transport = self.transport_registry.getExact(path, key) orelse continue;
+            self.drainTransport(transport);
+        }
+    }
+
+    fn drainTransport(self: *Self, transport: BackendTransport) void {
+        while (true) {
+            const event = transport.receive() catch |err| {
+                err_handler.reportError(.session, "Failed to receive backend response", err);
+                return;
+            } orelse break;
+            defer event.deinit(self.allocator);
+
+            const route = self.backend_routes.get(event.stream_id) orelse {
+                std.log.warn("[ROUTE] orphan backend response: backend_stream={}", .{event.stream_id});
+                continue;
+            };
+
+            var client_conn = QUICConnection.fromRaw(route.client_cnx);
+            client_conn.streamWrite(route.client_stream_id, event.data, event.is_fin) catch |err| {
+                err_handler.reportError(.session, "Failed to write backend response to client", err);
+                _ = self.backend_routes.remove(event.stream_id);
+                continue;
+            };
+
+            if (event.is_fin) {
+                _ = self.backend_routes.remove(event.stream_id);
+            }
+        }
+    }
+
+    fn transportPathForMode(mode: protocol.frame.TransportMode) ?TransportPath {
+        if (mode.isDirect()) return .direct;
+        if (mode.isRelay()) return .relay;
+        return null;
+    }
+
+    fn scheduleBackendPoll(self: *Self, delay_ms: u64) void {
+        self.backend_timer.run(self.event_loop, &self.backend_timer_completion, delay_ms, Self, self, backendPollCallback);
+    }
+
+    fn backendPollCallback(
+        ud: ?*Self,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        _ = result catch {};
+
+        const self = ud orelse return .disarm;
+        if (!self.running) return .disarm;
+
+        self.drainBackendResponses();
+        if (self.backend_timer_completion.state() != .active) {
+            self.scheduleBackendPoll(10);
+        }
+        return .disarm;
+    }
+
+    fn onBackendReady(ctx: ?*anyopaque, err: ?mq_backend.TransportError) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        _ = self;
+        if (err) |e| {
+            std.log.err("[BACKEND] transport connect failed: {}", .{e});
+        } else {
+            std.log.info("[BACKEND] transport ready", .{});
         }
     }
 
@@ -183,3 +334,11 @@ pub const GatewayWorker = struct {
         return if (ud) |u| @as(*Self, @ptrCast(@alignCast(u))) else null;
     }
 };
+
+test "GatewayWorker maps frame modes to transport paths" {
+    try std.testing.expectEqual(TransportPath.direct, GatewayWorker.transportPathForMode(.direct_buffered).?);
+    try std.testing.expectEqual(TransportPath.direct, GatewayWorker.transportPathForMode(.direct_streaming).?);
+    try std.testing.expectEqual(TransportPath.relay, GatewayWorker.transportPathForMode(.relay_buffered).?);
+    try std.testing.expectEqual(TransportPath.relay, GatewayWorker.transportPathForMode(.relay_streaming).?);
+    try std.testing.expect(GatewayWorker.transportPathForMode(.control) == null);
+}

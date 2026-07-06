@@ -28,6 +28,7 @@ const std = @import("std");
 const client = @import("backend.zig");
 const BackendTransport = client.BackendTransport;
 const TransportError = client.TransportError;
+const TransportRecv = client.TransportRecv;
 
 // ============================================================================
 // 传输路径类型
@@ -108,7 +109,7 @@ const RouteTable = struct {
 /// 传输注册表
 ///
 /// 管理 TransportPath + RouteKey 到 BackendTransport 的映射关系。
-/// 
+///
 /// ## 设计要点
 ///
 /// 1. 按 TransportPath（relay/direct）分组存储
@@ -228,8 +229,10 @@ test "TransportRegistry basic operations" {
         id: u8,
 
         pub fn resolveImpl(_: *@This(), _: u8) TransportError!void {}
-        pub fn sendImpl(_: *@This(), _: u8, _: []const u8) TransportError!void {}
-        pub fn receiveImpl(_: *@This()) TransportError!?[]const u8 {
+        pub fn sendImpl(_: *@This(), _: u8, _: []const u8) TransportError!u64 {
+            return 0;
+        }
+        pub fn receiveImpl(_: *@This()) TransportError!?TransportRecv {
             return null;
         }
         pub fn closeImpl(_: *@This()) void {}
@@ -267,8 +270,10 @@ test "TransportRegistry different paths same route_key" {
         id: u8,
 
         pub fn resolveImpl(_: *@This(), _: u8) TransportError!void {}
-        pub fn sendImpl(_: *@This(), _: u8, _: []const u8) TransportError!void {}
-        pub fn receiveImpl(_: *@This()) TransportError!?[]const u8 {
+        pub fn sendImpl(_: *@This(), _: u8, _: []const u8) TransportError!u64 {
+            return 0;
+        }
+        pub fn receiveImpl(_: *@This()) TransportError!?TransportRecv {
             return null;
         }
         pub fn closeImpl(_: *@This()) void {}
@@ -305,8 +310,10 @@ test "TransportRegistry default transport per path" {
         id: u8,
 
         pub fn resolveImpl(_: *@This(), _: u8) TransportError!void {}
-        pub fn sendImpl(_: *@This(), _: u8, _: []const u8) TransportError!void {}
-        pub fn receiveImpl(_: *@This()) TransportError!?[]const u8 {
+        pub fn sendImpl(_: *@This(), _: u8, _: []const u8) TransportError!u64 {
+            return 0;
+        }
+        pub fn receiveImpl(_: *@This()) TransportError!?TransportRecv {
             return null;
         }
         pub fn closeImpl(_: *@This()) void {}
@@ -339,8 +346,10 @@ test "TransportRegistry default transport per path" {
 test "TransportRegistry clear" {
     const TestTransport = struct {
         pub fn resolveImpl(_: *@This(), _: u8) TransportError!void {}
-        pub fn sendImpl(_: *@This(), _: u8, _: []const u8) TransportError!void {}
-        pub fn receiveImpl(_: *@This()) TransportError!?[]const u8 {
+        pub fn sendImpl(_: *@This(), _: u8, _: []const u8) TransportError!u64 {
+            return 0;
+        }
+        pub fn receiveImpl(_: *@This()) TransportError!?TransportRecv {
             return null;
         }
         pub fn closeImpl(_: *@This()) void {}

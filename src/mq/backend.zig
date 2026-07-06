@@ -11,12 +11,13 @@
 //! // 获取 Transport 实例
 //! const transport = registry.getTransport(route_key) orelse return error.RouteNotFound;
 //!
-//! // 发送数据到后端（上行）
-//! try transport.send(route_key, body_data);
+//! // 发送已经编码好的数据到后端（上行），返回后端 stream_id
+//! const backend_stream_id = try transport.send(route_key, frame_data);
 //!
 //! // 接收后端响应（下行）
-//! if (try transport.receive()) |frame_data| {
-//!     // 处理完整帧数据
+//! if (try transport.receive()) |event| {
+//!     defer event.deinit(allocator);
+//!     // 根据 event.stream_id / event.is_fin 处理后端响应
 //! }
 //! ```
 
@@ -55,6 +56,20 @@ pub const TransportError = error{
 /// - err: 如果操作失败则包含错误码，成功时为 null
 pub const ResolveCallback = *const fn (ctx: ?*anyopaque, err: ?TransportError) void;
 
+/// 后端传输接收事件。
+///
+/// `data` 由调用方持有，处理完成后必须调用 `deinit` 释放。
+/// `stream_id` 是后端连接上的 QUIC stream id，用于上层把后端响应关联回客户端 stream。
+pub const TransportRecv = struct {
+    stream_id: u64,
+    data: []u8,
+    is_fin: bool,
+
+    pub fn deinit(self: TransportRecv, allocator: std.mem.Allocator) void {
+        allocator.free(self.data);
+    }
+};
+
 // ============================================================================
 // 后端传输接口
 // ============================================================================
@@ -67,8 +82,8 @@ pub const ResolveCallback = *const fn (ctx: ?*anyopaque, err: ?TransportError) v
 /// ## 接口方法
 ///
 /// - `resolve`: 解析目标，建立连接或获取通道
-/// - `send`: 发送数据到后端（上行时发送 Body）
-/// - `receive`: 从后端接收数据（下行时接收完整帧）
+/// - `send`: 发送已经编码好的字节到后端，并返回后端 stream id
+/// - `receive`: 从后端接收 stream-aware 事件
 /// - `close`: 关闭连接，释放资源
 ///
 /// ## 实现说明
@@ -92,7 +107,7 @@ pub const BackendTransport = struct {
         /// 此方法为异步操作，连接结果通过回调通知。
         /// - 中继模式：确保 MQ 连接就绪，订阅对应 topic
         /// - 直连模式：通过服务发现获取后端地址，建立连接
-        /// 
+        ///
         /// 参数：
         /// - route_key: 路由键
         /// - on_ready: 连接就绪或失败时的回调（可为 null）
@@ -106,17 +121,18 @@ pub const BackendTransport = struct {
 
         /// 发送数据到后端
         ///
-        /// 上行时调用，将 Body 数据发送给后端服务。
+        /// 上行时调用，将上层已经编码好的数据发送给后端服务。
+        /// 返回后端连接上的 QUIC stream id，供上层建立请求/响应映射。
         /// - 中继模式：发布消息到对应 topic
         /// - 直连模式：通过连接直接发送
-        send: *const fn (ptr: *anyopaque, route_key: u8, data: []const u8) TransportError!void,
+        send: *const fn (ptr: *anyopaque, route_key: u8, data: []const u8) TransportError!u64,
 
         /// 从后端接收数据
         ///
-        /// 下行时调用，接收后端返回的完整帧数据。
+        /// 下行时调用，接收后端返回的 stream-aware 事件。
         /// 返回 null 表示当前没有数据可读（非阻塞）。
         /// 返回的数据由调用方负责释放。
-        receive: *const fn (ptr: *anyopaque) TransportError!?[]const u8,
+        receive: *const fn (ptr: *anyopaque) TransportError!?TransportRecv,
 
         /// 关闭连接
         ///
@@ -137,12 +153,12 @@ pub const BackendTransport = struct {
     }
 
     /// 发送数据到后端
-    pub fn send(self: BackendTransport, route_key: u8, data: []const u8) TransportError!void {
+    pub fn send(self: BackendTransport, route_key: u8, data: []const u8) TransportError!u64 {
         return self.vtable.send(self.ptr, route_key, data);
     }
 
     /// 从后端接收数据
-    pub fn receive(self: BackendTransport) TransportError!?[]const u8 {
+    pub fn receive(self: BackendTransport) TransportError!?TransportRecv {
         return self.vtable.receive(self.ptr);
     }
 
@@ -156,8 +172,8 @@ pub const BackendTransport = struct {
     /// 用于将具体实现类型转换为统一的接口类型。
     /// 具体实现需要提供以下方法：
     /// - `resolveImpl(self, route_key, on_ready, ctx) void` (异步)
-    /// - `sendImpl(self, route_key, data) !void`
-    /// - `receiveImpl(self) !?[]const u8`
+    /// - `sendImpl(self, route_key, data) !u64`
+    /// - `receiveImpl(self) !?TransportRecv`
     /// - `closeImpl(self) void`
     pub fn init(comptime T: type, impl: *T) BackendTransport {
         const gen = struct {
@@ -171,12 +187,12 @@ pub const BackendTransport = struct {
                 return self.resolveImpl(route_key, on_ready, ctx);
             }
 
-            fn sendImpl(ptr: *anyopaque, route_key: u8, data: []const u8) TransportError!void {
+            fn sendImpl(ptr: *anyopaque, route_key: u8, data: []const u8) TransportError!u64 {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.sendImpl(route_key, data);
             }
 
-            fn receiveImpl(ptr: *anyopaque) TransportError!?[]const u8 {
+            fn receiveImpl(ptr: *anyopaque) TransportError!?TransportRecv {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.receiveImpl();
             }
@@ -226,11 +242,12 @@ test "BackendTransport interface" {
             }
         }
 
-        pub fn sendImpl(self: *@This(), _: u8, data: []const u8) TransportError!void {
+        pub fn sendImpl(self: *@This(), _: u8, data: []const u8) TransportError!u64 {
             self.sent_data = data;
+            return 0;
         }
 
-        pub fn receiveImpl(_: *@This()) TransportError!?[]const u8 {
+        pub fn receiveImpl(_: *@This()) TransportError!?TransportRecv {
             return null;
         }
 
@@ -245,7 +262,7 @@ test "BackendTransport interface" {
     // 测试 resolve（异步回调模式）
     const TestCtx = struct {
         called: bool = false,
-        
+
         fn onReady(ctx: ?*anyopaque, err: ?TransportError) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.called = true;
@@ -253,7 +270,7 @@ test "BackendTransport interface" {
             std.testing.expect(err == null) catch {};
         }
     };
-    
+
     var test_ctx = TestCtx{};
     transport.resolve(0x01, TestCtx.onReady, &test_ctx);
     try std.testing.expect(impl.resolved);
@@ -261,7 +278,8 @@ test "BackendTransport interface" {
 
     // 测试 send
     const test_data = "hello";
-    try transport.send(0x01, test_data);
+    const backend_stream_id = try transport.send(0x01, test_data);
+    try std.testing.expectEqual(@as(u64, 0), backend_stream_id);
     try std.testing.expectEqualStrings(test_data, impl.sent_data.?);
 
     // 测试 receive

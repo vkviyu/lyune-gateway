@@ -13,6 +13,9 @@ pub const ConnectionContext = struct {
     user_id: u64 = 0, // 0 表示未认证
     connected_at: i64,
 
+    // owning GatewayWorker pointer, kept opaque to avoid an import cycle.
+    gateway_ctx: ?*anyopaque = null,
+
     // Stream 处理器映射表：stream_id -> Handler
     stream_handlers: std.AutoHashMap(u64, protocol.handler.StreamHandler),
 
@@ -80,9 +83,10 @@ pub const ConnectionManager = struct {
     }
 
     /// 注册新连接
-    pub fn add(self: *ConnectionManager, conn: *QUICConnection) !*ConnectionContext {
+    pub fn add(self: *ConnectionManager, conn: *QUICConnection, gateway_ctx: ?*anyopaque) !*ConnectionContext {
         const ctx = try self.allocator.create(ConnectionContext);
         ctx.* = ConnectionContext.init(self.allocator, conn.inner);
+        ctx.gateway_ctx = gateway_ctx;
 
         try self.contexts.put(conn.inner, ctx);
         return ctx;
