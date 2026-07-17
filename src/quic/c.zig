@@ -252,8 +252,8 @@ pub fn parseDcid(packet: []const u8, dcid: *ConnectionId) bool {
 /// @param short_header_cid_len 短包头中期望的 CID 长度（本项目默认为 8）
 /// @return 成功返回 true，失败返回 false
 pub fn parseDcidWithLength(packet: []const u8, dcid: *ConnectionId, short_header_cid_len: u8) bool {
-    const result = parseDcidDetailed(packet, dcid, short_header_cid_len);
-    return if (result) |_| true else false;
+    parseDcidDetailed(packet, dcid, short_header_cid_len) catch return false;
+    return true;
 }
 
 /// 带有详细错误信息的 DCID 解析函数。

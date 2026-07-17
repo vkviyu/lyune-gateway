@@ -4,13 +4,16 @@
 
 const std = @import("std");
 
+const foundation = @import("../foundation/mod.zig");
+const cluster_cid = @import("../io/cid.zig");
+const net = foundation.net;
 const Config = @import("config.zig");
 const Connection = @import("connection.zig").Connection;
 const quic_c = @import("c.zig");
 
 pub const PacketInfo = struct {
     data: []const u8,
-    dest: std.net.Address,
+    dest: net.Address,
     segment_size: usize, // 新增
 };
 
@@ -35,7 +38,7 @@ pub const Endpoint = struct {
     thread_id: u8,
     thread_id_ptr: *u8,
 
-     // 【新增】专门存转换格式后的 ALPN 数据，防止内存泄露
+    // 【新增】专门存转换格式后的 ALPN 数据，防止内存泄露
     alpn_buffer: []u8,
 
     pub const Error = error{
@@ -66,12 +69,13 @@ pub const Endpoint = struct {
 
         // 创建 reset seed
         var reset_seed: [quic_c.RESET_SECRET_SIZE]u8 = undefined;
-        std.crypto.random.bytes(&reset_seed);
+        std.Io.Threaded.global_single_threaded.io().random(&reset_seed);
 
         const now = quic_c.currentTime();
 
         // thread_id 指针
         const thread_id_ptr = allocator.create(u8) catch return Error.OutOfMemory;
+        errdefer allocator.destroy(thread_id_ptr);
         thread_id_ptr.* = thread_id;
 
         const raw_alpn = config.base.alpn;
@@ -176,21 +180,13 @@ pub const Endpoint = struct {
     pub fn handleIncomingPacket(
         self: *Self,
         data: []const u8,
-        from_addr: std.net.Address,
-        local_addr: std.net.Address,
+        from_addr: net.Address,
+        local_addr: net.Address,
         timestamp: u64,
     ) void {
-        // 构造源地址
-        var addr_from: quic_c.c.struct_sockaddr_storage = std.mem.zeroes(quic_c.c.struct_sockaddr_storage);
-        const src_bytes = std.mem.asBytes(&from_addr.any);
-        const dst_from = std.mem.asBytes(&addr_from);
-        @memcpy(dst_from[0..src_bytes.len], src_bytes);
-
-        // 构造目标地址
-        var addr_to: quic_c.c.struct_sockaddr_storage = std.mem.zeroes(quic_c.c.struct_sockaddr_storage);
-        const local_bytes = std.mem.asBytes(&local_addr.any);
-        const dst_to = std.mem.asBytes(&addr_to);
-        @memcpy(dst_to[0..local_bytes.len], local_bytes);
+        // 构造源/目标地址
+        var addr_from = net.toSockAddrStorage(from_addr);
+        var addr_to = net.toSockAddrStorage(local_addr);
 
         // 使用 I/O 层传递的时间戳（避免频繁系统调用）
         // libxev 传递的是微秒时间戳，与 picoquic 兼容
@@ -238,7 +234,7 @@ pub const Endpoint = struct {
 
         if (rc != 0 or send_len == 0) return null;
 
-        const dest_addr = sockaddrStorageToAddress(&addr_to) catch return null;
+        const dest_addr = net.fromSockAddrStorage(@ptrCast(&addr_to)) catch return null;
         return .{ .data = send_buf[0..send_len], .dest = dest_addr, .segment_size = send_msg_size };
     }
 
@@ -257,42 +253,6 @@ pub const Endpoint = struct {
     // 辅助函数
     // =========================================================================
 
-    /// 将 C 语言的 sockaddr_storage 结构转换为 Zig 的 std.net.Address。
-    ///
-    /// 此函数主要用于将 picoquic 底层返回的 C 结构体（通常是大端序）
-    /// 转换为 Zig 友好的地址类型。
-    ///
-    /// 主要处理逻辑：
-    /// 1. 识别地址族 (AF_INET / AF_INET6)。
-    /// 2. 进行指针强转以访问具体字段。
-    /// 3. **关键**：将端口号从网络字节序（Big-Endian）转换为主机字节序（Native-Endian）。
-    ///    这是因为底层 C socket 接口通常直接存储网络字节序数据，而 Zig 的 Address.init
-    ///    期望传入主机字节序的端口号。
-    ///
-    /// @param storage 指向 C sockaddr_storage 结构的指针。
-    /// @return 转换后的 std.net.Address，如果地址族不支持则返回 UnsupportedAddressFamily 错误。
-    fn sockaddrStorageToAddress(storage: *const quic_c.c.struct_sockaddr_storage) !std.net.Address {
-        const family = @as(u16, @intCast(storage.ss_family));
-        if (family == std.posix.AF.INET) {
-            const sockaddr_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(storage));
-            // 端口号需要从网络字节序（大端）转换为主机字节序
-            const port = std.mem.bigToNative(u16, sockaddr_in.port);
-            return std.net.Address.initIp4(
-                @as(*[4]u8, @ptrCast(@constCast(&sockaddr_in.addr)))[0..4].*,
-                port,
-            );
-        } else if (family == std.posix.AF.INET6) {
-            const sockaddr_in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(storage));
-            const port = std.mem.bigToNative(u16, sockaddr_in6.port);
-            return std.net.Address.initIp6(
-                @constCast(&sockaddr_in6.addr).*,
-                port,
-                0,
-                0,
-            );
-        }
-        return error.UnsupportedAddressFamily;
-    }
 };
 
 /// 回调上下文
@@ -370,11 +330,13 @@ fn connectionIdCallback(
     const thread_id_ptr = @as(*u8, @ptrCast(@alignCast(cnx_id_cb_data)));
     const thread_id = thread_id_ptr.*;
 
-    var new_cid: quic_c.ConnectionId = undefined;
-    new_cid.id_len = 8;
-    std.crypto.random.bytes(new_cid.id[0..8]);
-    new_cid.id[0] = thread_id;
+    var entropy: [4]u8 = undefined;
+    std.Io.Threaded.global_single_threaded.io().random(&entropy);
+    const encoded = cluster_cid.encode(thread_id, entropy);
 
+    var new_cid: quic_c.ConnectionId = std.mem.zeroes(quic_c.ConnectionId);
+    new_cid.id_len = cluster_cid.length;
+    @memcpy(new_cid.id[0..cluster_cid.length], &encoded);
     cnx_id_returned.* = new_cid;
 }
 

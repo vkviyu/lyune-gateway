@@ -12,8 +12,8 @@
 
 const std = @import("std");
 
-const common = @import("../common/mod.zig");
-const err_handler = common.err;
+const foundation = @import("../foundation/mod.zig");
+const err_handler = foundation.err;
 const quic = @import("../quic/mod.zig");
 
 /// 流事件委托接口 (泛型版本)
@@ -114,7 +114,7 @@ pub fn BufferedMessageHandler(comptime ContextType: type) type {
 
             self.* = .{
                 .allocator = allocator,
-                .buffer = .{},
+                .buffer = .{ .items = &.{}, .capacity = 0 },
                 .stream_id = stream_id,
                 .delegate = delegate,
             };

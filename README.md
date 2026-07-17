@@ -4,6 +4,16 @@ Lyune Gateway 是一个使用 Zig 编写的 QUIC 实时通信网关项目。它�
 
 当前项目已经具备 QUIC 服务端骨架、libxev 事件循环、picoquic/picotls 集成、Thread-per-Core 工作模型、连接/流处理框架、应用层帧协议和后端传输抽象。路由、NATS、服务发现、Redis、集群协调等模块仍处于预留或早期实现阶段。
 
+## 配置与启动
+
+网关使用单一 JSON 配置文件 `config/gateway.json`。启动时可通过 `--config` 指定其他路径：
+
+```bash
+zig build run -- server --config config/gateway.json
+```
+
+配置包含运行线程、监听地址、证书、QUIC 参数、直连后端和 Worker 轮询参数；未知字段或非法值会在启动阶段直接报错。
+
 ## 项目状态
 
 本项目处于早期开发阶段，README 以当前源码实现为准。
@@ -25,7 +35,7 @@ Lyune Gateway 是一个使用 Zig 编写的 QUIC 实时通信网关项目。它�
 
 尚未完整落地：
 
-- 配置文件加载，当前 `config/gateway.json` 和 `config/gateway.dev.json` 只是占位
+- 更多后端传输实现和动态路由管理
 - CLI 客户端命令
 - 网关业务路由闭环
 - NATS 中继实现

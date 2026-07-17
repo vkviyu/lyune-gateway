@@ -237,6 +237,7 @@ pub const Frame = struct {
 pub const FrameDecoder = struct {
     allocator: std.mem.Allocator,
     buffer: std.ArrayList(u8),
+    body_buffer: std.ArrayList(u8),
     state: State = .reading_header,
     current_header: ?FrameHeader = null,
 
@@ -248,12 +249,14 @@ pub const FrameDecoder = struct {
     pub fn init(allocator: std.mem.Allocator) FrameDecoder {
         return .{
             .allocator = allocator,
-            .buffer = .{},
+            .buffer = .{ .items = &.{}, .capacity = 0 },
+            .body_buffer = .{ .items = &.{}, .capacity = 0 },
         };
     }
 
     pub fn deinit(self: *FrameDecoder) void {
         self.buffer.deinit(self.allocator);
+        self.body_buffer.deinit(self.allocator);
     }
 
     /// 重置解码器状态
@@ -305,17 +308,15 @@ pub const FrameDecoder = struct {
 
                 if (buf.len < total_size) return null;
 
-                // 提取 Body
-                const body = buf[HEADER_SIZE..total_size];
+                self.body_buffer.clearRetainingCapacity();
+                try self.body_buffer.appendSlice(self.allocator, buf[HEADER_SIZE..total_size]);
 
-                // 构建 Frame
                 const result = Frame{
                     .header = header,
-                    .body = body,
+                    .body = self.body_buffer.items,
                 };
 
                 // 移除已解析的数据
-                // 注意：这里返回的 body 指向 buffer 内部，调用者需要在下次 feed 前处理完
                 const remaining = buf[total_size..];
                 @memcpy(self.buffer.items[0..remaining.len], remaining);
                 self.buffer.shrinkRetainingCapacity(remaining.len);

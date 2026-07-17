@@ -1,0 +1,16 @@
+.{
+    .name = .lyune_boringssl,
+    .version = "0.1.0",
+    .fingerprint = 0x220567a744ac6db0,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .source = .{
+            .url = "git+https://github.com/google/boringssl#535cc391915c37912ff9b3edb0cff9b3c5c77db0",
+            .hash = "N-V-__8AADGOTAg2qy2JMjVSleelXVWZhf9UTIjkuioQsv9-",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}

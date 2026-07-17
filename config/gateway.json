@@ -1,3 +1,39 @@
 {
-    "desc": "网关配置文件"
+  "runtime": {
+    "threads": 1
+  },
+  "server": {
+    "listen_host": "0.0.0.0",
+    "listen_port": 8443,
+    "certificate_file": "server.crt",
+    "private_key_file": "server.key",
+    "quic": {
+      "max_connections": 10000,
+      "idle_timeout_ms": 30000,
+      "alpn": "lyune-gateway",
+      "congestion_control": "bbr"
+    }
+  },
+  "backend": {
+    "direct": {
+      "route_key": 1,
+      "host": "127.0.0.1",
+      "port": 8443,
+      "verify_certificate": false,
+      "root_certificate_file": null,
+      "max_receive_queue": 1024,
+      "idle_timeout_ms": 30000,
+      "alpn": "lyune-gateway",
+      "congestion_control": "bbr"
+    }
+  },
+  "worker": {
+    "backend_poll_interval_ms": 10
+  },
+  "cluster": {
+    "node_id": "gateway-local-1",
+    "advertise_host": "127.0.0.1",
+    "advertise_port": 8443,
+    "handoff_queue_capacity": 1024
+  }
 }

@@ -68,7 +68,7 @@ Lyune Gateway 是一个基于 QUIC 协议的高性能网关，专为实时通信
 
 ### 3.1 Thread-per-Core 模型
 
-网关采用 Thread-per-Core 架构，每个线程拥有完全独立的资源，线程间无共享状态、无锁竞争：
+网关采用 Thread-per-Core 架构。每个 Worker 独占事件循环、QUIC 上下文和连接状态；正常数据面不共享状态，只有内核误分流的异常路径使用进程级有界包交接队列：
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -101,9 +101,10 @@ Lyune Gateway 是一个基于 QUIC 协议的高性能网关，专为实时通信
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-- 所有线程通过 `SO_REUSEPORT` 绑定同一 UDP 端口，由内核分发入站包
-- 每个线程的 `ConnectionManager` 是线程本地的，无需互斥锁
-- 线程数默认等于 CPU 核心数，可通过 `--threads N` 指定
+- 主线程按 Worker ID 顺序创建 `SO_REUSEPORT` socket 组，socket index 与 Worker ID 固定对应
+- Linux classic reuseport BPF 按服务端 CID 在内核态选择 socket；Initial 和未知 CID 回退内核默认哈希
+- 每个 Worker 的 `ConnectionManager` 和 picoquic 上下文完全本地化
+- 线程数由 `config/gateway.json` 的 `runtime.threads` 显式指定，范围为 1-256
 
 ### 3.2 三层驱动结构
 
@@ -142,17 +143,29 @@ UDP 包到达
 
 ### 3.3 Connection ID 线程路由
 
-picoquic 的 Connection ID 回调中，CID 的第一个字节编码了线程 ID：
+picoquic 的 Connection ID 回调生成固定 8 字节服务端 CID：
 
 ```
 Connection ID 格式：
-┌──────────┬──────────────────────┐
-│ thread_id│   random bytes       │
-│  (1 byte)│   (7 bytes)          │
-└──────────┴──────────────────────┘
+┌──────────┬─────────┬───────────┬──────────────┐
+│ magic LY │ version │ worker_id │ entropy      │
+│ 2 bytes  │ 1 byte  │ 1 byte    │ 4 bytes      │
+└──────────┴─────────┴───────────┴──────────────┘
 ```
 
-这使得内核通过 `SO_REUSEPORT` 分发包后，每个线程能快速判断该包是否属于自己管理的连接，实现无锁负载均衡。
+Linux reuseport BPF 校验 magic/version 后直接返回 `worker_id` 对应的 socket index。Worker 收包时还会执行同样的 owner 校验；只有异常误分流才进入有界 `LocalPacketRouter`，并通过 `xev.Async` 唤醒连接所属 Worker。
+
+### 3.4 进程级协调与控制面
+
+`Coordinator` 是进程级生命周期边界，负责节点状态、Worker 状态、服务发现快照和本地异常包交接：
+
+- 节点状态：`configured -> running -> draining -> stopped`
+- Worker 状态：`starting -> running -> stopped`
+- `draining` 状态拒绝新连接，但已有连接仍由原 Worker 持有
+- `ServiceDiscovery` 通过稳定 vtable 接口提供版本化不可变路由快照；当前配置文件被包装为 `StaticDiscovery`
+- `DirectTransport` 按 RouteKey 选择健康实例，再通过异步 DNS 建立后端 QUIC 连接
+- `LocalPacketRouter` 是固定容量、预分配的 MPSC 队列，仅处理本机误分流，不迁移 picoquic/TLS/拥塞控制状态
+- etcd、Consul 等远端实现应替换 Discovery provider，不进入业务数据面
 
 ## 4. 协议分层模型
 
@@ -188,17 +201,17 @@ Connection ID 格式：
 
 ### 4.2 各端职责划分
 
-| 角色         | 解析协议层        | 核心职责                            |
-| ------------ | ----------------- | ----------------------------------- |
-| **客户端**   | 帧协议 + 业务协议 | 封装/解析完整帧，构造/处理业务负载  |
-| **网关**     | 仅帧协议          | 解析帧头做路由决策，**不解析 Body** |
-| **后端服务** | 仅业务协议        | **不理解帧头**，只处理业务负载      |
+| 角色         | 解析协议层        | 核心职责                                 |
+| ------------ | ----------------- | ---------------------------------------- |
+| **客户端**   | 帧协议 + 业务协议 | 封装/解析完整帧，构造/处理业务负载       |
+| **网关**     | 仅帧协议          | 解析帧头做路由决策，默认透传完整帧       |
+| **后端服务** | 帧协议 + 业务协议 | 使用帧元数据关联请求，处理 Body 业务负载 |
 
 ### 4.3 设计优势
 
 1. **职责清晰**：网关专注传输路由，后端专注业务逻辑
-2. **解耦彻底**：后端无需理解网关协议，可独立开发部署
-3. **复用性高**：后端可复用现有 HTTP 框架和生态
+2. **路由一致**：RouteKey、Mode、Flags 和序列信息在全链路保留
+3. **协议稳定**：后端只依赖固定帧头，不需要理解网关内部实现
 4. **扩展灵活**：新增服务只需配置 RouteKey 映射
 
 ## 5. 连接管理策略
@@ -241,7 +254,7 @@ Connection ID 格式：
 │      │    从连接池获取/新建 QUIC 连接                           │
 │      │       │                                                 │
 │      │       ▼                                                 │
-│      │    剥离帧头，转发 Body                                   │
+│      │    解析帧头用于路由，向后端透传完整帧                     │
 │      │                                                         │
 │      └─── 中继模式 (relay_*)                                   │
 │              │                                                 │
@@ -298,41 +311,37 @@ Connection ID 格式：
 
 u8 类型，支持 256 种服务标识，对绝大多数系统足够。
 
-## 7. 模块依赖关系
+## 7. 组件分层与依赖
+
+网关由自上而下、无环依赖的组件层组成，组装集中在最上层 `app/`（组合根）：
 
 ```
-                    ┌──────────────┐
-                    │   main.zig   │
-                    └──────┬───────┘
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │   gateway/   │
-                    │   worker     │
-                    └──────┬───────┘
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-          ▼                ▼                ▼
-    ┌──────────┐    ┌──────────┐    ┌──────────┐
-    │ protocol │    │  driver/ │    │ cluster  │
-    │ (frame)  │    │ (server) │    │          │
-    └──────────┘    └────┬─────┘    └────┬─────┘
-                         │               │
-                    ┌────┴────┐          │
-                    │         │          │
-                    ▼         ▼          │
-             ┌──────────┐ ┌──────────┐  │
-             │   quic/  │ │transport/│  │
-             │(picoquic)│ │ (libxev) │  │
-             └──────────┘ └──────────┘  │
-                    │         │         │
-                    └────┬────┘─────────┘
-                         │
-              ┌──────────┼──────────┐
-              ▼          ▼          ▼
-        ┌─────────┐ ┌─────────┐ ┌─────────┐
-        │ storage │ │   mq    │ │ common  │
-        │ (redis) │ │ (nats)  │ │  (err)  │
-        └─────────┘ └─────────┘ └─────────┘
+        main ── app（组合根）
+                 │
+      ┌──────────┼──────────┐
+      ▼          ▼          ▼
+   worker     control     backend
+      │          │          │
+      └────┬─────┴──────────┤
+           ▼                ▼
+        reactor          protocol
+           │
+      ┌────┴────┐
+      ▼         ▼
+    quic       io
+      └────┬────┘
+           ▼
+       foundation
 ```
+
+- app：加载配置、装配组件、拉起进程（`app/config.zig` 装配 RuntimeConfig，`app/bootstrap.zig` 编排 Coordinator/socket 组/多 Worker）
+- worker：数据面 per-core，QUIC 连接、流分发、消息聚合
+- control：控制面，节点/Worker 生命周期与服务发现
+- backend：后端出口，BackendTransport 接口 + 直连实现 + 路由注册表
+- reactor：事件反应堆，组装 Endpoint + IoLoop 驱动收发循环
+- protocol：帧头编解码与流处理器
+- quic：picoquic 引擎封装
+- io：事件循环、reuseport 分流、CID、跨 Worker 交接
+- foundation：配置、错误、网络地址、时间、异步 DNS
+
+组件遵循统一约定：单一 `mod.zig` 暴露接口、依赖注入、`init`/`deinit` 生命周期、可单独测试与替换。详见 `docs/directory_design.md`。

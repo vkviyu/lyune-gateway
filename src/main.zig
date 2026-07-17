@@ -1,114 +1,56 @@
+//! Lyune Gateway 进程入口
+//!
+//! 只负责命令行解析，随后把控制权交给 app 装配层。
+
 const std = @import("std");
-const builtin = @import("builtin");
 
-const gateway = @import("gateway/mod.zig");
-const mq_direct = @import("mq/direct.zig");
-const mq_registry = @import("mq/registry.zig");
+const app = @import("app/mod.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.DebugAllocator(.{}).init;
-    defer _ = gpa.deinit();
+const DEFAULT_CONFIG_PATH = "config/gateway.json";
 
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args.deinit();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    if (args.len > 1) {
-        const cmd = args[1];
-        if (std.mem.eql(u8, cmd, "server")) {
-            var threads: ?usize = null;
-
-            var i: usize = 2;
-            while (i < args.len) : (i += 1) {
-                const arg = args[i];
-                if (std.mem.eql(u8, arg, "--threads")) {
-                    if (i + 1 < args.len) {
-                        threads = std.fmt.parseInt(usize, args[i + 1], 10) catch null;
-                        i += 1;
-                    }
-                }
-            }
-
-            try runServer(allocator, threads);
-        } else {
-            printUsage();
-        }
-    } else {
+    _ = args.skip();
+    const cmd = args.next() orelse {
         printUsage();
+        return;
+    };
+    if (!std.mem.eql(u8, cmd, "server")) {
+        std.log.err("Unknown command: {s}", .{cmd});
+        printUsage();
+        return;
     }
+
+    var config_path: []const u8 = DEFAULT_CONFIG_PATH;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--config")) {
+            config_path = args.next() orelse return error.MissingConfigPath;
+        } else {
+            std.log.err("Unknown option: {s}", .{arg});
+            printUsage();
+            return;
+        }
+    }
+
+    try app.serve(init.io, allocator, config_path);
 }
 
 fn printUsage() void {
     std.debug.print(
-        \\Lyune Gateway - High Performance IM Gateway
+        \\Lyune Gateway
         \\
         \\Usage:
-        \\  lyune-gateway server [--threads N]  - 启动 QUIC 服务端
+        \\  lyune_gateway server [--config PATH]
         \\
-        \\需要先生成测试证书:
-        \\  openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
-        \\    -days 365 -nodes -subj "/CN=localhost"
+        \\Default configuration: config/gateway.json
         \\
     , .{});
 }
 
-/// QUIC 服务端
-fn runServer(allocator: std.mem.Allocator, threads: ?usize) !void {
-    const num_threads = threads orelse std.Thread.getCpuCount() catch 1;
-    std.log.info("Starting Gateway on port 8443 (libxev: {s}) with {} threads...", .{ @tagName(builtin.os.tag), num_threads });
-
-    if (num_threads <= 1) {
-        try runSingleWorker(allocator, 0);
-    } else {
-        // 多线程模式：Thread-per-Core
-        const handles = try allocator.alloc(std.Thread, num_threads);
-        defer allocator.free(handles);
-
-        for (handles, 0..) |*handle, i| {
-            // 每个线程运行一个独立的 GatewayWorker
-            handle.* = try std.Thread.spawn(.{}, runSingleWorker, .{ allocator, @as(u8, @intCast(i)) });
-        }
-
-        for (handles) |t| {
-            t.join();
-        }
-    }
-}
-
-/// 运行单个 Worker 实例
-fn runSingleWorker(allocator: std.mem.Allocator, thread_id: u8) !void {
-    const registry = mq_registry.TransportRegistry.init();
-
-    var worker = gateway.worker.GatewayWorker.init(allocator, .{
-        .cert_file = "server.crt",
-        .key_file = "server.key",
-        .bind_address = .{ 0, 0, 0, 0 },
-        .bind_port = 4433,
-        .base = .{
-            .alpn = "lyune-im",
-            .max_connections = 10000,
-            .idle_timeout_ms = 30000,
-        },
-    }, thread_id, registry) catch |err| {
-        std.log.err("Failed to create gateway worker: {}", .{err});
-        std.log.err("Make sure server.crt and server.key exist.", .{});
-        return err;
-    };
-    defer worker.deinit();
-
-    var direct_transport = try mq_direct.DirectTransport.init(allocator, .{
-        .server_host = "127.0.0.1",
-        .server_port = 8443,
-        .verify_cert = false,
-    }, worker.event_loop);
-    defer direct_transport.deinit();
-
-    worker.registerTransport(.direct, 0x01, direct_transport.asTransport());
-
-    try worker.run();
-}
-
 test {
-    _ = @import("./mq/direct.zig");
+    std.testing.refAllDecls(@This());
+    _ = app;
 }

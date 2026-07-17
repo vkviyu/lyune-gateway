@@ -25,7 +25,7 @@
     .fingerprint = 0x71e573b01c29fdba, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,8 +33,15 @@
     // internet connectivity.
     .dependencies = .{
         .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
-            .hash = "libxev-0.0.0-86vtc0IbEwBzMSXa-ZPZ8JpcV4Mw1SrsTuvtJmFAQ7Uu",
+            .url = "https://github.com/mitchellh/libxev/archive/9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz",
+            .hash = "libxev-0.0.0-86vtczdYFwBVBJw2hy9CDgYcV7P4Y7xgUhnSvQFbg9WZ",
+        },
+        .c_ares = .{
+            .url = "https://github.com/c-ares/c-ares/releases/download/v1.34.6/c-ares-1.34.6.tar.gz",
+            .hash = "N-V-__8AAAajTQAmYQ0QM2-aiWi7kREo2M0unmNlDbxWE7hn",
+        },
+        .boringssl = .{
+            .path = "build/boringssl",
         },
     },
     .paths = .{

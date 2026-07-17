@@ -47,7 +47,7 @@ pub const Client = struct {
 
         // 创建 reset seed
         var reset_seed: [quic_c.RESET_SECRET_SIZE]u8 = undefined;
-        std.crypto.random.bytes(&reset_seed);
+        std.Io.Threaded.global_single_threaded.io().random(&reset_seed);
 
         const now = quic_c.currentTime();
 
