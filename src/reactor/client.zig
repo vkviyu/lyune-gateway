@@ -12,10 +12,9 @@ const quic_c = quic.c;
 const QUICConfig = quic.config.QUICConfig;
 const Endpoint = quic.endpoint.Endpoint;
 const QUICConnection = quic.connection.Connection;
-const io = @import("../io/loop.zig"); // 引用 io 组件的事件循环
-
-const IoLoop = io.IoLoop;
-const Packet = io.Packet;
+const io = @import("../io/mod.zig");
+const IoLoop = io.loop.IoLoop;
+const Packet = io.loop.Packet;
 
 // 复用 io.zig 的常量或自定义
 const MAX_BATCH_PACKETS = 64;
@@ -37,9 +36,6 @@ pub const AsyncClient = struct {
     on_stream_data: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void = null,
     on_close: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, event: quic_c.CallbackEvent) void = null,
     user_context: ?*anyopaque = null,
-
-    // 当前活跃连接（简单场景通常只维护一个与后端的连接，如需连接池可改为 HashMap）
-    active_connection: ?QUICConnection = null,
 
     pub const Error = error{
         InitFailed,
@@ -69,10 +65,14 @@ pub const AsyncClient = struct {
         };
     }
 
+    /// 释放客户端。
+    ///
+    /// **不关闭连接。** 连接的所有权在调用方（例如 `backend/pool.zig` 的连接池）：
+    /// 一个客户端上可以有任意多条连接，客户端自己不持有它们的列表，也就无法逐条
+    /// 优雅关闭。要发 CONNECTION_CLOSE 的话必须由所有方在 deinit 之前自己关。
+    ///
+    /// 残留的连接会随 `picoquic_free` 一起销毁（不发关闭帧，对端靠空闲超时收敛）。
     pub fn deinit(self: *Self) void {
-        if (self.active_connection) |*conn| {
-            conn.close();
-        }
         self.io_loop.deinit();
         self.endpoint.deinit();
     }
@@ -100,23 +100,67 @@ pub const AsyncClient = struct {
 
         // 2. 挂载 Endpoint 回调
         self.endpoint.setUserData(self);
-        self.endpoint.onConnection(internalOnConnected);
-        self.endpoint.onStreamData(internalOnStreamData);
-        self.endpoint.onConnectionClose(internalOnClose);
+        self.endpoint.onConnection(emitConnected);
+        self.endpoint.onStreamData(emitStreamData);
+        self.endpoint.onConnectionClose(emitClose);
 
         // 3. 启动 IO 监听（只注册 fd 到 loop，不阻塞）
         self.io_loop.start();
     }
 
-    pub fn connectAddress(self: *Self, server_addr: net.Address, sni: []const u8) Error!*QUICConnection {
+    /// 连接到指定地址。
+    ///
+    /// `placement_hint` 非空时用它作为**客户端自选的 initial DCID**，也就是 Worker 级
+    /// 亲和的支点（设计文档 §8.5 策略 B）：握手首包的 DCID 由客户端决定，reuseport
+    /// 分类器读其中的 worker_id，就能把首包直接投给目标 Worker，连接从一开始就落对位置。
+    ///
+    /// 已核实的两条前提：
+    /// - picoquic 接受 8–20 字节的自选 initial DCID（`PICOQUIC_ENFORCED_INITIAL_CID_LENGTH`
+    ///   是 8，见 `libs/picoquic/picoquic/packet.c` 的 initial 包筛查），12 字节的
+    ///   CID v1 正好落在区间内；服务端不会因此改变自己签发的 CID。
+    /// - `src/io/reuseport.c` 的分类器本来就只看 DCID 的 magic/version/worker_id，
+    ///   不区分这个 CID 是谁选的，因此不需要为 hint 改分流逻辑。
+    ///
+    /// hint 是**不可信提示，不是凭据**：worker_id 越界时分类器直接回退到四元组哈希，
+    /// 连接照样建立，只是落在别的 Worker 上。因此它不需要 MAC，也不能用来做任何授权。
+    ///
+    /// ## 一个客户端可以承载任意多条连接
+    ///
+    /// 返回的是 picoquic 的**裸连接句柄**，而不是指向本结构内部某个字段的指针。
+    /// 早先的版本存了一个 `active_connection: ?QUICConnection` 并返回 `&它`，
+    /// 于是在同一个客户端上开第二条连接会让第一个指针**变成指向新连接的别名**
+    /// ——调用方以为自己拿着连接 A，写进去的字节却跑到了连接 B。
+    ///
+    /// 现在句柄自己就是稳定的（picoquic 分配的 `picoquic_cnx_t*`），复用同一个
+    /// 客户端建 N 条连接是安全的。这是把"一条后端连接一个 AsyncClient"收敛成
+    /// "一个 Worker 一个 AsyncClient"的前提：那样 socket、picoquic 上下文、定时器、
+    /// GSO 缓冲都只有一份，而它们原先是每条后端连接一份。
+    ///
+    /// 入站包由 picoquic 按 CID 自己解复用（`Endpoint.handleIncomingPacket`），
+    /// 因此多连接共用一个 socket 不需要我们做任何分流。
+    ///
+    /// 连接的**所有权归调用方**：要优雅关闭必须自己 `QUICConnection.fromRaw(handle).close()`，
+    /// 客户端的 deinit 不会替你做（它不持有连接列表）。
+    pub fn connectAddress(
+        self: *Self,
+        server_addr: net.Address,
+        sni: []const u8,
+        placement_hint: ?[io.cid.length]u8,
+    ) Error!quic_c.QuicCnx {
         var sockaddr_storage = net.toSockAddrStorage(server_addr);
 
         const now = quic_c.currentTime();
 
+        var initial_cid = quic_c.nullConnectionId();
+        if (placement_hint) |hint| {
+            initial_cid.id_len = io.cid.length;
+            @memcpy(initial_cid.id[0..hint.len], &hint);
+        }
+
         // 创建底层连接
         const cnx_ptr = quic_c.c.picoquic_create_cnx(
             self.endpoint.getContext(),
-            quic_c.nullConnectionId(),
+            initial_cid,
             quic_c.nullConnectionId(),
             @ptrCast(&sockaddr_storage),
             now,
@@ -130,13 +174,10 @@ pub const AsyncClient = struct {
         const rc = quic_c.c.picoquic_start_client_cnx(cnx_ptr);
         if (rc != 0) return Error.ConnectFailed;
 
-        // 包装 Connection 对象
-        self.active_connection = QUICConnection.fromRaw(cnx_ptr);
-
         // 立即驱动一次事件循环（发送 Client Hello）
         self.processQuicEvents();
 
-        return &self.active_connection.?;
+        return cnx_ptr;
     }
 
     // =========================================================================
@@ -211,33 +252,46 @@ pub const AsyncClient = struct {
     }
 
     // =========================================================================
-    // 内部回调 -> 用户回调 桥接
+    // Endpoint 回调 -> 上层用户回调
+    //
+    // 名字与 on_* 字段一一对应，三个都只做类型还原与转交——客户端不持有连接状态，
+    // 所以没有任何需要在回调里维护的东西。
+    //
+    // 共同约束：conn 指向 endpoint.zig 回调栈上的临时包装（Connection.fromRaw），
+    // 只在本次调用期内有效；要长期持有必须存 conn.inner 这个稳定的 C 句柄。
     // =========================================================================
 
-    fn internalOnConnected(ctx: ?*anyopaque, conn: *QUICConnection) void {
+    /// 握手完成。只对应 picoquic 的 .ready 事件（.almost_ready 已在 endpoint.zig 过滤）。
+    ///
+    /// 调用方在 `connectAddress` 返回时就拿到了句柄，也就是说它在握手完成前就持有
+    /// 连接，但只有本回调触发之后才能真正发应用数据。
+    fn emitConnected(ctx: ?*anyopaque, conn: *QUICConnection) void {
         const self = castSelf(ctx.?);
         if (self.on_connected) |cb| {
             cb(self.user_context, conn);
         }
     }
 
-    fn internalOnStreamData(ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
+    /// 流数据到达。同时覆盖 .stream_data 与 .stream_fin，用 is_fin 区分；
+    /// is_fin 为 true 时 data 可能为空（对端只关流不带数据）。
+    ///
+    /// data 借用 picoquic 内部缓冲，回调返回即失效。上层要留存必须自己复制——
+    /// backend/direct.zig 的 onClientStreamData 就是先 dupe 再入队。
+    fn emitStreamData(ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
         const self = castSelf(ctx.?);
         if (self.on_stream_data) |cb| {
             cb(self.user_context, conn, stream_id, data, is_fin);
         }
     }
 
-    fn internalOnClose(ctx: ?*anyopaque, conn: *QUICConnection, event: quic_c.CallbackEvent) void {
+    /// 连接终止。.close / .application_close / .stateless_reset 三种事件共用此路径。
+    ///
+    /// 只转交，不做清理：连接状态归调用方，它要在自己的回调里把对应句柄置空。
+    /// 这里也**不能**调 close——仍在 picoquic 回调栈内，重入关闭会破坏它的状态机。
+    fn emitClose(ctx: ?*anyopaque, conn: *QUICConnection, event: quic_c.CallbackEvent) void {
         const self = castSelf(ctx.?);
         if (self.on_close) |cb| {
             cb(self.user_context, conn, event);
-        }
-        // 清理引用，但不 close，因为是回调里
-        if (self.active_connection) |*c| {
-            if (c.inner == conn.inner) {
-                self.active_connection = null;
-            }
         }
     }
 
@@ -245,6 +299,45 @@ pub const AsyncClient = struct {
         return @as(*Self, @ptrCast(@alignCast(ctx)));
     }
 };
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+// 一个客户端上并存多条连接，是把"一条后端连接一个 AsyncClient"收敛成
+// "一个 Worker 一个 AsyncClient"的前提——socket、picoquic 上下文、定时器、
+// GSO 缓冲从此各只有一份，而它们原先是每条后端连接一份（约 2.1 MiB + 1 fd）。
+//
+// 这条用例锁的是**旧 API 表达不出来的那件事**：早先 connectAddress 返回
+// `&self.active_connection.?`，第二次调用会把第一个指针变成指向新连接的别名，
+// 调用方以为在写连接 A，字节却进了连接 B。
+test "one client hosts several independent connections" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var client = try AsyncClient.init(std.testing.allocator, .{
+        // 客户端角色不需要证书；这里也不会真的握手（对端不存在）。
+        .base = .{ .verify_cert = false },
+    }, &loop);
+    defer client.deinit();
+    client.start();
+
+    const first = try client.connectAddress(net.initIp4(.{ 127, 0, 0, 1 }, 59001), "a.invalid", null);
+    const second = try client.connectAddress(net.initIp4(.{ 127, 0, 0, 1 }, 59002), "b.invalid", null);
+
+    // 两条是不同的连接，且第一条没有被第二条顶掉。
+    try std.testing.expect(first != second);
+
+    var conn_first = QUICConnection.fromRaw(first);
+    var conn_second = QUICConnection.fromRaw(second);
+    try std.testing.expectEqual(first, conn_first.inner);
+    try std.testing.expectEqual(second, conn_second.inner);
+
+    // 所有权在调用方：deinit 不会替我们关连接，所以这里自己关。
+    // 两条独立关闭都不该影响对方。
+    conn_first.close();
+    conn_second.close();
+}
 
 // test "AsyncClient" {
 //     var loop = try xev.Loop.init(.{});

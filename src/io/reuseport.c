@@ -9,14 +9,14 @@
  *     reuseport.zig），保证下面手写的 BPF 字节码逻辑正确；
  *   - lyune_attach_reuseport_classifier：把等价逻辑的 cBPF 程序 attach 到 socket。
  *
- * CID 布局（与 cid.zig 保持一致）：['L','Y', version, worker_id, entropy(4)]，共 8 字节。
+ * CID 布局（与 cid.zig 保持一致）：['L','Y', version, node_id(2), worker_id, entropy(6)]，共 12 字节。
  * 不匹配（握手期 Initial、外部 CID、越界 worker_id）时返回 UINT32_MAX，内核回退默认哈希。
  */
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define LYUNE_CID_LENGTH 8u
+#define LYUNE_CID_LENGTH 12u
 #define LYUNE_CID_MAGIC_0 0x4cu       /* 'L' */
 #define LYUNE_CID_MAGIC_1 0x59u       /* 'Y' */
 #define LYUNE_CID_VERSION 1u
@@ -31,14 +31,14 @@ uint32_t lyune_classify_quic_packet(const uint8_t *packet, size_t length,
 {
     size_t cid_offset;
 
-    /* 至少要能容纳短包头下的完整 8 字节 CID（首字节 + CID）。 */
-    if (packet == NULL || length < 9 || socket_count == 0) {
+    /* 至少要能容纳短包头下的完整 12 字节 CID（首字节 + CID）。 */
+    if (packet == NULL || length < 13 || socket_count == 0) {
         return LYUNE_REUSEPORT_FALLBACK;
     }
 
     if ((packet[0] & 0x80u) != 0) {
-        /* 长包头：byte5 是 DCID 长度，DCID 从 byte6 起；要求长度恰为 8。 */
-        if (length < 14 || packet[5] != LYUNE_CID_LENGTH) {
+        /* 长包头：byte5 是 DCID 长度，DCID 从 byte6 起；要求长度恰为 12。 */
+        if (length < 18 || packet[5] != LYUNE_CID_LENGTH) {
             return LYUNE_REUSEPORT_FALLBACK;
         }
         cid_offset = 6;
@@ -51,11 +51,11 @@ uint32_t lyune_classify_quic_packet(const uint8_t *packet, size_t length,
     if (packet[cid_offset] != LYUNE_CID_MAGIC_0 ||
         packet[cid_offset + 1] != LYUNE_CID_MAGIC_1 ||
         packet[cid_offset + 2] != LYUNE_CID_VERSION ||
-        packet[cid_offset + 3] >= socket_count) {
+        packet[cid_offset + 5] >= socket_count) {
         return LYUNE_REUSEPORT_FALLBACK;
     }
 
-    return packet[cid_offset + 3];
+    return packet[cid_offset + 5];
 }
 
 #if defined(__linux__)
@@ -78,7 +78,7 @@ int lyune_attach_reuseport_classifier(int fd, uint32_t socket_count)
     struct sock_filter code[] = {
         /* 包长不足以容纳短包头 CID，直接回退。 */
         BPF_STMT(BPF_LD | BPF_W | BPF_LEN, 0),                         /*  0 */
-        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 9, 0, 24),                /*  1 */
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 13, 0, 24),                /*  1 */
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 0),                        /*  2 */
         /* 首字节最高位区分长/短包头：置位跳到长包头分支(指令13)。 */
         BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x80, 9, 0),             /*  3 */
@@ -90,22 +90,22 @@ int lyune_attach_reuseport_classifier(int fd, uint32_t socket_count)
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, LYUNE_CID_MAGIC_1, 0, 18), /* 7 校验 'Y' */
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 3),                        /*  8 */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, LYUNE_CID_VERSION, 0, 16), /* 9 校验版本 */
-        BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 4),                        /* 10 读 worker_id */
+        BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 6),                        /* 10 读 CID+5 的 worker_id */
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, socket_count, 14, 0),     /* 11 越界则回退 */
         BPF_STMT(BPF_RET | BPF_A, 0),                                 /* 12 返回 worker_id */
 
         /* ===== 长包头分支：byte5=DCID 长度，CID 从 byte6 起 ===== */
         BPF_STMT(BPF_LD | BPF_W | BPF_LEN, 0),                        /* 13 */
-        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 14, 0, 11),               /* 14 长度不足则回退 */
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 18, 0, 11),               /* 14 长度不足则回退 */
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 5),                        /* 15 */
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, LYUNE_CID_LENGTH, 0, 9),  /* 16 DCID 长度须为 8 */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, LYUNE_CID_LENGTH, 0, 9),  /* 16 DCID 长度须为 12 */
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 6),                        /* 17 */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, LYUNE_CID_MAGIC_0, 0, 7), /* 18 校验 'L' */
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 7),                        /* 19 */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, LYUNE_CID_MAGIC_1, 0, 5), /* 20 校验 'Y' */
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 8),                        /* 21 */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, LYUNE_CID_VERSION, 0, 3), /* 22 校验版本 */
-        BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 9),                        /* 23 读 worker_id */
+        BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 11),                       /* 23 读 CID+5 的 worker_id */
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, socket_count, 1, 0),      /* 24 越界则回退 */
         BPF_STMT(BPF_RET | BPF_A, 0),                                 /* 25 返回 worker_id */
 

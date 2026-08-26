@@ -12,7 +12,8 @@ const foundation = @import("../foundation/mod.zig");
 const err_handler = foundation.err;
 const net = foundation.net;
 const time = foundation.time;
-const quic_c = @import("../quic/c.zig");
+const quic = @import("../quic/mod.zig");
+const quic_c = quic.c;
 
 /// 最大数据包大小
 pub const MAX_PACKET_SIZE = 1500;
@@ -103,9 +104,20 @@ pub const IoLoop = struct {
             .loop = loop,
             .udp = udp,
             .timer = timer,
-            .local_addr = local_addr,
+            // 必须回查内核实际绑定的地址：port 传 0 时由内核分配，
+            // 接管外部 socket_fd 时配置参数也未必与 fd 实际绑定的地址一致。
+            // 该地址会作为本地地址传给 picoquic 参与路径管理，不能是配置里的占位值。
+            .local_addr = resolveBoundAddress(udp.fd, local_addr),
             .allocator = allocator,
         };
+    }
+
+    /// 用 getsockname 回查 socket 真实绑定地址；失败时退回调用方给出的期望地址。
+    fn resolveBoundAddress(fd: std.posix.socket_t, fallback: net.Address) net.Address {
+        var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+        var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        if (std.c.getsockname(fd, @ptrCast(&storage), &len) != 0) return fallback;
+        return net.fromSockAddrStorage(&storage) catch fallback;
     }
 
     fn closeUdp(udp: xev.UDP) void {
@@ -117,6 +129,13 @@ pub const IoLoop = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // 关闭 fd 与销毁 timer 会让在飞的 recv/send/timer completion 立刻完成
+        // 并触发回调。这些回调会访问正在析构的 Driver，因此先摘除回调，
+        // 让它们退化为 no-op。
+        self.recv_callback = null;
+        self.timer_callback = null;
+        self.callback_ctx = null;
+
         for (self.send_queue.items) |pkt| {
             pkt.deinit(self.allocator);
         }

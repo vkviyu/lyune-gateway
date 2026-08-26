@@ -72,6 +72,19 @@ pub const Connection = struct {
         }
     }
 
+    /// 发送一个 QUIC DATAGRAM（RFC 9221，设计文档 §6）。
+    ///
+    /// **不排队重传、不分片。** 一个 datagram 必须整体装进一个 QUIC 包，超过对端
+    /// 通告的 `max_datagram_frame_size` 时 picoquic 直接返回错误——这是正确行为，
+    /// 上层应当把它当成"这一包发不出去"并丢弃，而不是尝试切开：切开就需要分片 id、
+    /// 乱序重组、超时回收，等于在不可靠通路上重新实现一遍流。
+    ///
+    /// 对端没有通告 `max_datagram_frame_size`（不支持或没开）时同样返回错误。
+    pub fn sendDatagram(self: *Connection, data: []const u8) Error!void {
+        const rc = quic_c.c.picoquic_queue_datagram_frame(self.inner, data.len, data.ptr);
+        if (rc != 0) return Error.DatagramSendFailed;
+    }
+
     /// 标记 stream 为活跃状态
     ///
     /// picoquic 会在下次发送时处理该 stream
@@ -99,9 +112,18 @@ pub const Connection = struct {
         _ = quic_c.c.picoquic_reset_stream(self.inner, stream_id, 0);
     }
 
-    /// 关闭连接
+    /// 关闭连接（正常关闭，application error code = 0）
     pub fn close(self: *Connection) void {
-        _ = quic_c.c.picoquic_close(self.inner, 0);
+        self.closeWithError(0);
+    }
+
+    /// 带应用层错误码关闭连接。
+    ///
+    /// 协议违规必须带上错误码，否则客户端只看到一次普通关闭，无法区分
+    /// "网关正常下线"和"我发出的字节被判违规"——后者需要修客户端，
+    /// 前者只需要重连。错误码取值见 protocol.frame.AppError。
+    pub fn closeWithError(self: *Connection, app_error_code: u64) void {
+        _ = quic_c.c.picoquic_close(self.inner, @intCast(app_error_code));
     }
 
     /// 设置连接的回调函数，用于接收事件通知
@@ -113,6 +135,20 @@ pub const Connection = struct {
         quic_c.c.picoquic_set_callback(self.inner, callback, context);
     }
 
+    /// 客户端在 TLS ClientHello 里请求的 SNI（server_name）；没发则为 null。
+    ///
+    /// 网关用它确定这条连接属于哪个隔离域（见 foundation.realm）。它由证书链背书，
+    /// 因此可以当作可信输入——这是它比"客户端在帧里自称身份"强的地方。
+    ///
+    /// 可用时机：握手完成之后（`.ready` 回调里已经可读）。更早的阶段 picoquic 不向
+    /// 应用层暴露，所以隔离域只能在连接就绪时确定，不能更早。
+    ///
+    /// 返回的切片由 picotls 持有，生命周期跟随连接；需要跨连接保存必须自己拷贝。
+    pub fn getServerName(self: *const Connection) ?[]const u8 {
+        const raw = quic_c.c.picoquic_tls_get_sni(self.inner) orelse return null;
+        return std.mem.span(raw);
+    }
+
     /// 获取连接所属的 QUIC 上下文（Server/Client 实例）
     pub fn getQuicContext(self: *const Connection) quic_c.QuicCtx {
         return quic_c.c.picoquic_get_quic_ctx(self.inner);
@@ -121,6 +157,7 @@ pub const Connection = struct {
     pub const Error = error{
         StreamWriteFailed,
         MarkStreamFailed,
+        DatagramSendFailed,
         ConnectionClosed,
     };
 };

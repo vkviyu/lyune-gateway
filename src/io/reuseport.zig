@@ -34,22 +34,22 @@ fn classify(packet: []const u8, socket_count: u32) u32 {
 }
 
 test "reuseport classifier routes short-header server CID" {
-    // 短包头：DCID 从偏移 1 开始，worker_id 在偏移 4。
-    const packet = [_]u8{ 0x40, 'L', 'Y', 1, 3, 10, 11, 12, 13 };
+    // 短包头：DCID 从偏移 1 开始，worker_id 在偏移 6。
+    const packet = [_]u8{ 0x40, 'L', 'Y', 1, 0, 9, 3, 10, 11, 12, 13, 14, 15 };
     try std.testing.expectEqual(@as(u32, 3), classify(&packet, 4));
     // worker_id(3) 超过 socket_count(3) 的合法范围 [0,3)，应回退。
     try std.testing.expectEqual(fallback, classify(&packet, 3));
 }
 
 test "reuseport classifier routes long-header server CID" {
-    // 长包头：偏移 5 是 DCID 长度(8)，DCID 从偏移 6 开始，worker_id 在偏移 9。
-    const packet = [_]u8{ 0xc0, 0, 0, 0, 1, 8, 'L', 'Y', 1, 2, 10, 11, 12, 13 };
+    // 长包头：偏移 5 是 DCID 长度(12)，DCID 从偏移 6 开始，worker_id 在偏移 11。
+    const packet = [_]u8{ 0xc0, 0, 0, 0, 1, 12, 'L', 'Y', 1, 0, 9, 2, 10, 11, 12, 13, 14, 15 };
     try std.testing.expectEqual(@as(u32, 2), classify(&packet, 4));
 }
 
 test "reuseport classifier falls back for initial and malformed packets" {
-    const initial = [_]u8{ 0xc0, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8 }; // 非本网关魔数
-    const bad_length = [_]u8{ 0xc0, 0, 0, 0, 1, 7, 'L', 'Y', 1, 0, 1, 2, 3, 4 }; // DCID 长度不是 8
+    const initial = [_]u8{ 0xc0, 0, 0, 0, 2, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }; // 非本网关魔数
+    const bad_length = [_]u8{ 0xc0, 0, 0, 0, 1, 8, 'L', 'Y', 1, 0, 1, 2, 3, 4, 5, 6, 7, 8 }; // DCID 长度不是 12
     const truncated = [_]u8{ 0x40, 'L', 'Y', 1 }; // 短于最小 CID 长度
 
     try std.testing.expectEqual(fallback, classify(&initial, 4));

@@ -9,10 +9,10 @@
 //!
 //! ```zig
 //! // 获取 Transport 实例
-//! const transport = registry.getTransport(route_key) orelse return error.RouteNotFound;
+//! const transport = registry.find(route_id) orelse return error.RouteNotFound;
 //!
 //! // 发送已经编码好的数据到后端（上行），返回后端 stream_id
-//! const backend_stream_id = try transport.send(route_key, frame_data);
+//! const backend_stream_id = try transport.send(route_id, frame_data);
 //!
 //! // 接收后端响应（下行）
 //! if (try transport.receive()) |event| {
@@ -22,6 +22,12 @@
 //! ```
 
 const std = @import("std");
+
+const protocol = @import("../protocol/mod.zig");
+const frame = protocol.frame;
+
+/// 完整路由键（Group + RouteKey 组合），定义见 protocol/frame.zig。
+pub const RouteId = frame.RouteId;
 
 // ============================================================================
 // 错误类型
@@ -35,7 +41,7 @@ pub const TransportError = error{
     SendFailed,
     /// 接收数据失败
     ReceiveFailed,
-    /// 路由未找到（RouteKey 未注册）
+    /// 路由未找到（RouteId 未注册）
     RouteNotFound,
     /// 操作超时
     Timeout,
@@ -58,16 +64,26 @@ pub const ResolveCallback = *const fn (ctx: ?*anyopaque, err: ?TransportError) v
 
 /// 后端传输接收事件。
 ///
-/// `data` 由调用方持有，处理完成后必须调用 `deinit` 释放。
+/// `data` 是对 transport 内部接收缓冲的**借用**，不是调用方拥有的内存：处理完必须
+/// 调用 `BackendTransport.releaseRecv` 把槽位还回去，否则接收池会被占满并导致
+/// 后续响应被拒。改成借用是为了让接收路径上不再有每分片的堆分配。
+///
 /// `stream_id` 是后端连接上的 QUIC stream id，用于上层把后端响应关联回客户端 stream。
+/// `token` 对调用方不透明，由实现用来定位要归还的槽位，必须原样回传。
 pub const TransportRecv = struct {
     stream_id: u64,
-    data: []u8,
+    data: []const u8,
     is_fin: bool,
-
-    pub fn deinit(self: TransportRecv, allocator: std.mem.Allocator) void {
-        allocator.free(self.data);
-    }
+    token: u64 = 0,
+    /// 这条流是**对端（后端）主动开的**，不是网关开的。
+    ///
+    /// 它是"后端推送"与"孤儿响应"的判据。两者都查不到回程映射，但含义相反：
+    /// 前者要按 `.peer` / `.multicast` 投递给客户端，后者是客户端早已断开、
+    /// 条目已被回收的残响，只能丢弃。若不区分，孤儿响应会被当成畸形推送刷日志，
+    /// 而真正的推送在客户端断开高峰期会被误判成孤儿。
+    ///
+    /// 由 transport 实现填写——只有它知道自己开过哪些流。
+    peer_initiated: bool = false,
 };
 
 // ============================================================================
@@ -103,36 +119,50 @@ pub const BackendTransport = struct {
     pub const VTable = struct {
         /// 解析/连接目标（异步）
         ///
-        /// 根据 RouteKey 建立到后端的连接或获取通信通道。
+        /// 根据 RouteId 建立到后端的连接或获取通信通道。
         /// 此方法为异步操作，连接结果通过回调通知。
         /// - 中继模式：确保 MQ 连接就绪，订阅对应 topic
         /// - 直连模式：通过服务发现获取后端地址，建立连接
         ///
         /// 参数：
-        /// - route_key: 路由键
+        /// - route: 完整路由键（Group + RouteKey 组合）
         /// - on_ready: 连接就绪或失败时的回调（可为 null）
         /// - ctx: 回调上下文
         resolve: *const fn (
             ptr: *anyopaque,
-            route_key: u8,
+            route: RouteId,
             on_ready: ?ResolveCallback,
             ctx: ?*anyopaque,
         ) void,
 
-        /// 发送数据到后端
+        /// 在后端流上发送数据
         ///
-        /// 上行时调用，将上层已经编码好的数据发送给后端服务。
-        /// 返回后端连接上的 QUIC stream id，供上层建立请求/响应映射。
-        /// - 中继模式：发布消息到对应 topic
-        /// - 直连模式：通过连接直接发送
-        send: *const fn (ptr: *anyopaque, route_key: u8, data: []const u8) TransportError!u64,
+        /// handle 为 null 时新开一条后端流，返回它的句柄；否则往该句柄指向的
+        /// 既有流上追加。is_fin 为 true 时结束这条流。
+        ///
+        /// 流式上行必须落在同一条后端流上：客户端一条流对应后端一条流，
+        /// 中途换流会让后端收到两段互不相关的字节，也让响应散落到多个 stream id 上。
+        /// 因此实现必须保证同一 handle 始终路由到当初开流的那条连接。
+        sendStream: *const fn (
+            ptr: *anyopaque,
+            route: RouteId,
+            handle: ?u64,
+            data: []const u8,
+            is_fin: bool,
+        ) TransportError!u64,
 
         /// 从后端接收数据
         ///
         /// 下行时调用，接收后端返回的 stream-aware 事件。
         /// 返回 null 表示当前没有数据可读（非阻塞）。
-        /// 返回的数据由调用方负责释放。
+        /// 返回的 data 是内部缓冲的借用，处理完必须经 releaseRecv 归还。
         receive: *const fn (ptr: *anyopaque) TransportError!?TransportRecv,
+
+        /// 归还接收槽位
+        ///
+        /// 必须与每一次成功的 receive 一一对应。不归还不会立即出错，但接收池
+        /// 会逐渐被占满，之后的后端响应只能被拒。
+        releaseRecv: *const fn (ptr: *anyopaque, recv: TransportRecv) void,
 
         /// 关闭连接
         ///
@@ -145,16 +175,32 @@ pub const BackendTransport = struct {
     /// 发起连接但不等待，连接结果通过回调通知。
     pub fn resolve(
         self: BackendTransport,
-        route_key: u8,
+        route: RouteId,
         on_ready: ?ResolveCallback,
         ctx: ?*anyopaque,
     ) void {
-        return self.vtable.resolve(self.ptr, route_key, on_ready, ctx);
+        return self.vtable.resolve(self.ptr, route, on_ready, ctx);
     }
 
-    /// 发送数据到后端
-    pub fn send(self: BackendTransport, route_key: u8, data: []const u8) TransportError!u64 {
-        return self.vtable.send(self.ptr, route_key, data);
+    /// 一次性请求：新开一条后端流，写入数据并立即结束该流。
+    ///
+    /// buffered 模式与控制帧走这条路径——请求与响应一一对应，不需要续写。
+    pub fn send(self: BackendTransport, route: RouteId, data: []const u8) TransportError!u64 {
+        return self.vtable.sendStream(self.ptr, route, null, data, true);
+    }
+
+    /// 流式上行：在既有后端流上追加分片，或用 null 开出第一条流。
+    ///
+    /// 客户端一条流上的多个 streaming 帧依次调用本方法，最后一帧带 is_fin，
+    /// 后端因此看到一条完整有序的字节流。
+    pub fn sendStream(
+        self: BackendTransport,
+        route: RouteId,
+        handle: ?u64,
+        data: []const u8,
+        is_fin: bool,
+    ) TransportError!u64 {
+        return self.vtable.sendStream(self.ptr, route, handle, data, is_fin);
     }
 
     /// 从后端接收数据
@@ -162,39 +208,70 @@ pub const BackendTransport = struct {
         return self.vtable.receive(self.ptr);
     }
 
+    /// 归还 receive 返回的接收槽位；与每次成功的 receive 一一对应。
+    pub fn releaseRecv(self: BackendTransport, recv: TransportRecv) void {
+        return self.vtable.releaseRecv(self.ptr, recv);
+    }
+
     /// 关闭连接
     pub fn close(self: BackendTransport) void {
         return self.vtable.close(self.ptr);
+    }
+
+    /// 这个 transport 实例的身份。
+    ///
+    /// `sendStream` 返回的句柄**只在单个实例内部唯一**：direct 实现用
+    /// `conn_id << 48 | stream_id` 合成，而 conn_id 是每个实例各自从 0 开始编号的。
+    /// 因此凡是按后端流做索引的表（在途映射、推送重组缓冲）都必须把实例身份并进键里，
+    /// 否则两个实例发出同一个句柄时，后一次登记会顶掉前一次，随后 A 的响应被写进
+    /// B 的客户端流——跨路由、跨 realm 的串话。
+    ///
+    /// 用实现指针作身份：它在实例存活期内唯一且稳定，而实例的生命周期覆盖了它开出的
+    /// 所有流（transport 由注册表持有到 Worker 退出）。
+    pub fn id(self: BackendTransport) usize {
+        return @intFromPtr(self.ptr);
     }
 
     /// 从具体实现创建接口实例
     ///
     /// 用于将具体实现类型转换为统一的接口类型。
     /// 具体实现需要提供以下方法：
-    /// - `resolveImpl(self, route_key, on_ready, ctx) void` (异步)
-    /// - `sendImpl(self, route_key, data) !u64`
+    /// - `resolveImpl(self, route, on_ready, ctx) void` (异步)
+    /// - `sendStreamImpl(self, route, handle, data, is_fin) !u64`
     /// - `receiveImpl(self) !?TransportRecv`
+    /// - `releaseRecvImpl(self, recv) void`
     /// - `closeImpl(self) void`
     pub fn init(comptime T: type, impl: *T) BackendTransport {
         const gen = struct {
             fn resolveImpl(
                 ptr: *anyopaque,
-                route_key: u8,
+                route: RouteId,
                 on_ready: ?ResolveCallback,
                 ctx: ?*anyopaque,
             ) void {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                return self.resolveImpl(route_key, on_ready, ctx);
+                return self.resolveImpl(route, on_ready, ctx);
             }
 
-            fn sendImpl(ptr: *anyopaque, route_key: u8, data: []const u8) TransportError!u64 {
+            fn sendStreamImpl(
+                ptr: *anyopaque,
+                route: RouteId,
+                handle: ?u64,
+                data: []const u8,
+                is_fin: bool,
+            ) TransportError!u64 {
                 const self: *T = @ptrCast(@alignCast(ptr));
-                return self.sendImpl(route_key, data);
+                return self.sendStreamImpl(route, handle, data, is_fin);
             }
 
             fn receiveImpl(ptr: *anyopaque) TransportError!?TransportRecv {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.receiveImpl();
+            }
+
+            fn releaseRecvImpl(ptr: *anyopaque, recv: TransportRecv) void {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                return self.releaseRecvImpl(recv);
             }
 
             fn closeImpl(ptr: *anyopaque) void {
@@ -204,8 +281,9 @@ pub const BackendTransport = struct {
 
             const vtable = VTable{
                 .resolve = resolveImpl,
-                .send = sendImpl,
+                .sendStream = sendStreamImpl,
                 .receive = receiveImpl,
+                .releaseRecv = releaseRecvImpl,
                 .close = closeImpl,
             };
         };
@@ -226,12 +304,14 @@ test "BackendTransport interface" {
     const TestTransport = struct {
         resolved: bool = false,
         sent_data: ?[]const u8 = null,
+        last_handle: ?u64 = null,
+        last_is_fin: bool = false,
         closed: bool = false,
         callback_called: bool = false,
 
         pub fn resolveImpl(
             self: *@This(),
-            _: u8,
+            _: RouteId,
             on_ready: ?ResolveCallback,
             ctx: ?*anyopaque,
         ) void {
@@ -242,14 +322,24 @@ test "BackendTransport interface" {
             }
         }
 
-        pub fn sendImpl(self: *@This(), _: u8, data: []const u8) TransportError!u64 {
+        pub fn sendStreamImpl(
+            self: *@This(),
+            _: RouteId,
+            handle: ?u64,
+            data: []const u8,
+            is_fin: bool,
+        ) TransportError!u64 {
             self.sent_data = data;
-            return 0;
+            self.last_handle = handle;
+            self.last_is_fin = is_fin;
+            return handle orelse 0;
         }
 
         pub fn receiveImpl(_: *@This()) TransportError!?TransportRecv {
             return null;
         }
+
+        pub fn releaseRecvImpl(_: *@This(), _: TransportRecv) void {}
 
         pub fn closeImpl(self: *@This()) void {
             self.closed = true;
@@ -272,15 +362,23 @@ test "BackendTransport interface" {
     };
 
     var test_ctx = TestCtx{};
-    transport.resolve(0x01, TestCtx.onReady, &test_ctx);
+    transport.resolve(RouteId.init(0x01, 0x00), TestCtx.onReady, &test_ctx);
     try std.testing.expect(impl.resolved);
     try std.testing.expect(test_ctx.called);
 
-    // 测试 send
+    // 测试 send（一次性请求：新开流并立即 fin）
     const test_data = "hello";
-    const backend_stream_id = try transport.send(0x01, test_data);
+    const backend_stream_id = try transport.send(RouteId.init(0x01, 0x00), test_data);
     try std.testing.expectEqual(@as(u64, 0), backend_stream_id);
     try std.testing.expectEqualStrings(test_data, impl.sent_data.?);
+    try std.testing.expectEqual(@as(?u64, null), impl.last_handle);
+    try std.testing.expect(impl.last_is_fin);
+
+    // 测试 sendStream（流式续写：句柄透传，中间分片不 fin）
+    const continued = try transport.sendStream(RouteId.init(0x01, 0x00), 7, "chunk", false);
+    try std.testing.expectEqual(@as(u64, 7), continued);
+    try std.testing.expectEqual(@as(?u64, 7), impl.last_handle);
+    try std.testing.expect(!impl.last_is_fin);
 
     // 测试 receive
     const received = try transport.receive();

@@ -1,7 +1,8 @@
 const std = @import("std");
 const xev = @import("xev");
 
-const net = @import("../net.zig");
+const foundation = @import("../mod.zig");
+const net = foundation.net;
 const resolver = @import("mod.zig");
 
 const c = @cImport({
@@ -23,6 +24,9 @@ pub const CaresResolver = struct {
     next_id: u64 = 1,
     running: bool = false,
     shutting_down: bool = false,
+    /// 仍有 poll completion 在 loop 队列中、必须等回调后才能释放的 watcher 数。
+    /// deinit 用它决定要驱动 loop 多久才能安全收回全部 watcher。
+    watchers_in_flight: usize = 0,
 
     const SocketWatcher = struct {
         resolver: *Self,
@@ -30,6 +34,10 @@ pub const CaresResolver = struct {
         tcp: xev.TCP,
         completion: xev.Completion = undefined,
         readable: bool = false,
+        /// poll completion 已提交给 loop、尚未回调。
+        ///
+        /// 这是释放该 watcher 的门禁：completion 在飞时释放内存，
+        /// 回调（以及 io_uring 后端的内核写回）会访问已释放内存。
         active: bool = false,
         processing: bool = false,
         removed: bool = false,
@@ -93,18 +101,40 @@ pub const CaresResolver = struct {
         }
         c.ares_cancel(self.channel);
 
+        // 标记全部 watcher 待回收；completion 仍在飞的不能就地释放。
         var watcher_it = self.watchers.valueIterator();
         while (watcher_it.next()) |watcher| {
-            watcher.*.active = false;
+            watcher.*.readable = false;
             watcher.*.removed = true;
-            if (!watcher.*.processing) {
+            if (!watcher.*.active and !watcher.*.processing) {
                 allocator.destroy(watcher.*);
             }
         }
+        self.watchers.clearRetainingCapacity();
+
+        // 先销毁 channel：它会关闭全部 c-ares socket，使在飞的 poll 立刻完成，
+        // 从而触发 pollCallback。此时 shutting_down 已置位，回调会走
+        // 「直接返回 + defer 释放 watcher」的分支，不会再触碰 channel。
+        c.ares_destroy(self.channel);
+
+        // 驱动 loop 收割这些回调。调用方保证 loop 的生命周期长于 resolver
+        // （bootstrap 里 resolver 的 defer 早于 worker 的 defer 执行）。
+        // 加自旋上限兜底：极端情况下宁可泄漏几个 watcher，也不能让
+        // completion 悬垂到 resolver 释放之后。
+        var spins: usize = 0;
+        while (self.watchers_in_flight > 0 and spins < 1024) : (spins += 1) {
+            self.loop.run(.no_wait) catch break;
+        }
+        if (self.watchers_in_flight > 0) {
+            std.log.warn(
+                "[Cares] {} socket watcher(s) still in flight at shutdown; leaking to avoid use-after-free",
+                .{self.watchers_in_flight},
+            );
+        }
+
         self.watchers.deinit();
         self.pending.deinit();
 
-        c.ares_destroy(self.channel);
         self.timer.deinit();
         c.ares_library_cleanup();
         allocator.destroy(self);
@@ -127,7 +157,7 @@ pub const CaresResolver = struct {
         const req = try self.allocator.create(Request);
         errdefer self.allocator.destroy(req);
 
-        const host_copy = try self.allocator.dupeZ(u8, host);
+        const host_copy = try self.allocator.dupeSentinel(u8, host, 0);
         errdefer self.allocator.free(host_copy);
 
         req.* = .{
@@ -207,9 +237,11 @@ pub const CaresResolver = struct {
 
         if (!wants_read and !wants_write) {
             if (self.watchers.fetchRemove(socket_fd)) |entry| {
-                entry.value.active = false;
+                entry.value.readable = false;
                 entry.value.removed = true;
-                if (!entry.value.processing) {
+                // active 表示 poll completion 仍在 loop 队列里；此时释放会让
+                // 回调访问已释放内存。留给 pollCallback 在最后一次回调里释放。
+                if (!entry.value.active and !entry.value.processing) {
                     self.allocator.destroy(entry.value);
                 }
             }
@@ -237,8 +269,13 @@ pub const CaresResolver = struct {
         self.ensureTimer();
     }
 
+    /// 提交一次读事件 poll。active 从 false 变 true 时登记在飞计数，
+    /// 供 deinit 判断还需驱动 loop 多久才能安全回收 watcher。
     fn armWatcher(watcher: *SocketWatcher) void {
-        watcher.active = true;
+        if (!watcher.active) {
+            watcher.active = true;
+            watcher.resolver.watchers_in_flight += 1;
+        }
         watcher.tcp.poll(watcher.resolver.loop, &watcher.completion, .read, SocketWatcher, watcher, pollCallback);
     }
 
@@ -256,7 +293,11 @@ pub const CaresResolver = struct {
 
         const watcher = ud orelse return .disarm;
         const self = watcher.resolver;
-        watcher.active = false;
+        // completion 已被消耗，注销在飞计数。
+        if (watcher.active) {
+            watcher.active = false;
+            self.watchers_in_flight -= 1;
+        }
         watcher.processing = true;
         defer {
             watcher.processing = false;

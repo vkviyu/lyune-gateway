@@ -25,8 +25,11 @@ pub const Config = struct {
     /// 如果为 false，将禁用证书验证（用于自签名证书的开发环境）
     verify_cert: bool = true,
 
-    /// ALPN 协议标识
-    alpn: [:0]const u8 = "lyune-im",
+    /// ALPN 协议标识。
+    ///
+    /// 协议版本就活在这里：帧头里没有 version 字段，版本不匹配在 QUIC 握手阶段
+    /// 就失败，不会进到帧层（见 docs/protocol_design.md §3）。
+    alpn: [:0]const u8 = "lyune/1",
 
     /// 初始最大数据量
     initial_max_data: u64 = 10_000_000,
@@ -45,6 +48,19 @@ pub const Config = struct {
 
     /// 是否启用 0-RTT
     enable_0rtt: bool = true,
+
+    /// 本端愿意接收的单个 QUIC DATAGRAM 上限（字节）；0 表示不启用不可靠通路。
+    ///
+    /// 它作为传输参数通告给对端（RFC 9221 的 `max_datagram_frame_size`），对端据此
+    /// 决定能不能发、能发多大。**DATAGRAM 不分片**：超过这个数的包发不出去，也不会
+    /// 被切开——切开就需要分片 id、乱序重组、超时回收，等于在不可靠通路上把流重新
+    /// 实现一遍（设计文档 §6）。
+    ///
+    /// 默认 0（关闭）是有意的：只有面向客户端的监听器需要它（`app/config.zig` 从 JSON
+    /// 配置取值，那一层的默认是 1200，落在 IPv6 最小 MTU 扣掉各层包头后的安全区里）。
+    /// 网关↔后端、网关↔对等节点这两条链路都只说可靠流，给它们默认打开等于凭空多出
+    /// 两条谁都不该走、也没人测过的路径。
+    max_datagram_frame_size: u16 = 0,
 
     /// 拥塞控制算法
     congestion_algorithm: CongestionAlgorithm = .bbr,
@@ -85,4 +101,14 @@ pub const QUICConfig = struct {
     /// 绑定地址
     /// 默认为 0.0.0.0 (IPv4 Any)，适用于客户端或默认服务端
     bind_address: [4]u8 = .{ 0, 0, 0, 0 },
+
+    /// 服务端是否**要求**对端出示客户端证书（mTLS）。
+    ///
+    /// 只给集群监听器用（设计文档 §8.5）：那个端口上握手成功即等价于"对端持有集群
+    /// CA 签发的证书" = "对端是一个网关节点"，于是 `.peer` / `.multicast` 的权限判据
+    /// 变成结构性的——**面向客户端的端口绝不能开它**，否则普通客户端也要带证书。
+    ///
+    /// 注意它与 `verify_cert` 是两个方向：`verify_cert` 是"我校验对端"（客户端角色），
+    /// 这一项是"我要求对端出示"（服务端角色）。集群监听器两者都要开。
+    require_client_auth: bool = false,
 };

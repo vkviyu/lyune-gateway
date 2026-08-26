@@ -13,7 +13,11 @@ pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args.deinit();
 
+    // 跳过程序名 `lyune_gateway`
     _ = args.skip();
+
+    // args.next() 本身不负责按照空格、逗号或其他符号分割命令行
+    // 它只是从操作系统已经准备好的参数数组中，依次取出下一个参数
     const cmd = args.next() orelse {
         printUsage();
         return;

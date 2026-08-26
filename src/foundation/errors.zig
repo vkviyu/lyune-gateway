@@ -12,7 +12,8 @@
 //! ## 使用示例
 //!
 //! ```zig
-//! const err_handler = @import("common/error.zig");
+//! const foundation = @import("../foundation/mod.zig");
+//! const err_handler = foundation.err;
 //!
 //! // 在 Worker 初始化时设置处理器
 //! err_handler.setHandler(myCustomHandler);

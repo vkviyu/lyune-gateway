@@ -8,15 +8,15 @@ Lyune Gateway 是一个基于 QUIC 协议的高性能网关，专为实时通信
 
 - **传输层网关**：只关心"数据怎么传、传给谁"，不关心"传什么"
 - **协议解耦**：网关层帧协议与业务层应用协议分离
-- **双模传输**：同时支持中继（通过消息中间件）和直连（服务发现直连）两种模式
+- **可扩展传输**：当前实现网关直连后端的 DirectTransport；BackendTransport/Registry 已为未来的中继实现保留扩展点，走哪条路径由服务端注册关系决定，客户端无感
 
 ### 1.2 核心能力
 
 | 能力       | 说明                                                                             |
 | ---------- | -------------------------------------------------------------------------------- |
 | 多模式传输 | 缓冲传输（完整消息）、流式传输（分片实时转发）                                   |
-| 灵活路由   | 中继模式走消息中间件，直连模式走服务发现                                         |
-| 连接管理   | QUIC 连接复用、会话管理、连接迁移                                                |
+| 灵活路由   | 帧头 RouteId 查注册表命中唯一 Transport 实例，当前使用直连实现                  |
+| 连接管理   | QUIC 连接复用、会话管理、客户端网络路径迁移                                     |
 | 高性能     | 基于 Zig + libxev (macOS kqueue / Linux io_uring) 异步 I/O，Thread-per-Core 架构 |
 
 ## 2. 整体架构
@@ -44,15 +44,15 @@ Lyune Gateway 是一个基于 QUIC 协议的高性能网关，专为实时通信
 │   │         ┌────────┴────────┐                                 │        │
 │   │         ▼                 ▼                                 │        │
 │   │   ┌──────────┐      ┌──────────┐                            │        │
-│   │   │ 中继模式 │      │ 直连模式 │                            │        │
+│   │   │ 中继规划 │      │ 直连模式 │                            │        │
 │   │   │ (Relay)  │      │ (Direct) │                            │        │
 │   │   └────┬─────┘      └────┬─────┘                            │        │
 │   └────────┼─────────────────┼──────────────────────────────────┘        │
 │            │                 │                                           │
 │            ▼                 ▼                                           │
 │   ┌──────────────┐    ┌──────────────┐                                   │
-│   │     NATS     │    │ 服务发现     │                                   │
-│   │ (消息中间件) │    │ (etcd/Consul)│                                   │
+│   │     NATS     │    │ 直连实例     │                                   │
+│   │ （尚未实现） │    │ (内部连接池) │                                   │
 │   └──────┬───────┘    └──────┬───────┘                                   │
 │          │                   │                                           │
 │          ▼                   ▼                                           │
@@ -113,8 +113,8 @@ Lyune Gateway 是一个基于 QUIC 协议的高性能网关，专为实时通信
 ```
 ┌──────────────────────────────────────────────────────┐
 │                  GatewayWorker (业务层)                │
-│  职责：连接管理、流分发、消息聚合                       │
-│  组件：ConnectionManager, BufferedMessageHandler       │
+│  职责：连接管理、逐帧分派、上行转发                     │
+│  组件：ConnectionManager, framing.drainFrames          │
 ├──────────────────────────────────────────────────────┤
 │                  ServerDriver (驱动层)                 │
 │  职责：组装 Endpoint + IoLoop，驱动事件循环             │
@@ -143,29 +143,31 @@ UDP 包到达
 
 ### 3.3 Connection ID 线程路由
 
-picoquic 的 Connection ID 回调生成固定 8 字节服务端 CID：
+picoquic 的 Connection ID 回调生成固定 12 字节 CID v1：
 
 ```
-Connection ID 格式：
-┌──────────┬─────────┬───────────┬──────────────┐
-│ magic LY │ version │ worker_id │ entropy      │
-│ 2 bytes  │ 1 byte  │ 1 byte    │ 4 bytes      │
-└──────────┴─────────┴───────────┴──────────────┘
+magic(2) | version=1(1) | node_id(2) | worker_id(1) | entropy(6)
 ```
 
-Linux reuseport BPF 校验 magic/version 后直接返回 `worker_id` 对应的 socket index。Worker 收包时还会执行同样的 owner 校验；只有异常误分流才进入有界 `LocalPacketRouter`，并通过 `xev.Async` 唤醒连接所属 Worker。
+Linux reuseport BPF 校验 magic/version 后直接返回 `worker_id` 对应的 socket index。Worker 收包时
+解析同一 CID：node_id 为本机但 Worker 不同则进入有界 `LocalPacketRouter`；node_id 属于其他
+alive/suspect 成员则通过独立 UDP 隧道转发到归属节点；无法识别的 Initial/外部 CID 回退本地
+picoquic 处理。连接状态始终只存在于签发 CID 的 Endpoint。
 
 ### 3.4 进程级协调与控制面
 
-`Coordinator` 是进程级生命周期边界，负责节点状态、Worker 状态、服务发现快照和本地异常包交接：
+`Coordinator` 是进程级生命周期边界，负责节点状态、Worker 状态和集群运行器：
 
 - 节点状态：`configured -> running -> draining -> stopped`
 - Worker 状态：`starting -> running -> stopped`
-- `draining` 状态拒绝新连接，但已有连接仍由原 Worker 持有
-- `ServiceDiscovery` 通过稳定 vtable 接口提供版本化不可变路由快照；当前配置文件被包装为 `StaticDiscovery`
-- `DirectTransport` 按 RouteKey 选择健康实例，再通过异步 DNS 建立后端 QUIC 连接
-- `LocalPacketRouter` 是固定容量、预分配的 MPSC 队列，仅处理本机误分流，不迁移 picoquic/TLS/拥塞控制状态
-- etcd、Consul 等远端实现应替换 Discovery provider，不进入业务数据面
+- 集群启用时持有独立 membership v1 UDP runner 和双向 forward tunnel v1；单机模式不创建额外 socket/线程
+- `direct` 模式不创建 forward 隧道；`anycast` 模式由 CID owner 直接回包；`l4_lb` 模式使用 Worker 本地有界回程表，把响应封装回原入口 Worker
+- membership v1 使用 SWIM、anti-entropy、Lifeguard 和 HMAC 双密钥维护零锁成员视图
+- `draining` 先由协议线程广播 `left`，再拒绝新连接；已有连接仍由原 Worker 持有
+- 相同 node_id 出现不同地址时 runner fail-fast，避免 CID 路由身份不唯一
+- `LocalPacketRouter` 是固定容量、预分配的 MPSC 队列，只搬运原始 UDP 包，不迁移 picoquic/TLS/拥塞控制状态
+- 控制面不参与后端寻址；`DirectTransport` 仍从自身副本列表选择后端并通过异步 DNS 建连
+- etcd、Consul 等后端寻址方式将来以新的 Transport 实现类型接入，不进入控制面
 
 ## 4. 协议分层模型
 
@@ -186,7 +188,7 @@ Linux reuseport BPF 校验 magic/version 后直接返回 `worker_id` 对应的 s
 │                            │                                    │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │              帧协议层 (Frame Protocol)                   │   │
-│  │  • 16 字节帧头 + 变长 Body                               │   │
+│  │  • 变长帧头（OPEN 8B / DATA 4B）+ 变长 Body               │   │
 │  │  • 由网关和客户端 SDK 处理                               │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                            ▲                                    │
@@ -210,13 +212,53 @@ Linux reuseport BPF 校验 magic/version 后直接返回 `worker_id` 对应的 s
 ### 4.3 设计优势
 
 1. **职责清晰**：网关专注传输路由，后端专注业务逻辑
-2. **路由一致**：RouteKey、Mode、Flags 和序列信息在全链路保留
+2. **路由一致**：RouteId（Group + RouteKey）、Mode、Flags 和序列信息在全链路保留
 3. **协议稳定**：后端只依赖固定帧头，不需要理解网关内部实现
-4. **扩展灵活**：新增服务只需配置 RouteKey 映射
+4. **扩展灵活**：新增服务只需配置 RouteId 映射
 
-## 5. 连接管理策略
+## 5. 路由模型：RouteId 与 Transport 实例
 
-### 5.1 Gateway-initiated 模式
+这是网关路由最核心的语义拆分，所有路由相关的设计与实现都必须遵守，避免跑题。
+
+### 5.1 两层语义，一个交汇点
+
+路由涉及两层彼此独立的语义：
+
+- **Transport 实现类型 = 传输方式的语义**，只回答"数据怎么传"。
+  `BackendTransport` 是纯 vtable 接口（resolve / send / receive / close）；`DirectTransport`（直连 QUIC）、将来的中继实现（经 NATS）等是它的实现类型。实现类型只表达传输方式，**不携带任何使用场景/业务语义**。
+- **RouteId = 使用场景的语义**，只回答"哪个业务、哪个场景"。
+  `RouteId = Group（业务组）+ RouteKey（组内场景）`，是帧头携带的复合路由键。
+
+两层语义的**唯一交汇点**是 `TransportRegistry`：维护 `RouteId → Transport 实例` 的一一映射。交汇只发生在这一处，两边可以独立演化。
+
+### 5.2 RouteId 对应"实例"，而不是"实现类型"
+
+- 相同 RouteId 的所有客户端连接，命中的一定是**同一个** Transport 实例。
+- 不同 RouteId 即使都采用直连方式（同为 DirectTransport 这一实现类型），也各自对应**独立的实例**。例如 RouteId 1+0（聊天）与 2+0（支付）都走直连，但它们是两个逻辑服务，各有独立的 DirectTransport 实例、独立的后端副本集合与连接池。
+- 因此实现类型是可多次实例化的"类"，实例数量只由配置中的 RouteId 数量决定，与实现类型的种类无关。
+
+### 5.3 实例内部是黑盒
+
+一个 DirectTransport 实例 = 一个逻辑服务的直连出口：
+
+- 实例的配置就是该服务的全部后端副本（endpoints 列表），内部用连接池按 host:port 去重管理连接；
+- 如何寻址、建连、选副本、复用连接，全部是实现的私事，注册表和 Worker 不感知、不参与；
+- 路由语义不进入实现内部：resolve / send 的 route 参数只是接口契约，实现内不用它做二次分流。
+
+### 5.4 与集群服务发现的边界
+
+控制面（Coordinator）层面的"服务发现"指网关**集群本身**的节点成员与生命周期管理；"实例内部寻址后端副本"是 Transport 实现的内部行为。两者是不同层级的概念，互不相干。etcd / Consul 等后端寻址方式将来以新的 Transport 实现类型接入，不进入控制面。
+
+### 5.5 演化规则
+
+- 新增一个业务场景：配置里加一条 RouteId 及其副本列表，装配时注册一个新实例，不改任何传输代码；
+- 新增一种传输方式：加一个实现类型，不改路由逻辑；
+- 当前热加载只允许新增 realm 和 route；修改既有 RouteId 的绑定、参数或 endpoint 会整次拒绝。
+  将来若扩展为完整动态配置，仍应通过注册表与 Transport 实例边界实现，不把部署策略写入帧协议。
+
+## 6. 连接管理策略
+
+### 6.1 Gateway-initiated 模式
 
 采用**网关主动连接后端**的模式：
 
@@ -228,90 +270,77 @@ Linux reuseport BPF 校验 magic/version 后直接返回 `worker_id` 对应的 s
 │   网关启动                                                      │
 │      │                                                         │
 │      ▼                                                         │
-│   订阅服务发现 (etcd/Consul)                                    │
+│   读取配置，按 RouteId 装配并注册 Transport 实例                 │
+│   ┌─────────────────────────────────────────────┐              │
+│   │ TransportRegistry（RouteId → 实例，一一对应）│              │
+│   │ ┌─────────────────────────────────────────┐ │              │
+│   │ │ 1+0 → DirectTransport 实例 A（聊天）    │ │              │
+│   │ │ 2+0 → DirectTransport 实例 B（支付）    │ │              │
+│   │ │ 3+0 → RelayTransport  实例 C（规划中） │ │              │
+│   │ └─────────────────────────────────────────┘ │              │
+│   └─────────────────────────────────────────────┘              │
 │      │                                                         │
 │      ▼                                                         │
-│   ┌─────────────────────────────────────────┐                  │
-│   │ RouteKey 映射表                          │                  │
-│   │ ┌─────────────────────────────────────┐ │                  │
-│   │ │ 0x01 → ai-service    → [实例列表]  │ │                  │
-│   │ │ 0x02 → im-service    → [实例列表]  │ │                  │
-│   │ │ 0x03 → file-service  → [实例列表]  │ │                  │
-│   │ └─────────────────────────────────────┘ │                  │
-│   └─────────────────────────────────────────┘                  │
+│   收到客户端帧                                                  │
+│      │                                                         │
+│      ├─── 解析帧头，取 RouteId（Group + RouteKey）              │
 │      │                                                         │
 │      ▼                                                         │
-│   收到客户端请求                                                │
+│   注册表按 RouteId 命中唯一 Transport 实例                       │
 │      │                                                         │
-│      ├─── 解析帧头，获取 TransportMode 和 RouteKey              │
-│      │                                                         │
-│      ├─── 直连模式 (direct_*)                                  │
-│      │       │                                                 │
-│      │       ▼                                                 │
-│      │    查询 RouteKey 对应的服务实例                          │
-│      │       │                                                 │
-│      │       ▼                                                 │
-│      │    从连接池获取/新建 QUIC 连接                           │
-│      │       │                                                 │
-│      │       ▼                                                 │
-│      │    解析帧头用于路由，向后端透传完整帧                     │
-│      │                                                         │
-│      └─── 中继模式 (relay_*)                                   │
-│              │                                                 │
-│              ▼                                                 │
-│           发送到 NATS 对应 topic (RouteKey 作为 topic 标识)     │
+│      ▼                                                         │
+│   实例内部完成寻址/建连/连接复用（对上层黑盒），                  │
+│   向后端透传完整帧；中继实例则发布到对应 topic                    │
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 连接池管理
+### 6.2 连接池管理
 
-对于直连模式，网关维护到各后端服务的连接池：
+连接池是 DirectTransport 实例的**私有状态**：每个实例只管理自己这个逻辑服务的副本连接，按 host:port 去重，一台后端一条连接：
 
 ```
-┌────────────────────────────────────────┐
-│           连接池 (Connection Pool)      │
-├────────────────────────────────────────┤
-│                                        │
-│  ai-service (0x01)                     │
-│  ├── conn_1 → 192.168.1.10:8080       │
-│  ├── conn_2 → 192.168.1.11:8080       │
-│  └── conn_3 → 192.168.1.12:8080       │
-│                                        │
-│  im-service (0x02)                     │
-│  ├── conn_1 → 192.168.2.10:8080       │
-│  └── conn_2 → 192.168.2.11:8080       │
-│                                        │
-└────────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│ DirectTransport 实例 A（RouteId 1+0）     │
+│  ├── conn → 192.168.1.10:8443            │
+│  ├── conn → 192.168.1.11:8443            │
+│  └── conn → 192.168.1.12:8443            │
+├──────────────────────────────────────────┤
+│ DirectTransport 实例 B（RouteId 2+0）     │
+│  ├── conn → 192.168.2.10:8443            │
+│  └── conn → 192.168.2.11:8443            │
+└──────────────────────────────────────────┘
 ```
 
-## 6. 扩展性设计
+不同实例之间不共享连接：连接池属于实例内部，不做跨实例复用，路由语义因此不会泄漏进实现。
 
-### 6.1 新增后端服务
+## 7. 扩展性设计
 
-只需两步：
+### 7.1 新增后端服务
 
-1. 在服务发现中注册新服务
-2. 配置 RouteKey 到服务名的映射
+只需一步：在 `gateway.json` 中新增一条路由（RouteId + 该服务的 endpoints 副本列表），装配时会为它注册一个独立的 Transport 实例。
 
 **网关代码无需修改。**
 
-### 6.2 TransportMode 扩展
+### 7.2 目的地类型（dest_kind）
 
-当前编码规则：高 4 位表示路径，低 4 位表示方式
+传输路径（直连/中继）不在帧头编码——那是服务端的部署决策，由 RouteId 的注册关系决定，客户端无感。帧头只表达"发给谁"：
 
-| 路径         | 方式                     | 预留空间               |
-| ------------ | ------------------------ | ---------------------- |
-| 0x0\_ (中继) | 0x_0 (缓冲), 0x_1 (流式) | 0x02-0x0F 可扩展新方式 |
-| 0x1\_ (直连) | 0x_0 (缓冲), 0x_1 (流式) | 0x12-0x1F 可扩展新方式 |
-| 0x2*-0xE*    | -                        | 预留新路径类型         |
-| 0xF\_ (控制) | -                        | 控制帧专用             |
+| dest_kind    | 值   | 说明                                 |
+| ------------ | ---- | ------------------------------------ |
+| `.gateway`   | 0x00 | 网关本地处理，不转发（控制交换）     |
+| `.service`   | 0x01 | 按 RouteId 转给后端服务              |
+| `.peer`      | 0x02 | 投递给一个或多个客户端（已实现）     |
+| `.multicast` | 0x03 | 投递给一个组播组（已实现）           |
+| 其余         | -    | 解码时拒绝（白名单），不留未定义语义 |
 
-### 6.3 RouteKey 空间
+"怎么传"由帧数表达而不是由字段表达：一次性交换是一个带 `eof` 的 OPEN，流式交换是 OPEN + N×DATA。详见 `docs/protocol_design.md` §5.2。
 
-u8 类型，支持 256 种服务标识，对绝大多数系统足够。
+### 7.3 RouteId 空间
 
-## 7. 组件分层与依赖
+RouteId = Group（u8，业务组）+ RouteKey（u8，组内场景），共 65536 个使用场景标识，对绝大多数系统足够。
+
+## 8. 组件分层与依赖
 
 网关由自上而下、无环依赖的组件层组成，组装集中在最上层 `app/`（组合根）：
 
@@ -336,12 +365,12 @@ u8 类型，支持 256 种服务标识，对绝大多数系统足够。
 
 - app：加载配置、装配组件、拉起进程（`app/config.zig` 装配 RuntimeConfig，`app/bootstrap.zig` 编排 Coordinator/socket 组/多 Worker）
 - worker：数据面 per-core，QUIC 连接、流分发、消息聚合
-- control：控制面，节点/Worker 生命周期与服务发现
+- control：控制面，节点/Worker 生命周期、SWIM membership 与集群运行器
 - backend：后端出口，BackendTransport 接口 + 直连实现 + 路由注册表
 - reactor：事件反应堆，组装 Endpoint + IoLoop 驱动收发循环
 - protocol：帧头编解码与流处理器
 - quic：picoquic 引擎封装
-- io：事件循环、reuseport 分流、CID、跨 Worker 交接
+- io：事件循环、reuseport 分流、CID、本地交接与节点间 UDP 转发隧道
 - foundation：配置、错误、网络地址、时间、异步 DNS
 
 组件遵循统一约定：单一 `mod.zig` 暴露接口、依赖注入、`init`/`deinit` 生命周期、可单独测试与替换。详见 `docs/directory_design.md`。

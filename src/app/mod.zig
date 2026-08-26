@@ -9,6 +9,7 @@ const foundation = @import("../foundation/mod.zig");
 
 pub const config = @import("config.zig");
 pub const bootstrap = @import("bootstrap.zig");
+pub const reload = @import("reload.zig");
 
 /// 加载配置文件、装配运行期配置并启动网关，直到事件循环结束。
 pub fn serve(io: std.Io, allocator: std.mem.Allocator, config_path: []const u8) !void {
@@ -21,7 +22,8 @@ pub fn serve(io: std.Io, allocator: std.mem.Allocator, config_path: []const u8) 
     var runtime = try config.prepare(allocator, loaded.parsed.value);
     defer runtime.deinit(allocator);
 
-    try bootstrap.run(io, allocator, &runtime);
+    // 路径要往下传：热加载靠重读同一个文件实现（见 app/reload.zig）。
+    try bootstrap.run(io, allocator, &runtime, config_path);
 }
 
 test {

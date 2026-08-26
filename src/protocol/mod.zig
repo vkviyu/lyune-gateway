@@ -5,9 +5,14 @@
 // 帧格式
 pub const codec = @import("codec.zig");
 pub const frame = @import("frame.zig");
-pub const handler = @import("handler.zig");
+pub const framing = @import("framing.zig");
 
-// 以下模块尚未实现完整功能
+// 不可靠通路（QUIC DATAGRAM）
+pub const datagram = @import("datagram.zig");
+
+// 网关会解析的 Body 结构（准入结果、目标列表）
+pub const body = @import("body.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

@@ -4,7 +4,8 @@
 //! resolver.Cares 一并导出，使用方只依赖本 mod.zig 即可拿到接口与默认实现。
 
 const std = @import("std");
-const net = @import("../net.zig");
+const foundation = @import("../mod.zig");
+const net = foundation.net;
 
 /// c-ares 异步 DNS 解析实现。
 pub const Cares = @import("cares.zig").CaresResolver;

@@ -2,6 +2,9 @@
 //!
 //! 这个文件导入 picoquic 的 C 头文件，并提供类型别名。
 
+const io = @import("../io/mod.zig");
+const cluster_cid = io.cid;
+
 pub const c = @cImport({
     @cInclude("picoquic.h"); // 核心 API（连接、stream 等）
     @cInclude("picoquic_utils.h"); // 工具函数
@@ -74,6 +77,19 @@ pub const CallbackEvent = enum(c_int) {
     almost_ready = c.picoquic_callback_almost_ready,
     /// 连接就绪。连接完全建立，可以开始收发应用数据。这是发送数据的最佳时机。
     ready = c.picoquic_callback_ready,
+    /// 收到一个 QUIC DATAGRAM（RFC 9221）。负载就是回调带来的那一段字节，
+    /// 不会跨回调被切开——datagram 本身就是完整单元（设计文档 §6）。
+    datagram = c.picoquic_callback_datagram,
+    /// datagram 已被对端确认。
+    ///
+    /// 映射它只是为了让 `else => {}` 不再吞掉一类可识别的事件；本网关不消费这三个
+    /// 事件——不可靠通路的语义就是"发出去就不管了"，为它记账等于把 QUIC 已经
+    /// 明确放弃的可靠性又请回来一半。
+    datagram_acked = c.picoquic_callback_datagram_acked,
+    /// datagram 被判丢失。
+    datagram_lost = c.picoquic_callback_datagram_lost,
+    /// datagram 被误判丢失（其实到了）。
+    datagram_spurious = c.picoquic_callback_datagram_spurious,
     /// 其他事件（用于未知事件），Zig 非穷尽枚举语法，允许接收未定义的值而不报错。
     /// 这样即使 picoquic 新增事件类型，代码也不会崩溃。
     _,
@@ -113,10 +129,12 @@ pub const ConnectionState = enum(c_int) {
     draining = c.picoquic_state_draining,
     _,
 
+    /// 仅 ready 状态表示握手完成并可正常通信。
     pub fn isConnected(self: ConnectionState) bool {
         return self == .ready;
     }
 
+    /// 判断连接是否已进入最终 disconnected 状态。
     pub fn isDisconnected(self: ConnectionState) bool {
         return self == .disconnected;
     }
@@ -199,7 +217,7 @@ pub const MAX_CID_LENGTH: u8 = 20;
 
 /// 本项目使用的固定 CID 长度（与 connectionIdCallback 中的生成逻辑一致）
 /// 用于短包头解析，因为短包头不携带显式的 DCID 长度字段。
-pub const DEFAULT_SHORT_HEADER_CID_LENGTH: u8 = 8;
+pub const DEFAULT_SHORT_HEADER_CID_LENGTH: u8 = cluster_cid.length;
 
 /// 从 QUIC 包中解析 Destination Connection ID (DCID)。
 ///
@@ -234,7 +252,7 @@ pub const DEFAULT_SHORT_HEADER_CID_LENGTH: u8 = 8;
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
 /// 注意：短包头中 DCID 长度是隐式的，需要从连接上下文中获取。
-/// 本项目使用固定的 8 字节 CID（见 DEFAULT_SHORT_HEADER_CID_LENGTH）。
+/// 本项目使用 CID v1 固定长度（见 DEFAULT_SHORT_HEADER_CID_LENGTH）。
 ///
 /// @param packet 收到的原始 UDP 包数据
 /// @param dcid 输出参数，用于存储解析出的 DCID
@@ -249,7 +267,7 @@ pub fn parseDcid(packet: []const u8, dcid: *ConnectionId) bool {
 ///
 /// @param packet 收到的原始 UDP 包数据
 /// @param dcid 输出参数，用于存储解析出的 DCID
-/// @param short_header_cid_len 短包头中期望的 CID 长度（本项目默认为 8）
+/// @param short_header_cid_len 短包头中期望的 CID 长度（当前为 CID v1 的 12 字节）
 /// @return 成功返回 true，失败返回 false
 pub fn parseDcidWithLength(packet: []const u8, dcid: *ConnectionId, short_header_cid_len: u8) bool {
     parseDcidDetailed(packet, dcid, short_header_cid_len) catch return false;
@@ -287,12 +305,8 @@ pub fn parseDcidDetailed(
             @as(u32, packet[3]) << 8 |
             @as(u32, packet[4]);
 
-        if (version == 0) {
-            // Version Negotiation 包的格式：
-            // [First Byte][Version=0][DCID Len][DCID][SCID Len][SCID][Supported Versions...]
-            // 虽然它也有 DCID，但通常不用于路由，这里我们仍然尝试解析
-            // 如果需要严格区分，可以返回错误
-        }
+        // Version Negotiation 报文不属于已建立连接的数据路径，不用其中的 DCID 做 owner 路由。
+        if (version == 0) return ParseError.VersionNegotiation;
 
         // 解析 DCID 长度（字节 5）
         const dcid_len = packet[5];
