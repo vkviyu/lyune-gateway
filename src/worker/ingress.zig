@@ -398,7 +398,7 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
         .client_cnx = ctx.cnx_handle,
         .client_stream_id = stream_id,
         .realm = ctx.realm,
-        .created_at = now,
+        .last_active_at = now,
     }) catch |err| {
         // 登记不上回程映射，后端的响应就找不回客户端。当场把后端流收尾，
         // 否则它会一直等一个永远不来的 eof。
@@ -454,6 +454,16 @@ fn appendToExchange(
         self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "backend unavailable");
         return .continue_stream;
     };
+
+    // 映射可能已经因真实空闲而被周期回收；先判定再发送，不能把一帧交给后端后才
+    // 发现响应无处可回。完整 DATA 被接纳即算上行活动，发送失败路径会立即删映射。
+    if (!self.inflight.touchRoute(backend.key, quic.c.currentTime())) {
+        std.log.warn("[STREAM] in-flight route expired mid-exchange: stream={}", .{stream_id});
+        self.finishBackendStream(backend);
+        ctx.closeExchange(stream_id);
+        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "request expired");
+        return .continue_stream;
+    }
 
     const is_last = parsed.header.isLast();
     _ = transport.sendStream(backend.scope.route, backend.key.stream, parsed.bytes, is_last) catch |err| {

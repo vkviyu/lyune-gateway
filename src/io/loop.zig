@@ -104,6 +104,9 @@ pub const IoLoop = struct {
             .loop = loop,
             .udp = udp,
             .timer = timer,
+            // Timer.reset 要求 timer/cancel completion 首次使用前不是 undefined。
+            .timer_completion = .{},
+            .cancel_completion = .{},
             // 必须回查内核实际绑定的地址：port 传 0 时由内核分配，
             // 接管外部 socket_fd 时配置参数也未必与 fd 实际绑定的地址一致。
             // 该地址会作为本地地址传给 picoquic 参与路径管理，不能是配置里的占位值。
@@ -160,21 +163,25 @@ pub const IoLoop = struct {
     }
 
     pub fn updateTimer(self: *Self, interval_ms: u64) void {
-        // 1. 总是更新这个记录值
-        // 这样当定时器下一次触发时，timerCallback 会使用这个最新的值来重新调度
+        // 总是更新记录值；timer callback 续期时使用它。
         self.timer_interval_ms = interval_ms;
 
-        // 2. 检查状态
-        // 如果定时器已经是 Active 状态，不要再次调用 scheduleTimer
-        // 否则 libxev 会报 "invalid state" 错误
+        // QUIC 的下次唤醒会因应用写入从“空闲 10 秒后”骤然变成“现在”。只改记录值
+        // 而保留旧 active timer，会让 ACK、后续发送和响应处理平白卡到旧 deadline。
+        // libxev 的 reset 正是为此设计：它安全取消旧 timer 并用同一 completion 重排。
         if (self.timer_completion.state() == .active) {
-            // 策略：直接返回，不做操作。
-            // 虽然这可能导致这一次的唤醒时间不够精确（还是按照旧的时间触发），
-            // 但能保证程序不崩，且定时器链条不断裂。
+            self.timer.reset(
+                self.loop,
+                &self.timer_completion,
+                &self.cancel_completion,
+                interval_ms,
+                Self,
+                self,
+                timerCallback,
+            );
             return;
         }
 
-        // 3. 只有在非 Active 状态下才启动新的定时器
         self.scheduleTimer(interval_ms);
     }
 

@@ -1,0 +1,75 @@
+{
+  "runtime": {
+    "threads": 1
+  },
+  "server": {
+    "listen_host": "127.0.0.1",
+    "listen_port": 8443,
+    "certificate_file": "server.crt",
+    "private_key_file": "server.key",
+    "quic": {
+      "max_connections": 1024,
+      "idle_timeout_ms": 120000,
+      "alpn": "lyune/1",
+      "congestion_control": "bbr",
+      "max_datagram_frame_size": 1200
+    }
+  },
+  "backend": {
+    "direct": {
+      "routes": [
+        {
+          "group": 1,
+          "route_key": 0,
+          "endpoints": [{ "host": "127.0.0.1", "port": 9443 }]
+        },
+        {
+          "group": 1,
+          "route_key": 1,
+          "endpoints": [{ "host": "127.0.0.1", "port": 9443 }]
+        },
+        {
+          "group": 1,
+          "route_key": 2,
+          "endpoints": [{ "host": "127.0.0.1", "port": 9443 }]
+        }
+      ],
+      "verify_certificate": false,
+      "root_certificate_file": null,
+      "client_certificate_file": null,
+      "client_private_key_file": null,
+      "max_receive_queue": 1024,
+      "idle_timeout_ms": 120000,
+      "alpn": "lyune/1",
+      "congestion_control": "bbr"
+    }
+  },
+  "worker": {
+    "backend_poll_interval_ms": 10
+  },
+  "auth": {
+    "required": true,
+    "group": 1,
+    "route_key": 1
+  },
+  "cluster": {
+    "enabled": false,
+    "node_id": 1,
+    "advertise_host": "127.0.0.1",
+    "advertise_port": 7946,
+    "forward_port": 7947,
+    "deployment_mode": "direct",
+    "return_path_capacity": 4096,
+    "handoff_queue_capacity": 1024,
+    "message_queue_capacity": 16,
+    "placement": "affinity",
+    "peer_port": 7948,
+    "peer_cert_file": "",
+    "peer_key_file": "",
+    "peer_ca_file": "",
+    "secret": "",
+    "previous_secret": "",
+    "max_nodes": 1024,
+    "seeds": []
+  }
+}

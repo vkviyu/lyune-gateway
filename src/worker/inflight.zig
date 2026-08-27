@@ -28,6 +28,7 @@ const std = @import("std");
 
 const foundation = @import("../foundation/mod.zig");
 const quic = @import("../quic/mod.zig");
+const backend = @import("../backend/transport.zig");
 
 const RealmId = foundation.realm.RealmId;
 
@@ -50,10 +51,11 @@ pub const StreamKey = struct {
 /// 比静默膨胀到 OOM 更可诊断。
 pub const max_requests: u32 = 16384;
 
-/// 在途请求的最大存活时间（微秒）。
+/// 普通回程映射与认证等待的超时周期（微秒）。
 ///
-/// 取值需要明显大于正常后端响应时间，它只是兜底回收，不是超时语义：
-/// 真正的请求超时需要 transport 层支持取消，属于后续能力。
+/// 普通回程映射按双向应用帧的最后活动时刻计算；认证等待仍按创建时刻计算，
+/// 避免恶意认证服务靠零碎响应无限占住 buffer。真正的请求 deadline 仍需要
+/// transport 层支持取消，不由这张兜底表表达。
 pub const request_timeout_us: u64 = 60 * std.time.us_per_s;
 
 /// 一次批量回收扫描能带走的条目数。
@@ -68,9 +70,9 @@ pub const Route = struct {
     client_stream_id: u64,
     /// 发起这条请求的连接所属 realm；配额归还时从这里取（见文件开头）。
     realm: RealmId,
-    /// 创建时刻（微秒）。用于兜底过期：后端不回包、只回一半、连接中断
-    /// 都会让条目滞留，仅靠 is_fin 回收不够。
-    created_at: u64,
+    /// 最近一次成功转发完整应用帧的时刻（微秒）。客户端上行和后端下行都会刷新；
+    /// 后端不回包、双方都停止活动或 fin 丢失时，条目最终由空闲超时回收。
+    last_active_at: u64,
 };
 
 /// 已转发给认证服务、等待回包的认证请求。
@@ -95,13 +97,13 @@ pub const Admit = enum { ok, table_full, realm_over_share };
 pub const Filter = union(enum) {
     /// 回收属于某个客户端连接的全部条目。
     connection: quic.c.QuicCnx,
-    /// 回收创建时刻早于该 deadline 的条目。
+    /// 回收活动/创建时刻早于该 deadline 的条目。
     older_than: u64,
 
-    fn matches(self: Filter, cnx: quic.c.QuicCnx, created_at: u64) bool {
+    fn matches(self: Filter, cnx: quic.c.QuicCnx, timestamp: u64) bool {
         return switch (self) {
             .connection => |target| cnx == target,
-            .older_than => |deadline| created_at < deadline,
+            .older_than => |deadline| timestamp < deadline,
         };
     }
 };
@@ -197,6 +199,16 @@ pub const Tables = struct {
         return self.routes.get(key);
     }
 
+    /// 刷新普通回程映射的空闲时钟。返回 false 表示映射已经被其他回收路径删除。
+    ///
+    /// Tables 是 Worker 线程私有的，因此更新 value 不需要锁；调用方只在接纳完整
+    /// 上行帧或成功写回完整下行事件时刷新，残帧与纯 QUIC keepalive 不能续命。
+    pub fn touchRoute(self: *Tables, key: StreamKey, now: u64) bool {
+        const route = self.routes.getPtr(key) orelse return false;
+        route.last_active_at = now;
+        return true;
+    }
+
     pub fn closeRoute(self: *Tables, key: StreamKey) void {
         self.dropRoute(key);
     }
@@ -250,13 +262,72 @@ pub const Tables = struct {
     }
 
     // ========================================================================
+    // 后端故障回收
+    // ========================================================================
+
+    /// 摘出一次后端故障影响的普通回程映射，所有权转移到 out。
+    ///
+    /// 固定批量接口让 Worker 可以一边回错客户端一边继续扫描，故障路径零分配。
+    pub fn takeFailedRoutes(
+        self: *Tables,
+        transport_id: usize,
+        selector: backend.StreamSelector,
+        out: []Route,
+    ) usize {
+        var keys: [purge_batch]StreamKey = undefined;
+        const limit = @min(keys.len, out.len);
+        if (limit == 0) return 0;
+
+        var count: usize = 0;
+        var it = self.routes.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (key.transport != transport_id or !selector.matches(key.stream)) continue;
+            keys[count] = key;
+            count += 1;
+            if (count == limit) break;
+        }
+        for (keys[0..count], 0..) |key, index| out[index] = self.takeRoute(key).?;
+        return count;
+    }
+
+    /// 摘出一次后端故障影响的认证等待，buffer 所有权转移到 out。
+    pub fn takeFailedAuths(
+        self: *Tables,
+        transport_id: usize,
+        selector: backend.StreamSelector,
+        out: []PendingAuth,
+    ) usize {
+        var keys: [purge_batch]StreamKey = undefined;
+        const limit = @min(keys.len, out.len);
+        if (limit == 0) return 0;
+
+        var count: usize = 0;
+        var it = self.auths.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (key.transport != transport_id or !selector.matches(key.stream)) continue;
+            keys[count] = key;
+            count += 1;
+            if (count == limit) break;
+        }
+        for (keys[0..count], 0..) |key, index| out[index] = self.dropAuth(key).?;
+        return count;
+    }
+
+    // ========================================================================
     // 回收
     // ========================================================================
 
     /// routes 的唯一删除出口；配额递减贴在这里，三条回收路径都经由它。
-    fn dropRoute(self: *Tables, key: StreamKey) void {
-        const removed = self.routes.fetchRemove(key) orelse return;
+    fn takeRoute(self: *Tables, key: StreamKey) ?Route {
+        const removed = self.routes.fetchRemove(key) orelse return null;
         self.route_quota.release(removed.value.realm);
+        return removed.value;
+    }
+
+    fn dropRoute(self: *Tables, key: StreamKey) void {
+        _ = self.takeRoute(key);
     }
 
     /// auths 的唯一删除出口。返回摘出的条目，buffer 所有权随之转移给调用方。
@@ -283,7 +354,7 @@ pub const Tables = struct {
             var count: usize = 0;
             var it = self.routes.iterator();
             while (it.next()) |entry| {
-                if (!filter.matches(entry.value_ptr.client_cnx, entry.value_ptr.created_at)) continue;
+                if (!filter.matches(entry.value_ptr.client_cnx, entry.value_ptr.last_active_at)) continue;
                 keys[count] = entry.key_ptr.*;
                 count += 1;
                 if (count == keys.len) break;
@@ -332,7 +403,7 @@ test "route lifecycle: open, lookup, close" {
     defer tables.deinit();
 
     const cnx = fakeCnx(0x1000);
-    try tables.openRoute(streamKey(7), .{ .client_cnx = cnx, .client_stream_id = 4, .realm = 1, .created_at = 100 });
+    try tables.openRoute(streamKey(7), .{ .client_cnx = cnx, .client_stream_id = 4, .realm = 1, .last_active_at = 100 });
 
     const found = tables.lookupRoute(streamKey(7)).?;
     try std.testing.expectEqual(@as(u64, 4), found.client_stream_id);
@@ -354,8 +425,8 @@ test "the same handle from two transports is two different entries" {
     const from_a = StreamKey{ .transport = 0xA000, .stream = 4 };
     const from_b = StreamKey{ .transport = 0xB000, .stream = 4 };
 
-    try tables.openRoute(from_a, .{ .client_cnx = client_a, .client_stream_id = 1, .realm = 1, .created_at = 10 });
-    try tables.openRoute(from_b, .{ .client_cnx = client_b, .client_stream_id = 2, .realm = 2, .created_at = 10 });
+    try tables.openRoute(from_a, .{ .client_cnx = client_a, .client_stream_id = 1, .realm = 1, .last_active_at = 10 });
+    try tables.openRoute(from_b, .{ .client_cnx = client_b, .client_stream_id = 2, .realm = 2, .last_active_at = 10 });
 
     try std.testing.expectEqual(@as(u32, 2), tables.routeCount());
     try std.testing.expectEqual(client_a, tables.lookupRoute(from_a).?.client_cnx);
@@ -365,6 +436,62 @@ test "the same handle from two transports is two different entries" {
     tables.closeRoute(from_a);
     try std.testing.expect(tables.lookupRoute(from_a) == null);
     try std.testing.expect(tables.lookupRoute(from_b) != null);
+}
+
+test "backend failure takes only streams in its transport and selector" {
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+
+    const transport_a: usize = 0xA000;
+    const transport_b: usize = 0xB000;
+    const conn_1 = @as(u64, 1) << 48;
+    const conn_2 = @as(u64, 2) << 48;
+    const client = fakeCnx(0x1000);
+
+    try tables.openRoute(.{ .transport = transport_a, .stream = conn_1 | 4 }, .{
+        .client_cnx = client,
+        .client_stream_id = 4,
+        .realm = 1,
+        .last_active_at = 10,
+    });
+    try tables.openRoute(.{ .transport = transport_a, .stream = conn_2 | 8 }, .{
+        .client_cnx = client,
+        .client_stream_id = 8,
+        .realm = 1,
+        .last_active_at = 10,
+    });
+    try tables.openRoute(.{ .transport = transport_b, .stream = conn_1 | 4 }, .{
+        .client_cnx = client,
+        .client_stream_id = 12,
+        .realm = 2,
+        .last_active_at = 10,
+    });
+    try tables.trackAuth(.{ .transport = transport_a, .stream = conn_1 | 12 }, .{
+        .client_cnx = client,
+        .client_stream_id = 16,
+        .realm = 1,
+        .buffer = .{ .items = &.{}, .capacity = 0 },
+        .created_at = 10,
+    });
+
+    const selector = backend.StreamSelector{
+        .mask = @as(u64, std.math.maxInt(u16)) << 48,
+        .value = conn_1,
+    };
+    var routes: [4]Route = undefined;
+    try std.testing.expectEqual(@as(usize, 1), tables.takeFailedRoutes(transport_a, selector, &routes));
+    try std.testing.expectEqual(@as(u64, 4), routes[0].client_stream_id);
+
+    var auths: [4]PendingAuth = undefined;
+    try std.testing.expectEqual(@as(usize, 1), tables.takeFailedAuths(transport_a, selector, &auths));
+    auths[0].buffer.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), tables.routeCount());
+    try std.testing.expect(tables.lookupRoute(.{ .transport = transport_a, .stream = conn_2 | 8 }) != null);
+    try std.testing.expect(tables.lookupRoute(.{ .transport = transport_b, .stream = conn_1 | 4 }) != null);
+    try std.testing.expectEqual(@as(u32, 0), tables.authCount());
+    try std.testing.expectEqual(@as(usize, 2), tables.route_quota.total);
+    try std.testing.expectEqual(@as(usize, 0), tables.auth_quota.total);
 }
 
 // 连接关闭必须清空属于它的全部条目。
@@ -378,9 +505,9 @@ test "purge by connection removes only that connection's entries" {
     const doomed = fakeCnx(0x1000);
     const survivor = fakeCnx(0x2000);
 
-    try tables.openRoute(streamKey(1), .{ .client_cnx = doomed, .client_stream_id = 0, .realm = 1, .created_at = 10 });
-    try tables.openRoute(streamKey(2), .{ .client_cnx = survivor, .client_stream_id = 0, .realm = 1, .created_at = 10 });
-    try tables.openRoute(streamKey(3), .{ .client_cnx = doomed, .client_stream_id = 4, .realm = 1, .created_at = 10 });
+    try tables.openRoute(streamKey(1), .{ .client_cnx = doomed, .client_stream_id = 0, .realm = 1, .last_active_at = 10 });
+    try tables.openRoute(streamKey(2), .{ .client_cnx = survivor, .client_stream_id = 0, .realm = 1, .last_active_at = 10 });
+    try tables.openRoute(streamKey(3), .{ .client_cnx = doomed, .client_stream_id = 4, .realm = 1, .last_active_at = 10 });
     try tables.trackAuth(streamKey(11), .{
         .client_cnx = doomed,
         .client_stream_id = 8,
@@ -413,7 +540,7 @@ test "purge sweeps more entries than one batch" {
     const total = purge_batch * 2 + 5;
     var i: u64 = 0;
     while (i < total) : (i += 1) {
-        try tables.openRoute(streamKey(i), .{ .client_cnx = cnx, .client_stream_id = i, .realm = 1, .created_at = 10 });
+        try tables.openRoute(streamKey(i), .{ .client_cnx = cnx, .client_stream_id = i, .realm = 1, .last_active_at = 10 });
     }
     try std.testing.expectEqual(@as(u32, @intCast(total)), tables.routeCount());
 
@@ -426,13 +553,44 @@ test "purge by age keeps fresh entries" {
     defer tables.deinit();
 
     const cnx = fakeCnx(0x1000);
-    try tables.openRoute(streamKey(1), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .created_at = 100 });
-    try tables.openRoute(streamKey(2), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 1, .created_at = 900 });
+    try tables.openRoute(streamKey(1), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .last_active_at = 100 });
+    try tables.openRoute(streamKey(2), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 1, .last_active_at = 900 });
 
     tables.purge(.{ .older_than = 500 });
 
     try std.testing.expect(tables.lookupRoute(streamKey(1)) == null);
     try std.testing.expect(tables.lookupRoute(streamKey(2)) != null);
+}
+
+test "route activity refreshes idle deadline without extending auth lifetime" {
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+
+    const cnx = fakeCnx(0x1000);
+    try tables.openRoute(streamKey(1), .{
+        .client_cnx = cnx,
+        .client_stream_id = 0,
+        .realm = 1,
+        .last_active_at = 100,
+    });
+    try tables.trackAuth(streamKey(2), .{
+        .client_cnx = cnx,
+        .client_stream_id = 4,
+        .realm = 1,
+        .buffer = .{ .items = &.{}, .capacity = 0 },
+        .created_at = 100,
+    });
+
+    try std.testing.expect(tables.touchRoute(streamKey(1), 900));
+    try std.testing.expectEqual(@as(u64, 900), tables.lookupRoute(streamKey(1)).?.last_active_at);
+
+    // 同一个 cutoff 下，活跃的普通路由存活；认证仍按创建时刻到期。
+    tables.purge(.{ .older_than = 500 });
+    try std.testing.expect(tables.lookupRoute(streamKey(1)) != null);
+    try std.testing.expectEqual(@as(u32, 0), tables.authCount());
+
+    tables.closeRoute(streamKey(1));
+    try std.testing.expect(!tables.touchRoute(streamKey(1), 1_000));
 }
 
 // 过期回收必须按超时周期摊薄，不能跟随后端轮询频率。
@@ -442,7 +600,7 @@ test "purgeExpired throttles to one sweep per timeout window" {
 
     const cnx = fakeCnx(0x1000);
     const now = request_timeout_us * 3;
-    try tables.openRoute(streamKey(1), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .created_at = 0 });
+    try tables.openRoute(streamKey(1), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .last_active_at = 0 });
 
     // 第一次调用：last_purge_at 还是 0，距今已超过一个周期，应当真正扫表。
     tables.purgeExpired(now);
@@ -450,7 +608,7 @@ test "purgeExpired throttles to one sweep per timeout window" {
     try std.testing.expectEqual(now, tables.last_purge_at);
 
     // 紧接着再调：不足一个周期，必须直接跳过，连新插入的老条目也不动。
-    try tables.openRoute(streamKey(2), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 1, .created_at = 0 });
+    try tables.openRoute(streamKey(2), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 1, .last_active_at = 0 });
     tables.purgeExpired(now + 1);
     try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
     try std.testing.expectEqual(now, tables.last_purge_at);
@@ -497,13 +655,13 @@ test "a realm over its fair share is refused while others still get in" {
     var i: u64 = 0;
     while (i < above_watermark) : (i += 1) {
         try std.testing.expectEqual(Admit.ok, tables.reserveRoute(1, 0));
-        try tables.openRoute(streamKey(i), .{ .client_cnx = cnx, .client_stream_id = i, .realm = 1, .created_at = 0 });
+        try tables.openRoute(streamKey(i), .{ .client_cnx = cnx, .client_stream_id = i, .realm = 1, .last_active_at = 0 });
     }
 
     // realm 2 进来，活跃变 2，份额腰斩。realm 1 已经超了，realm 2 照常放行
     // ——这就是"只拒超额的那个"。
     try std.testing.expectEqual(Admit.ok, tables.reserveRoute(2, 0));
-    try tables.openRoute(streamKey(above_watermark), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 2, .created_at = 0 });
+    try tables.openRoute(streamKey(above_watermark), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 2, .last_active_at = 0 });
     try std.testing.expectEqual(Admit.realm_over_share, tables.reserveRoute(1, 0));
     try std.testing.expectEqual(Admit.ok, tables.reserveRoute(2, 0));
 }
@@ -520,9 +678,9 @@ test "quota counters return to zero through all three reclaim paths" {
         var realm: RealmId = 1;
         while (realm <= 4) : (realm += 1) {
             const base = @as(u64, realm) * 100;
-            try tables.openRoute(streamKey(base), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = realm, .created_at = 0 });
-            try tables.openRoute(streamKey(base + 1), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = realm, .created_at = 0 });
-            try tables.openRoute(streamKey(base + 2), .{ .client_cnx = cnx, .client_stream_id = 2, .realm = realm, .created_at = 0 });
+            try tables.openRoute(streamKey(base), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = realm, .last_active_at = 0 });
+            try tables.openRoute(streamKey(base + 1), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = realm, .last_active_at = 0 });
+            try tables.openRoute(streamKey(base + 2), .{ .client_cnx = cnx, .client_stream_id = 2, .realm = realm, .last_active_at = 0 });
             try tables.trackAuth(streamKey(base + 3), .{
                 .client_cnx = cnx,
                 .client_stream_id = 3,
@@ -570,8 +728,8 @@ test "reusing a stream key does not leak a quota slot" {
     defer tables.deinit();
 
     const cnx = fakeCnx(0x1000);
-    try tables.openRoute(streamKey(4), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .created_at = 0 });
-    try tables.openRoute(streamKey(4), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 2, .created_at = 0 });
+    try tables.openRoute(streamKey(4), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .last_active_at = 0 });
+    try tables.openRoute(streamKey(4), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 2, .last_active_at = 0 });
     try std.testing.expectEqual(@as(usize, 1), tables.route_quota.total);
     try std.testing.expectEqual(@as(u32, 0), tables.route_quota.count(1));
     try std.testing.expectEqual(@as(u32, 1), tables.route_quota.count(2));

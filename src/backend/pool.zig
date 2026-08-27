@@ -368,6 +368,12 @@ pub const BackendPool = struct {
     /// realm × 路由 × 副本 × Worker——500 租户规模下会真的耗尽，且是运行期硬失败。
     next_conn_id: u16,
 
+    /// 等待 Worker 消费的 transport 失败通知数。
+    ///
+    /// 失败不占接收槽位；若不把它并入 idle 判据，池恰好没有数据时 Worker 会走
+    /// 快速路径跳过 transport 遍历，失败通知以及对应的在途请求就会悬挂到超时。
+    pending_failures: usize,
+
     /// 决定"能否共用同一个 client"的那几个 TLS 参数。
     ///
     /// 客户端证书也在其中，而且它是这张表**最不能漏**的一项：漏掉它意味着两条配了不同
@@ -426,6 +432,7 @@ pub const BackendPool = struct {
             .arena = arena,
             .live = 0,
             .next_conn_id = 0,
+            .pending_failures = 0,
         };
     }
 
@@ -464,6 +471,14 @@ pub const BackendPool = struct {
         client.setCallbacks(self, dispatchConnected, dispatchStreamData, dispatchClose);
         client.start();
         return client;
+    }
+
+    /// 冲刷共享客户端中由应用层新排入的 QUIC 数据。
+    ///
+    /// client 懒建之前调用是安全的 no-op；正常发送路径已经持有 ready 连接，所以此时
+    /// client 必然存在。保留 no-op 让池的生命周期边界保持简单。
+    pub fn flushClient(self: *BackendPool) void {
+        if (self.client) |*client| client.flush();
     }
 
     /// 分配一个 Worker 内唯一的连接 id。
@@ -515,6 +530,17 @@ pub const BackendPool = struct {
         self.arena.drop(list);
     }
 
+    /// 登记/消费一条 transport 失败通知。每个 DirectTransport 会把同一轮内的多个
+    /// 连接失败合并成一条通知，所以这里按通知而不是按连接计数。
+    pub fn signalFailure(self: *BackendPool) void {
+        self.pending_failures += 1;
+    }
+
+    pub fn acknowledgeFailure(self: *BackendPool) void {
+        std.debug.assert(self.pending_failures > 0);
+        self.pending_failures -= 1;
+    }
+
     /// 池里一个待取槽位都没有。
     ///
     /// 给 Worker 的 drain 循环当快速判据：空闲时不必遍历注册表逐个 `receive()`。
@@ -523,7 +549,7 @@ pub const BackendPool = struct {
     /// 判据是"全部槽位都在空闲链表上"，因此它精确、不是估算：只要有任何一条连接
     /// 队列里还挂着东西，`free_count` 就一定小于总数。
     pub fn idle(self: *const BackendPool) bool {
-        return self.arena.free_count == self.arena.slots.len;
+        return self.arena.free_count == self.arena.slots.len and self.pending_failures == 0;
     }
 
     /// 从共享池取出的一个待处理分片。

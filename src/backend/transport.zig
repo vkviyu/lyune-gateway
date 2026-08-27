@@ -86,6 +86,20 @@ pub const TransportRecv = struct {
     peer_initiated: bool = false,
 };
 
+/// 一次 transport 接收失败影响哪些后端流。
+///
+/// `mask == 0` 表示这个 transport 上的全部流；其余实现可以用句柄中稳定的位域
+/// 精确圈定故障域。DirectTransport 的句柄高 16 位是连接 id，因此单个后端副本
+/// 断开时不必误伤同一逻辑服务的健康副本。
+pub const StreamSelector = struct {
+    mask: u64 = 0,
+    value: u64 = 0,
+
+    pub fn matches(self: StreamSelector, stream: u64) bool {
+        return stream & self.mask == self.value;
+    }
+};
+
 // ============================================================================
 // 后端传输接口
 // ============================================================================
@@ -164,6 +178,12 @@ pub const BackendTransport = struct {
         /// 会逐渐被占满，之后的后端响应只能被拒。
         releaseRecv: *const fn (ptr: *anyopaque, recv: TransportRecv) void,
 
+        /// 最近一次 receive 错误影响的流集合。
+        ///
+        /// 不实现精细故障域的 transport 默认返回全选；调用方只会在 receive 返回
+        /// error 后读取它。
+        failureSelector: *const fn (ptr: *anyopaque) StreamSelector,
+
         /// 关闭连接
         ///
         /// 释放资源，断开与后端的连接。
@@ -211,6 +231,11 @@ pub const BackendTransport = struct {
     /// 归还 receive 返回的接收槽位；与每次成功的 receive 一一对应。
     pub fn releaseRecv(self: BackendTransport, recv: TransportRecv) void {
         return self.vtable.releaseRecv(self.ptr, recv);
+    }
+
+    /// 最近一次 receive 错误影响的流集合。
+    pub fn failureSelector(self: BackendTransport) StreamSelector {
+        return self.vtable.failureSelector(self.ptr);
     }
 
     /// 关闭连接
@@ -274,6 +299,14 @@ pub const BackendTransport = struct {
                 return self.releaseRecvImpl(recv);
             }
 
+            fn failureSelectorImpl(ptr: *anyopaque) StreamSelector {
+                if (@hasDecl(T, "failureSelectorImpl")) {
+                    const self: *T = @ptrCast(@alignCast(ptr));
+                    return self.failureSelectorImpl();
+                }
+                return .{};
+            }
+
             fn closeImpl(ptr: *anyopaque) void {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.closeImpl();
@@ -284,6 +317,7 @@ pub const BackendTransport = struct {
                 .sendStream = sendStreamImpl,
                 .receive = receiveImpl,
                 .releaseRecv = releaseRecvImpl,
+                .failureSelector = failureSelectorImpl,
                 .close = closeImpl,
             };
         };
@@ -387,4 +421,14 @@ test "BackendTransport interface" {
     // 测试 close
     transport.close();
     try std.testing.expect(impl.closed);
+}
+
+test "stream selector can isolate a connection encoded in the high bits" {
+    const selector = StreamSelector{
+        .mask = @as(u64, std.math.maxInt(u16)) << 48,
+        .value = @as(u64, 7) << 48,
+    };
+    try std.testing.expect(selector.matches((@as(u64, 7) << 48) | 12));
+    try std.testing.expect(!selector.matches((@as(u64, 8) << 48) | 12));
+    try std.testing.expect((StreamSelector{}).matches(1234));
 }

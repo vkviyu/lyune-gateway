@@ -683,23 +683,27 @@ pub const GatewayWorker = struct {
         };
     }
 
-    /// 后端轮询的主体：先做一次摊薄的过期回收，再排空两条路径上所有 transport 的接收队列。
-    fn drainBackendResponses(self: *Self) void {
-        // 兜底回收：后端不回包、只回一半、或 is_fin 丢失时，条目无法靠正常
-        // 路径回收。摊薄策略在 inflight 模块里，不跟随后端轮询频率。
-        self.inflight.purgeExpired(quic.c.currentTime());
-
+    /// 后端轮询的主体：先排空响应，再做一次摊薄的过期回收。
+    fn drainBackendResponses(self: *Self) bool {
         // 共享接收池一个待取槽位都没有时直接返回。
         //
         // 下面那两趟遍历是 O(路由数)，而路由数是 realm 数 × 服务数：200 条路由 ×
         // 每 10ms 一次 tick = 每秒 2 万次什么也没捞到的 `receive()`。所有后端响应
         // 都经由这一个池，所以"池空"就等价于"两条路径都没东西"，判据是精确的。
         if (self.backend_pool) |shared| {
-            if (shared.idle()) return;
+            if (shared.idle()) {
+                self.inflight.purgeExpired(quic.c.currentTime());
+                return false;
+            }
         }
 
         self.drainTransportPath(.direct);
         self.drainTransportPath(.relay);
+
+        // 已经进入接收队列的响应也是活动。先让 drainTransport 刷新对应映射，再扫描，
+        // 避免一个刚在 deadline 前到达的响应因轮询顺序被误判为空闲。
+        self.inflight.purgeExpired(quic.c.currentTime());
+        return true;
     }
 
     fn drainTransportPath(self: *Self, path: TransportPath) void {
@@ -727,6 +731,7 @@ pub const GatewayWorker = struct {
         while (true) {
             const event = transport.receive() catch |err| {
                 err_handler.reportError(.session, "Failed to receive backend response", err);
+                self.failTransportRequests(transport);
                 return;
             } orelse break;
             // data 是 transport 接收池槽位的借用，必须归还，否则池会被逐渐占满。
@@ -766,7 +771,38 @@ pub const GatewayWorker = struct {
 
             if (event.is_fin) {
                 self.inflight.closeRoute(key);
+            } else {
+                // 成功写回一个完整后端事件才刷新；发送失败会走上面的关闭分支。
+                _ = self.inflight.touchRoute(key, quic.c.currentTime());
             }
+        }
+    }
+
+    /// 后端连接已无法交付响应时，立即终止它影响的在途请求。
+    ///
+    /// 普通业务流回 gateway_error；认证流回 auth_failure。两者都经 replyControl 写入
+    /// 原客户端流并带 fin，客户端因此在本轮 Worker tick 内得到明确、可重试的结果，
+    /// 不再悬挂到自己的 deadline。
+    fn failTransportRequests(self: *Self, transport: BackendTransport) void {
+        const selector = transport.failureSelector();
+        var routes: [64]inflight.Route = undefined;
+        while (true) {
+            const count = self.inflight.takeFailedRoutes(transport.id(), selector, &routes);
+            for (routes[0..count]) |route| {
+                self.replyControl(route.client_cnx, route.client_stream_id, .gateway_error, "backend connection failed");
+            }
+            if (count < routes.len) break;
+        }
+
+        var auths: [64]inflight.PendingAuth = undefined;
+        while (true) {
+            const count = self.inflight.takeFailedAuths(transport.id(), selector, &auths);
+            for (auths[0..count]) |pending_value| {
+                var pending = pending_value;
+                self.replyControl(pending.client_cnx, pending.client_stream_id, .auth_failure, "authentication backend failed");
+                pending.buffer.deinit(self.allocator);
+            }
+            if (count < auths.len) break;
         }
     }
 
@@ -851,7 +887,10 @@ pub const GatewayWorker = struct {
         const now = quic.c.currentTime();
         self.refreshPlacement(now);
         self.rehomeDrifted();
-        self.drainBackendResponses();
+        // 后端响应由独立的 UDP client + 本定时器收割，不经过面向客户端的
+        // ServerDriver 收包回调。因此 streamWrite 之后必须显式驱动一次服务端
+        // picoquic；否则字节会滞留到空闲连接最远 10 秒后的协议定时器。
+        if (self.drainBackendResponses()) self.server_driver.flushApplicationWrites();
         // 推进退避中的对等链路。少了它，一条进入退避的链路只能等下一次跨节点投递
         // 来唤醒——而那次投递必然先失败一回，等于每个退避周期至少损失一帧。
         if (self.peer_links) |*links| links.poll(now);

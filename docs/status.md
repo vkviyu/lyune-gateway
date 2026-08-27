@@ -1,10 +1,12 @@
 # 当前实现状态
 
-> 基线日期：2026-08-27
+> 基线日期：2026-08-28
 >
 > 状态：开发中；没有正式 release，没有生产环境使用者。
 >
 > 本文描述当前源码事实，不构成兼容性或发布时间承诺。
+
+当前开发基线已经冻结，功能演进暂缓。真实 MacBook 单机 M0–M9 已完成，眼下只把同一代码、数据与场景迁移到远程 Linux；实际结论与证据以 [两阶段真实环境验证](validation.md) 为准。
 
 ## 1. 已形成闭环的能力
 
@@ -18,6 +20,7 @@
 - 后端控制的 kick、join_group、leave_group；
 - DirectTransport 副本连接、异步 DNS、退避重连；
 - 每 Worker 共享 AsyncClient 和后端接收槽位池，同时保持 ScopedRoute/realm 连接语义隔离。
+- 后端响应由 Worker 定时器写入客户端 QUIC 后会主动 flush，不再滞留到最长 10 秒的协议 timer；后端连接失败会立即终止该连接上的普通/认证 inflight。
 
 ### 多 Worker 与集群
 
@@ -45,18 +48,18 @@
 当前基线验证结果：
 
 - `zig fmt --check build.zig src`：通过；
-- `zig build test --summary all`：244 pass、1 skip，共 245 个测试；
+- `zig build test --summary all`：247 pass、1 skip，共 248 个测试；
 - `zig build -Doptimize=ReleaseSafe --summary all`：9/9 构建步骤通过。
 
 测试覆盖帧 codec/framing、连接与路由表、realm 配额、DirectTransport、CID、交接队列、SWIM 状态机、分区愈合、Lifeguard、HMAC、真实 loopback gossip、forward tunnel、peer 权限和主要 Worker 分派路径。
 
-尚未完成的发布级验证：
+真实环境验证状态与仍未完成项：
 
+- Mac 上真实浏览器 + 原生 QUIC client-agent → Gateway → Go Reactor/SQLite 的 M0–M9 全部通过；M8 包含 120 秒活跃长流与 125 秒静默负对照，M7 包含慢后端/慢客户端/8 槽压力，M9 包含真实双用户认证、成员授权、历史持久化与 `.peer` 双向群聊；
 - Linux 内核真实 cBPF attach 与多 socket 分流；
 - 两个完整网关进程的客户端 QUIC、forward tunnel 和 peer link 联调；
 - 3–5 节点 `tc netem` 丢包、延迟、重排、分区和长时间 soak；
-- 超过 60 秒的流式请求/响应；
-- socket `EAGAIN`、慢后端、慢客户端和内存压力测试；
+- socket `EAGAIN`、持续内存压力和发布容量下的 soak；M7 已覆盖受控慢后端、慢客户端与接收池满载；
 - 多 realm + 后端 mTLS 的端到端安全测试；
 - 进程滚动扩缩容、drain 和大规模同时重连。
 
@@ -64,12 +67,12 @@
 
 ### 优先级 A：正确性与资源上界
 
-1. `inflight` 以创建时间执行 60 秒绝对超时，活跃长流不会刷新，可能在传输中丢失回程映射；应改为空闲超时。
-2. 认证服务响应使用动态缓冲累积到 FIN，缺少最大帧长度上限。
-3. 客户端快、后端慢时，上行 QUIC 流控不会自动跨两段连接传导；需要显式背压。
-4. UDP socket 忙时的发送队列是动态数组且没有容量上限，需要有界 ring 和过载策略。
-5. 后端接收槽位池满时会关闭整条后端连接；更细粒度的目标是只终止受影响流。
-6. membership.Table 的多缓冲无锁发布依赖“写者不会连续追上读者”的时序假设；生产前需要完成严格内存模型证明或改为可证明安全的快照机制。
+1. 认证服务响应使用动态缓冲累积到 FIN，缺少最大帧长度上限。
+2. 客户端快、后端慢时，上行 QUIC 流控不会自动跨两段连接传导；需要显式背压。
+3. UDP socket 忙时的发送队列是动态数组且没有容量上限，需要有界 ring 和过载策略。
+4. 后端接收槽位池满时会关闭发生溢出的后端连接，并立即失败该连接上的全部 inflight；已避免静默截断和跨副本误伤，但若要只取消导致超额的单流，需要 transport 提供单流 reset 与独立记账。
+5. membership.Table 的多缓冲无锁发布依赖“写者不会连续追上读者”的时序假设；生产前需要完成严格内存模型证明或改为可证明安全的快照机制。
+6. DirectTransport 连接在空闲关闭边界可能仍短暂处于 ready，首个请求会进入失效连接；需要稳定复现并明确失败请求的重试/重排队语义。
 
 ### 优先级 B：安全与配置
 

@@ -108,6 +108,16 @@ pub const AsyncClient = struct {
         self.io_loop.start();
     }
 
+    /// 应用层刚向 picoquic 排入数据后立即驱动一次发送。
+    ///
+    /// `picoquic_add_to_stream` 只把字节放进协议栈队列，不会唤醒 libxev。客户端空闲时
+    /// 下次 QUIC timer 最远可以在 10 秒后；如果调用方只排队而不驱动，新的应用数据就会
+    /// 平白滞留到那个 timer。所有调用都发生在持有本客户端的 Worker 线程上，因此这里
+    /// 直接复用与 UDP 收包/定时器相同的驱动入口，不需要跨线程通知。
+    pub fn flush(self: *Self) void {
+        self.processQuicEvents();
+    }
+
     /// 连接到指定地址。
     ///
     /// `placement_hint` 非空时用它作为**客户端自选的 initial DCID**，也就是 Worker 级

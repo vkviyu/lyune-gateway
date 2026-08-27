@@ -175,6 +175,15 @@ pub const ServerDriver = struct {
         self.io_loop.stop();
     }
 
+    /// Flush bytes queued by application code that ran outside a client UDP
+    /// receive callback (for example a delayed backend response collected by
+    /// the Worker's timer). Without this explicit drive, picoquic keeps the
+    /// bytes until its next protocol timer, which can be as far as 10 seconds
+    /// away on an otherwise idle client connection.
+    pub fn flushApplicationWrites(self: *Self) void {
+        self.processQuicEvents();
+    }
+
     // ========================================================================
     // 核心驱动逻辑：入站选路、交接包处理、发包与定时器
     // ========================================================================

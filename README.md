@@ -2,7 +2,7 @@
 
 Lyune Gateway 是一个使用 Zig 构建的分布式 QUIC 实时通信网关。它负责连接接入、QUIC 收发、流分发、在线推送和后端转发，只解析网关帧协议，不解析业务 Body。
 
-项目当前处于持续迭代阶段：核心数据面、单机多 Worker 和主要分布式链路已经形成可运行基线，但尚未发布版本，也没有生产环境使用者。当前重点是收敛正确性、资源上界、可观测性和真实 Linux 集成验证，而不是对外发布。
+项目当前处于验证优先阶段：核心数据面、单机多 Worker 和主要分布式链路已经形成代码基线，但尚未发布版本，也没有生产环境使用者。真实 MacBook 单机 M0–M9 已通过，包括 Go/SQLite 用户认证、群成员授权、消息持久化和两位浏览器用户的实时群聊；功能演进继续暂停，下一步只把同一套资产迁移到远程 Linux。计划和逐次证据见 [两阶段真实环境验证](docs/validation.md)。
 
 ## 当前基线
 
@@ -20,7 +20,7 @@ Lyune Gateway 是一个使用 Zig 构建的分布式 QUIC 实时通信网关。�
 - 节点间 QUIC+mTLS peer link、HRW affinity/broadcast、双查与 rehome；
 - SIGHUP 增量热加载（仅允许新增 realm 与路由）和 drain 生命周期。
 
-当前基线仍有明确缺口，主要是长流回程映射的空闲超时、端到端背压、认证响应缓冲上限、热加载提交原子性、生产安全配置强制、指标导出，以及 Linux 多进程/netem 验证。完整清单见 [当前实现状态](docs/status.md)，演进顺序见 [Roadmap](docs/roadmap.md)。
+当前基线仍有明确缺口，主要是端到端主动背压、认证响应缓冲上限、UDP 有界发送队列、热加载提交原子性、生产安全配置强制、指标导出，以及 Linux 多进程/netem/soak 验证。完整清单见 [当前实现状态](docs/status.md)，当前验证门槛见 [两阶段真实环境验证](docs/validation.md)，演进顺序见 [Roadmap](docs/roadmap.md)。
 
 ## 架构边界
 
@@ -72,7 +72,7 @@ zig build test -Denable-integration-tests=true --summary all
 当前冻结前验证结果：
 
 - `zig fmt --check build.zig src` 通过；
-- 默认测试 245 个：244 通过、1 跳过；
+- 默认测试 248 个：247 通过、1 跳过；
 - `ReleaseSafe` 构建 9/9 步通过。
 
 这些结果覆盖单元测试、确定性模拟和部分 loopback UDP 测试，但不能替代 Linux 内核 cBPF、多网关进程和长时间网络故障测试。
@@ -95,6 +95,22 @@ zig build run -- server --config config/gateway.json
 
 仓库中的 `server.crt`、`server.key` 和默认 `gateway.json` 仅用于本地开发。默认配置关闭后端证书验证、客户端认证和集群能力，不是生产安全模板。
 
+Mac 真实 IM 验证使用独立配置，不修改默认配置：
+
+```bash
+go -C ../lyune-reactor/reactor run . \
+  --listen 127.0.0.1:9443 \
+  --cert ../../lyune-gateway/server.crt \
+  --key ../../lyune-gateway/server.key \
+  --db /private/tmp/lyune-im-mac-stage.sqlite
+zig build run -- server --config config/validation-im-macos.json
+go -C validation/client-agent run . --listen 127.0.0.1:8787
+npm --prefix validation/web-client install
+npm --prefix validation/web-client run dev
+```
+
+浏览器打开 `http://127.0.0.1:5173`，可注册两个用户、建群、凭邀请码入群并实时互发消息。完整的 Reactor 命令、密码/成员授权判据、M0–M9 结果和压力负对照见 [两阶段真实环境验证](docs/validation.md)。浏览器经 client-agent 使用真实 `lyune/1` QUIC；这不是“浏览器直接打开原生 QUIC”。
+
 ## 集群部署模式
 
 `cluster.enabled=false` 时不创建 membership/forward socket 或协议线程。启用后支持三种入口模型：
@@ -111,8 +127,12 @@ zig build run -- server --config config/gateway.json
 lyune-gateway/
 ├── build.zig / build.zig.zon
 ├── config/gateway.json
+├── config/validation-*.json     # Mac 真实链路与压力诊断配置
 ├── docs/
 ├── libs/                       # picoquic / picotls submodules
+├── validation/
+│   ├── client-agent/           # browser-adjacent Go QUIC client
+│   └── web-client/             # React real-IM validation UI
 └── src/
     ├── app/                    # configuration and composition root
     ├── worker/                 # per-core data plane
@@ -132,6 +152,7 @@ lyune-gateway/
 文档入口与权威关系见 [docs/README.md](docs/README.md)：
 
 - [当前实现状态](docs/status.md)：当前代码事实、验证结果和已知缺口；
+- [两阶段真实环境验证](docs/validation.md)：MacBook 与远程 Linux 的真实验证计划、退出条件和执行记录；
 - [Roadmap](docs/roadmap.md)：迭代优先级，不代表发布日期承诺；
 - [架构设计](docs/architecture.md)：组件边界与核心模型；
 - [帧协议设计](docs/protocol_design.md)：应用层线格式与设计决策；

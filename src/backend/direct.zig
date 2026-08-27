@@ -316,6 +316,9 @@ const BackendConn = struct {
             self.nextBidiStreamId();
 
         conn.streamWrite(stream_id, data, is_fin) catch return TransportError.SendFailed;
+        // add_to_stream 只入 picoquic 队列；不主动驱动共享客户端的话，空闲连接上的
+        // 应用数据会一直等到最远 10 秒后的 QUIC timer 才真正发出。
+        self.transport.pool.flushClient();
         return DirectTransport.makeHandle(self.id, stream_id);
     }
 
@@ -394,6 +397,9 @@ const BackendConn = struct {
     fn hookStreamData(ctx: *anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
         const self: *BackendConn = @ptrCast(@alignCast(ctx));
 
+        // 同一个 UDP 包可能连续派发多个流回调。第一段把连接废弃后，其余回调必须
+        // 直接丢弃，否则会重复记录同一故障、重复关闭连接并刷屏。
+        if (self.state != .ready) return;
         if (data.len == 0 and !is_fin) return;
 
         // 丢弃可靠流上的字节会让后续帧的长度与内容错位，属于静默数据损坏，
@@ -415,6 +421,7 @@ const BackendConn = struct {
         // 只清句柄，不从池索引上摘：此刻仍在 picoquic 回调栈内，而池会在
         // 随后的 close 事件里自己 unregister。
         self.cnx = null;
+        self.transport.signalFailure(self.id);
         self.markFailed(err);
     }
 
@@ -432,6 +439,7 @@ const BackendConn = struct {
 
         // 无论此前是否就绪，都必须离开 ready/connecting 并安排退避，
         // 否则状态会永久停滞、此后所有建连尝试都被误判为"已在进行中"。
+        if (was_ready) self.transport.signalFailure(self.id);
         self.markFailed(if (was_ready) TransportError.Closed else TransportError.ConnectionFailed);
     }
 };
@@ -471,6 +479,16 @@ pub const DirectTransport = struct {
     /// 状态标记
     closed: bool,
 
+    /// 等待 Worker 消费的连接失败。
+    ///
+    /// 一轮内只有一条连接失败时保留其 id，Worker 只回收这个副本上的在途流；若多个
+    /// 副本在 Worker 来得及消费前同时失败，则退化为整个 transport，保证不漏请求。
+    pending_failure: bool,
+    pending_failure_conn: u16,
+    pending_failure_all: bool,
+    last_failure_conn: u16,
+    last_failure_all: bool,
+
     // ========================================================================
     // 生命周期
     // ========================================================================
@@ -493,11 +511,20 @@ pub const DirectTransport = struct {
             .conns = .{ .items = &.{}, .capacity = 0 },
             .next_conn = 0,
             .closed = false,
+            .pending_failure = false,
+            .pending_failure_conn = 0,
+            .pending_failure_all = false,
+            .last_failure_conn = 0,
+            .last_failure_all = true,
         };
     }
 
     pub fn deinit(self: *Self) void {
         if (self.closed) return;
+        if (self.pending_failure) {
+            self.pool.acknowledgeFailure();
+            self.pending_failure = false;
+        }
         for (self.conns.items) |conn| {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -509,6 +536,17 @@ pub const DirectTransport = struct {
     // ========================================================================
     // 内部辅助方法
     // ========================================================================
+
+    fn signalFailure(self: *Self, conn_id: u16) void {
+        if (!self.pending_failure) {
+            self.pending_failure = true;
+            self.pending_failure_conn = conn_id;
+            self.pending_failure_all = false;
+            self.pool.signalFailure();
+            return;
+        }
+        if (self.pending_failure_conn != conn_id) self.pending_failure_all = true;
+    }
 
     /// 获取 endpoint 对应的池中连接，不存在则新建（按 host:port 去重）。
     fn getOrCreateConn(self: *Self, endpoint: Endpoint) TransportError!*BackendConn {
@@ -647,6 +685,7 @@ pub const DirectTransport = struct {
             const conn = self.connById(handleConnId(value)) orelse return TransportError.Closed;
             if (!conn.isReady()) return TransportError.ConnectionFailed;
             return conn.sendOn(value, data, is_fin) catch |err| {
+                self.signalFailure(conn.id);
                 conn.markFailed(err);
                 return err;
             };
@@ -661,6 +700,7 @@ pub const DirectTransport = struct {
             if (!conn.isReady()) continue;
             const new_handle = conn.sendOn(null, data, is_fin) catch |err| {
                 last_error = err;
+                self.signalFailure(conn.id);
                 conn.markFailed(err);
                 continue;
             };
@@ -691,7 +731,23 @@ pub const DirectTransport = struct {
             };
         }
 
+        if (self.pending_failure) {
+            self.last_failure_conn = self.pending_failure_conn;
+            self.last_failure_all = self.pending_failure_all;
+            self.pending_failure = false;
+            self.pending_failure_all = false;
+            self.pool.acknowledgeFailure();
+            return TransportError.ReceiveFailed;
+        }
+
         return null;
+    }
+
+    /// 最近一次 receive 错误的精确故障域。句柄高 16 位是后端连接 id。
+    pub fn failureSelectorImpl(self: *const Self) backend_mod.StreamSelector {
+        if (self.last_failure_all) return .{};
+        const mask = @as(u64, std.math.maxInt(u16)) << stream_id_bits;
+        return .{ .mask = mask, .value = @as(u64, self.last_failure_conn) << stream_id_bits };
     }
 
     /// 这条 QUIC 流是后端开的还是网关开的。
