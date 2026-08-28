@@ -36,15 +36,16 @@ type imSession struct {
 	serverName  string
 	connectedAt time.Time
 
-	mu        sync.RWMutex
-	token     string
-	destID    uint64
-	ttl       uint32
-	user      *imUser
-	events    []imEvent
-	nextSeq   uint64
-	notify    chan struct{}
-	closedErr string
+	mu              sync.RWMutex
+	token           string
+	destID          uint64
+	ttl             uint32
+	user            *imUser
+	events          []imEvent
+	nextSeq         uint64
+	notify          chan struct{}
+	closedErr       string
+	writeOnNextPush bool
 }
 
 type imEvent struct {
@@ -160,6 +161,34 @@ func (a *Agent) handleIMCommand(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(payload)
 }
 
+// handleIMExchange runs transport-level validation streams on an already
+// authenticated IM connection. It is deliberately separate from application
+// commands and is only exposed by the loopback validation agent.
+func (a *Agent) handleIMExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var request struct {
+		SessionID string `json:"session_id"`
+		exchangeRequest
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := prepareExchangeRequest(&request.exchangeRequest); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	session, err := a.imSession(request.SessionID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeExchangeResponse(w, runExchanges(r.Context(), session.conn, request.exchangeRequest))
+}
+
 func (a *Agent) handleIMEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -197,6 +226,32 @@ func (a *Agent) handleIMLogout(w http.ResponseWriter, r *http.Request) {
 		session.close("user logged out")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// / Validation-only negative path: arm one IM session to send application bytes back on the
+// / next Gateway-initiated stream. lyune/2 reserves that reverse half for an empty FIN, so the
+// / Gateway must close this connection as a protocol violation without affecting other users.
+func (a *Agent) handleIMViolateServerStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var request struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	session, err := a.imSession(request.SessionID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	session.mu.Lock()
+	session.writeOnNextPush = true
+	session.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "armed": true})
 }
 
 func (a *Agent) imSessionForAuth(ctx context.Context, request imAuthRequest) (*imSession, bool, error) {
@@ -267,7 +322,7 @@ func (s *imSession) authenticate(ctx context.Context, action, username, password
 	if err != nil {
 		return err
 	}
-	request, err := wire.NewOpen(wire.DestGateway, 0, 0x10, wire.FlagEOF, body)
+	request, err := wire.NewOpen(wire.DestGateway, 0, 0x10, wire.ResponseRequired, wire.FlagEOF, body)
 	if err != nil {
 		return err
 	}
@@ -312,13 +367,26 @@ func (s *imSession) command(ctx context.Context, request imCommandRequest) (json
 	if err != nil {
 		return nil, err
 	}
-	frame, err := wire.NewOpen(wire.DestService, imGroup, imRoute, wire.FlagEOF, body)
+	responseMode := wire.ResponseRequired
+	if request.Type == "typing" {
+		responseMode = wire.ResponseNone
+	}
+	frame, err := wire.NewOpen(wire.DestService, imGroup, imRoute, responseMode, wire.FlagEOF, body)
 	if err != nil {
 		return nil, err
+	}
+	if responseMode == wire.ResponseNone {
+		if err := s.sendNoResponse(ctx, frame); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{"ok":true,"type":"accepted"}`), nil
 	}
 	response, err := s.exchange(ctx, frame)
 	if err != nil {
 		return nil, err
+	}
+	if response.Header.Type == wire.FrameOpen && response.Header.DestKind == wire.DestGateway && response.Header.RouteKey == 0xF0 {
+		return nil, fmt.Errorf("gateway rejected IM exchange: %s", response.Body)
 	}
 	if response.Header.Type != wire.FrameOpen || response.Header.DestKind != wire.DestService {
 		return nil, errors.New("gateway returned an invalid IM response")
@@ -327,6 +395,35 @@ func (s *imSession) command(ctx context.Context, request imCommandRequest) (json
 		return nil, errors.New("IM backend returned invalid JSON")
 	}
 	return json.RawMessage(response.Body), nil
+}
+
+func (s *imSession) sendNoResponse(parent context.Context, request *wire.Frame) error {
+	ctx, cancel := context.WithTimeout(parent, 4*time.Second)
+	defer cancel()
+	stream, err := s.conn.OpenStreamSync(ctx)
+	if err != nil {
+		return fmt.Errorf("open no-response stream: %w", err)
+	}
+	_ = stream.SetDeadline(time.Now().Add(4 * time.Second))
+	if err := wire.WriteFrame(stream, request); err != nil {
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		return fmt.Errorf("write no-response request: %w", err)
+	}
+	if err := stream.Close(); err != nil {
+		return fmt.Errorf("finish no-response request: %w", err)
+	}
+	response, err := wire.ReadFrame(stream)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("finish no-response exchange: %w", err)
+	}
+	if response.Header.DestKind == wire.DestGateway && response.Header.RouteKey == 0xF0 {
+		return fmt.Errorf("gateway rejected no-response exchange: %s", response.Body)
+	}
+	return errors.New("no-response exchange unexpectedly returned an application frame")
 }
 
 func (s *imSession) exchange(parent context.Context, request *wire.Frame) (*wire.Frame, error) {
@@ -384,6 +481,17 @@ func (s *imSession) readPush(stream *quic.Stream) {
 	}
 	if frame.Header.Type != wire.FrameOpen || frame.Header.DestKind != wire.DestPeer || !frame.Header.Flags.IsEOF() {
 		log.Printf("IM session %s rejected non one-shot .peer push", s.id)
+		return
+	}
+	s.mu.Lock()
+	violateDirection := s.writeOnNextPush
+	s.writeOnNextPush = false
+	s.mu.Unlock()
+	if violateDirection {
+		invalid, buildErr := wire.NewOpen(wire.DestService, imGroup, imRoute, wire.ResponseRequired, wire.FlagEOF, []byte("client bytes on a Gateway-initiated stream"))
+		if buildErr == nil {
+			_ = wire.WriteFrame(stream, invalid)
+		}
 		return
 	}
 	targets, payload, err := wire.ParseTargetList(frame.Body)

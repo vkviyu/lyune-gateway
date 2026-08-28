@@ -262,7 +262,7 @@ fn runSingleWorker(
         registry,
         &config.realms,
         config.backend_poll_interval_ms,
-        .{ .required = config.auth_required, .route = config.auth_route },
+        .{ .required = config.auth_required, .route = config.auth_route, .lifecycle_route = config.lifecycle_route },
         socket_fd,
         if (config.peer_quic) |peer_config|
             .{ .config = peer_config, .socket_fd = peer_socket_fd }

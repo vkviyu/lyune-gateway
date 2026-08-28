@@ -10,7 +10,7 @@
     "quic": {
       "max_connections": 1024,
       "idle_timeout_ms": 120000,
-      "alpn": "lyune/1",
+      "alpn": "lyune/2",
       "congestion_control": "bbr",
       "max_datagram_frame_size": 1200
     }
@@ -35,7 +35,7 @@
       "client_private_key_file": null,
       "max_receive_queue": 1024,
       "idle_timeout_ms": 120000,
-      "alpn": "lyune/1",
+      "alpn": "lyune/2",
       "congestion_control": "bbr"
     }
   },

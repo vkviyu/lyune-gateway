@@ -29,7 +29,7 @@ pub const Config = struct {
     ///
     /// 协议版本就活在这里：帧头里没有 version 字段，版本不匹配在 QUIC 握手阶段
     /// 就失败，不会进到帧层（见 docs/protocol_design.md §3）。
-    alpn: [:0]const u8 = "lyune/1",
+    alpn: [:0]const u8 = "lyune/2",
 
     /// 初始最大数据量
     initial_max_data: u64 = 10_000_000,
@@ -43,8 +43,12 @@ pub const Config = struct {
     /// 初始最大双向流数量
     initial_max_streams_bidi: u64 = 128,
 
-    /// 初始最大单向流数量
-    initial_max_streams_uni: u64 = 128,
+    /// 初始最大单向流数量。
+    ///
+    /// lyune 的可靠应用协议只使用双向流：请求方写入一侧，接收方用另一侧返回
+    /// 应用响应或空 FIN。通告单向流额度却在应用入口拒绝它们会形成互相矛盾的
+    /// 能力声明，因此默认明确为 0。
+    initial_max_streams_uni: u64 = 0,
 
     /// 是否启用 0-RTT
     enable_0rtt: bool = true,

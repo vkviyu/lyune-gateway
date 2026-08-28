@@ -205,6 +205,21 @@ pub const TransportRegistry = struct {
         return self.tables[@intFromEnum(TransportPath.relay)].default_transport;
     }
 
+    /// 用 BackendTransport.id() 反查实例。只用于故障/超时路径，热路径仍按 ScopedRoute
+    /// 查找；O(路由数) 扫描换取 inflight 条目不持有可悬空的实现指针。
+    pub fn findById(self: *const TransportRegistry, id: usize) ?BackendTransport {
+        for (&self.tables) |*table| {
+            var it = table.transports.valueIterator();
+            while (it.next()) |transport| {
+                if (transport.id() == id) return transport.*;
+            }
+            if (table.default_transport) |transport| {
+                if (transport.id() == id) return transport;
+            }
+        }
+        return null;
+    }
+
     /// 设置默认 Transport
     ///
     /// 为指定路径设置默认 Transport。

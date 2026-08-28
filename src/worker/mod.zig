@@ -9,6 +9,7 @@
 //!   - peer_link.zig  —— 节点间应用层投递的出站链路（对等网关节点，mTLS）
 //!   - inflight.zig   —— 在途请求表：回程映射与认证等待表，含上限与三条回收路径
 //!   - auth.zig       —— 接入认证：委托给后端认证服务，解析准入结果
+//!   - lifecycle.zig  —— 连接级 online/offline 事件，不做多设备聚合
 //!   - connection.zig —— 会话上下文、定容槽位池、`dest_id` / 组播成员索引
 //!
 //! 上行在 ingress、下行在 egress，两边通过 inflight 里的映射对接；worker.zig 只负责
@@ -22,6 +23,7 @@ pub const egress = @import("egress.zig");
 pub const peer_link = @import("peer_link.zig");
 pub const inflight = @import("inflight.zig");
 pub const auth = @import("auth.zig");
+pub const lifecycle = @import("lifecycle.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

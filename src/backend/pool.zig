@@ -52,6 +52,7 @@ const QUICConnection = quic.connection.Connection;
 const QUICConfig = quic.config.QUICConfig;
 const reactor = @import("../reactor/mod.zig");
 const AsyncClient = reactor.client.AsyncClient;
+const RecvKind = @import("transport.zig").RecvKind;
 
 const RealmId = foundation.realm.RealmId;
 
@@ -92,6 +93,7 @@ const Slot = struct {
     stream_id: u64 = 0,
     len: u32 = 0,
     is_fin: bool = false,
+    kind: RecvKind = .data,
     /// 这一格算在哪个 realm 头上。
     ///
     /// 取自入队时队列的 realm，一直留到归还为止。存在槽位上而不是靠调用方回忆：
@@ -192,6 +194,23 @@ const SlotArena = struct {
     /// realm 份额只在整段入队之前判一次，因此一段多槽位的分片可以略微越过份额。
     /// 这是有意的：为了守住一个整数把一条可靠流截断，代价远大于超出的那几格。
     fn enqueue(self: *SlotArena, list: *SlotList, stream_id: u64, data: []const u8, is_fin: bool) bool {
+        return self.enqueueEvent(list, stream_id, data, is_fin, .data);
+    }
+
+    /// 控制事件也占一个有界槽位，保证它与此前已入队的数据保持同一条连接上的顺序。
+    fn enqueueControl(self: *SlotArena, list: *SlotList, stream_id: u64, kind: RecvKind) bool {
+        std.debug.assert(kind != .data);
+        return self.enqueueEvent(list, stream_id, &.{}, true, kind);
+    }
+
+    fn enqueueEvent(
+        self: *SlotArena,
+        list: *SlotList,
+        stream_id: u64,
+        data: []const u8,
+        is_fin: bool,
+        kind: RecvKind,
+    ) bool {
         const chunks = @max((data.len + slot_bytes - 1) / slot_bytes, 1);
         if (chunks > self.free_count) return false;
         if (list.count + chunks > self.max_per_conn) return false;
@@ -208,6 +227,7 @@ const SlotArena = struct {
             self.slots[index].len = @intCast(chunk.len);
             // fin 只能落在最后一段，否则上层会提前认为这条流结束了。
             self.slots[index].is_fin = is_fin and remaining == 1;
+            self.slots[index].kind = kind;
 
             if (list.tail) |tail| {
                 self.slots[tail].next = index;
@@ -257,6 +277,7 @@ const SlotArena = struct {
 pub const ConnHooks = struct {
     on_connected: *const fn (ctx: *anyopaque, conn: *QUICConnection) void,
     on_stream_data: *const fn (ctx: *anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void,
+    on_stream_control: *const fn (ctx: *anyopaque, conn: *QUICConnection, stream_id: u64, event: quic.c.CallbackEvent) void,
     on_close: *const fn (ctx: *anyopaque, conn: *QUICConnection, event: quic.c.CallbackEvent) void,
 };
 
@@ -469,6 +490,7 @@ pub const BackendPool = struct {
 
         const client = &self.client.?;
         client.setCallbacks(self, dispatchConnected, dispatchStreamData, dispatchClose);
+        client.setStreamControlCallback(dispatchStreamControl);
         client.start();
         return client;
     }
@@ -509,6 +531,10 @@ pub const BackendPool = struct {
         return self.arena.enqueue(list, stream_id, data, is_fin);
     }
 
+    pub fn enqueueControl(self: *BackendPool, list: *SlotList, stream_id: u64, kind: RecvKind) bool {
+        return self.arena.enqueueControl(list, stream_id, kind);
+    }
+
     /// 取出队头槽位；返回的 data 是池内缓冲的借用，处理完必须 `release`。
     pub fn pop(self: *BackendPool, list: *SlotList) ?Ready {
         const index = self.arena.pop(list) orelse return null;
@@ -517,6 +543,7 @@ pub const BackendPool = struct {
             .index = index,
             .stream_id = slot.stream_id,
             .is_fin = slot.is_fin,
+            .kind = slot.kind,
             .data = self.arena.slotBytes(index)[0..slot.len],
         };
     }
@@ -530,8 +557,8 @@ pub const BackendPool = struct {
         self.arena.drop(list);
     }
 
-    /// 登记/消费一条 transport 失败通知。每个 DirectTransport 会把同一轮内的多个
-    /// 连接失败合并成一条通知，所以这里按通知而不是按连接计数。
+    /// 登记/消费一条连接失败通知。DirectTransport 会逐连接保留故障域，因此这里
+    /// 按连接通知计数；只要还有一项未消费，Worker 的空闲快速路径就不能跳过轮询。
     pub fn signalFailure(self: *BackendPool) void {
         self.pending_failures += 1;
     }
@@ -552,12 +579,30 @@ pub const BackendPool = struct {
         return self.arena.free_count == self.arena.slots.len and self.pending_failures == 0;
     }
 
+    pub const Stats = struct {
+        connections: usize,
+        recv_slots_used: usize,
+        recv_slots_capacity: usize,
+        pending_failures: usize,
+    };
+
+    /// Worker 线程上的低频诊断快照；所有字段都是同线程维护的精确计数。
+    pub fn stats(self: *const BackendPool) Stats {
+        return .{
+            .connections = self.live,
+            .recv_slots_used = self.arena.slots.len - self.arena.free_count,
+            .recv_slots_capacity = self.arena.slots.len,
+            .pending_failures = self.pending_failures,
+        };
+    }
+
     /// 从共享池取出的一个待处理分片。
     pub const Ready = struct {
         index: u32,
         stream_id: u64,
         data: []const u8,
         is_fin: bool,
+        kind: RecvKind,
     };
 
     // ------------------------------------------------------------------------
@@ -576,6 +621,12 @@ pub const BackendPool = struct {
         const self = castSelf(ctx);
         const entry = self.index.find(conn.inner) orelse return;
         entry.hooks.?.on_stream_data(entry.ctx.?, conn, stream_id, data, is_fin);
+    }
+
+    fn dispatchStreamControl(ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, event: quic.c.CallbackEvent) void {
+        const self = castSelf(ctx);
+        const entry = self.index.find(conn.inner) orelse return;
+        entry.hooks.?.on_stream_control(entry.ctx.?, conn, stream_id, event);
     }
 
     fn dispatchClose(ctx: ?*anyopaque, conn: *QUICConnection, event: quic.c.CallbackEvent) void {
@@ -620,6 +671,26 @@ test "the shared arena keeps each connection's byte order" {
 
     const b1 = arena.pop(&b).?;
     try std.testing.expectEqualStrings("b1", arena.slotBytes(b1)[0..arena.slots[b1].len]);
+}
+
+test "stream control stays ordered and distinct from an empty FIN" {
+    var arena = try testArena(8, 8);
+    defer arena.deinit(std.testing.allocator);
+
+    var list: SlotList = .{};
+    try std.testing.expect(arena.enqueue(&list, 4, "partial", false));
+    try std.testing.expect(arena.enqueueControl(&list, 4, .stream_reset));
+
+    const data_index = arena.pop(&list).?;
+    defer arena.release(data_index);
+    try std.testing.expectEqual(RecvKind.data, arena.slots[data_index].kind);
+    try std.testing.expect(!arena.slots[data_index].is_fin);
+
+    const reset_index = arena.pop(&list).?;
+    defer arena.release(reset_index);
+    try std.testing.expectEqual(RecvKind.stream_reset, arena.slots[reset_index].kind);
+    try std.testing.expect(arena.slots[reset_index].is_fin);
+    try std.testing.expectEqual(@as(u32, 0), arena.slots[reset_index].len);
 }
 
 test "a fragment larger than one slot is split, and fin lands only on the last piece" {
@@ -756,6 +827,9 @@ test "the cnx index survives insert, lookup and removal" {
         }.f,
         .on_stream_data = struct {
             fn f(_: *anyopaque, _: *QUICConnection, _: u64, _: []const u8, _: bool) void {}
+        }.f,
+        .on_stream_control = struct {
+            fn f(_: *anyopaque, _: *QUICConnection, _: u64, _: quic.c.CallbackEvent) void {}
         }.f,
         .on_close = struct {
             fn f(_: *anyopaque, _: *QUICConnection, _: quic.c.CallbackEvent) void {}

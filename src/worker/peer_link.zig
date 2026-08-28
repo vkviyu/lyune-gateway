@@ -465,7 +465,7 @@ test "patching realm rewrites only the two reserved bytes" {
     // 一帧 `.peer` OPEN，group/route_key 都是 0（客户端/后端连接上它们是保留字节）。
     var frame_buf: [64]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&frame_buf);
-    const original = try encoder.encodeOpen(.peer, .{}, protocol.frame.Flags.last(), "body");
+    const original = try encoder.encodeOpen(.peer, .{}, .none, protocol.frame.Flags.last(), "body");
 
     const patched = links.patchRealm(original, 0x0709).?;
 
@@ -507,7 +507,7 @@ test "delivery to an unknown node is refused, not queued" {
 
     var frame_buf: [64]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&frame_buf);
-    const frame_bytes = try encoder.encodeOpen(.peer, .{}, protocol.frame.Flags.last(), "body");
+    const frame_bytes = try encoder.encodeOpen(.peer, .{}, .none, protocol.frame.Flags.last(), "body");
 
     // 集群没启用，membership 视图为空 → 查不到地址。
     //

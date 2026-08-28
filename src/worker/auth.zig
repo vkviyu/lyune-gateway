@@ -6,7 +6,7 @@
 //! 这样做的理由是职责边界：token 的签发、校验、吊销都是业务逻辑，放进网关就意味着
 //! 网关要跟着业务的认证方案一起改。网关只需要知道"这条连接过了没有"。
 //!
-//! 但两个方向上各有一段**网关自有的定长前缀**（设计文档 §10.3），它们不违反上面
+//! 但两个方向上各有一段**网关自有的定长前缀**（设计文档 §10.3/§10.4），它们不违反上面
 //! 那条边界——网关只碰自己的字段，token 的形态依然完全不可见：
 //!
 //! - 请求方向 `AuthContext{realm, conn_token}`：告诉后端"这是哪个 realm 的、
@@ -41,6 +41,8 @@ pub const Policy = struct {
     required: bool = false,
     /// 认证服务的完整路由键（Group + RouteKey）；null 表示未配置认证服务。
     route: ?RouteId = null,
+    /// 认证后连接级 online/offline 事件的后端路由；null 表示不发布。
+    lifecycle_route: ?RouteId = null,
 };
 
 /// 认证服务响应的判定结果。
@@ -108,7 +110,7 @@ pub fn delegateAuth(self: *GatewayWorker, ctx: *ConnectionContext, client_stream
         .{ .realm = ctx.realm, .conn_token = token.encode() },
         parsed.body,
     ) catch |err| {
-        // 唯一现实原因是客户端的认证 body 已经贴着 64KB 上限，插不进 10 字节前缀。
+        // 唯一现实原因是客户端的认证 body 已经贴着 64KB 上限，插不进 18 字节前缀。
         std.log.warn("[AUTH] cannot frame auth request: {}", .{err});
         self.replyControl(ctx.cnx_handle, client_stream_id, .auth_failure, "authentication payload too large");
         return;
@@ -183,12 +185,18 @@ fn completeAuth(self: *GatewayWorker, auth: *const inflight.PendingAuth) void {
             // hash 定向转发的推送会漏掉它，而漏掉的表现是消息静默丢失（§8.5 策略 B）。
             if (redirectIfNotHome(self, ctx, auth, verdict.grant.dest_id, response)) return;
 
+            // 同一 conn_token 改绑身份时先结束旧连接级会话；多设备聚合仍由 Reactor 做。
+            if (ctx.authenticated and ctx.dest_id != verdict.grant.dest_id) {
+                @import("lifecycle.zig").publishOffline(self, ctx, .identity_replaced);
+            }
+            const announce_online = !ctx.authenticated or ctx.dest_id != verdict.grant.dest_id;
             ctx.authenticated = true;
             ctx.auth_expires_at = expiryFrom(verdict.grant.ttl_seconds);
             // 绑定寻址标识：这一步之后 .peer 投递才能找到这条连接。
             // dest_id 只来自认证服务，客户端声明的任何字段都不参与；它只在本连接的
             // realm 内唯一，realm 由 ConnectionManager 从连接上下文自己取。
             self.conn_manager.bindDest(auth.client_cnx, verdict.grant.dest_id);
+            if (announce_online) @import("lifecycle.zig").publishOnline(self, ctx);
             std.log.info("[AUTH] success: stream={} realm={} dest_id={} ttl={}s", .{
                 auth.client_stream_id,
                 ctx.realm,
@@ -199,11 +207,14 @@ fn completeAuth(self: *GatewayWorker, auth: *const inflight.PendingAuth) void {
         .failure => std.log.info("[AUTH] failure: stream={}", .{auth.client_stream_id}),
         .invalid => {
             std.log.warn("[AUTH] invalid response from auth service", .{});
-            self.replyControl(auth.client_cnx, auth.client_stream_id, .auth_failure, "invalid auth service response");
+            if (!auth.response_suppressed) {
+                self.replyControl(auth.client_cnx, auth.client_stream_id, .auth_failure, "invalid auth service response");
+            }
             return;
         },
     }
 
+    if (auth.response_suppressed) return;
     var conn = QUICConnection.fromRaw(auth.client_cnx);
     conn.streamWrite(auth.client_stream_id, response, true) catch |err| {
         err_handler.reportError(.session, "Failed to write auth response to client", err);
@@ -238,10 +249,15 @@ fn redirectIfNotHome(
     // 可能比别人新也可能比别人旧，按一份不稳定的视图重定向会让客户端来回弹。
     if (self.placement.isHomeNode(ctx.realm, dest_id)) return false;
 
-    return redirectToHome(self, ctx, dest_id, .{
-        .stream_id = auth.client_stream_id,
-        .bytes = response,
-    });
+    return redirectToHome(
+        self,
+        ctx,
+        dest_id,
+        if (auth.response_suppressed) null else .{
+            .stream_id = auth.client_stream_id,
+            .bytes = response,
+        },
+    );
 }
 
 /// 把一条连接赶到它的 home 节点：发一个 redirect 帧，再带 `redirected` 错误码关闭。
@@ -386,7 +402,7 @@ test "buildAuthRequest prefixes the gateway context without touching the client 
 }
 
 test "an auth body that leaves no room for the prefix is refused" {
-    // 唯一现实的失败原因：客户端的认证 body 已经贴着 64KB 上限，插不进 10 字节前缀。
+    // 唯一现实的失败原因：客户端的认证 body 已经贴着 64KB 上限，插不进 18 字节前缀。
     // 这里必须报错而不是截断——截断会把一个残缺的 token 交给认证服务。
     const allocator = std.testing.allocator;
     const scratch = try allocator.alloc(u8, protocol.frame.OPEN_HEADER_SIZE + protocol.frame.MAX_BODY_SIZE);

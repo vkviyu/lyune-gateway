@@ -8,8 +8,8 @@
 //!
 //! ## 回程句柄
 //!
-//! send 返回的 stream 句柄由「连接 id + 该连接上的 QUIC stream id」合成，
-//! 保证跨后端连接全局唯一，worker 直接用它做请求/响应回程映射。
+//! send 返回的 stream 句柄由「连接 id + 连接代际 + 该连接上的 QUIC stream id」合成，
+//! 保证跨后端连接和重连前后全局唯一，worker 直接用它做请求/响应回程映射。
 
 const std = @import("std");
 const xev = @import("xev");
@@ -50,7 +50,7 @@ pub const DirectConfig = struct {
     /// 将来接 etcd/Consul 动态副本时，只替换这份列表的来源，接口不变。
     endpoints: []const Endpoint,
     /// ALPN 协议标识；与客户端侧同一个字符串，协议版本活在这里。
-    alpn: [:0]const u8 = "lyune/1",
+    alpn: [:0]const u8 = "lyune/2",
     /// 是否验证服务器证书
     verify_cert: bool = true,
     /// 根证书文件路径（可选）
@@ -110,6 +110,11 @@ const BackendConn = struct {
     transport: *DirectTransport,
     /// 连接 id，用于合成跨连接唯一的 stream 句柄
     id: u16,
+    /// 这条 endpoint 连接的当前代际。
+    ///
+    /// 同一个 BackendConn 会在断线后建立新的 QUIC 连接，而 QUIC stream id 必须从 0
+    /// 重新开始。把代际并入上层句柄后，新旧连接即使都有 stream 0 也不会发生 ABA。
+    generation: u16,
     /// 本连接对应的后端 endpoint（引用配置内存，不拥有所有权）
     host: [:0]const u8,
     port: u16,
@@ -148,6 +153,7 @@ const BackendConn = struct {
     const hooks: pool_mod.ConnHooks = .{
         .on_connected = hookConnected,
         .on_stream_data = hookStreamData,
+        .on_stream_control = hookStreamControl,
         .on_close = hookClose,
     };
 
@@ -161,6 +167,7 @@ const BackendConn = struct {
         return .{
             .transport = transport,
             .id = id,
+            .generation = 0,
             .host = host,
             .port = port,
             .cnx = null,
@@ -201,7 +208,12 @@ const BackendConn = struct {
     /// 本连接自己的公平上限（一个卡住不取的后端不能把整个 Worker 的接收容量吃干）、
     /// 以及本 realm 在争用时的公平份额（一个租户不能靠多开连接绕过前一条）。
     fn enqueueRecv(self: *BackendConn, stream_id: u64, data: []const u8, is_fin: bool) bool {
-        return self.transport.pool.enqueue(&self.queue, stream_id, data, is_fin);
+        return self.transport.pool.enqueue(
+            &self.queue,
+            DirectTransport.makeHandle(self.id, self.generation, stream_id),
+            data,
+            is_fin,
+        );
     }
 
     /// 断开并从池的索引上摘掉自己。
@@ -310,22 +322,31 @@ const BackendConn = struct {
         var conn = QUICConnection.fromRaw(cnx_handle);
         if (!conn.isConnected()) return TransportError.ConnectionFailed;
 
-        const stream_id = if (handle) |value|
-            DirectTransport.handleStreamId(value)
-        else
-            self.nextBidiStreamId();
+        const stream_id = if (handle) |value| blk: {
+            if (DirectTransport.handleConnId(value) != self.id or
+                DirectTransport.handleGeneration(value) != self.generation)
+            {
+                return TransportError.Closed;
+            }
+            break :blk DirectTransport.handleStreamId(value);
+        } else self.nextBidiStreamId();
 
         conn.streamWrite(stream_id, data, is_fin) catch return TransportError.SendFailed;
         // add_to_stream 只入 picoquic 队列；不主动驱动共享客户端的话，空闲连接上的
         // 应用数据会一直等到最远 10 秒后的 QUIC timer 才真正发出。
         self.transport.pool.flushClient();
-        return DirectTransport.makeHandle(self.id, stream_id);
+        return DirectTransport.makeHandle(self.id, self.generation, stream_id);
     }
 
     fn nextBidiStreamId(self: *BackendConn) u64 {
         const stream_id = self.next_bidi_stream_id;
         self.next_bidi_stream_id += 4;
         return stream_id;
+    }
+
+    /// 与句柄高 32 位相同的连接代际键。
+    fn connectionKey(self: *const BackendConn) u32 {
+        return (@as(u32, self.id) << DirectTransport.generation_bits) | self.generation;
     }
 
     // ------------------------------------------------------------------------
@@ -385,6 +406,12 @@ const BackendConn = struct {
         _ = conn;
         const self: *BackendConn = @ptrCast(@alignCast(ctx));
 
+        // 每条 QUIC 连接都有独立的流编号空间，新连接必须从客户端 bidi stream 0
+        // 重新开始。代际先递增再进入 ready，使新请求的上层句柄与旧连接彻底隔离。
+        // u16 回绕需要同一 endpoint 在 60 秒 inflight 窗口内完成 65536 次重连才会 ABA，
+        // 远高于 100ms 起步的退避状态机在物理上可能达到的速度。
+        self.generation +%= 1;
+        self.next_bidi_stream_id = 0;
         self.state = .ready;
         self.failure_count = 0;
         self.retry_at = 0;
@@ -414,6 +441,33 @@ const BackendConn = struct {
         }
     }
 
+    fn hookStreamControl(ctx: *anyopaque, conn: *QUICConnection, stream_id: u64, event: quic.c.CallbackEvent) void {
+        const self: *BackendConn = @ptrCast(@alignCast(ctx));
+        if (self.state != .ready) return;
+
+        const kind: backend_mod.RecvKind = switch (event) {
+            .stream_reset => .stream_reset,
+            .stop_sending => .stop_sending,
+            else => unreachable,
+        };
+        if (!self.transport.pool.enqueueControl(
+            &self.queue,
+            DirectTransport.makeHandle(self.id, self.generation, stream_id),
+            kind,
+        )) {
+            std.log.err(
+                "[DirectTransport] recv pool full for {s}:{}, dropping connection",
+                .{ self.host, self.port },
+            );
+            self.abortConnection(conn, TransportError.ReceiveFailed);
+            return;
+        }
+
+        // 后端用 STOP_SENDING 终止网关→后端这一方向；按 QUIC 约定立即 RESET_STREAM，
+        // 同时仍把事件排给 Worker，让对应客户端交换得到明确失败而非等待超时。
+        if (event == .stop_sending) conn.closeStream(stream_id);
+    }
+
     /// 主动废弃当前连接：请求 QUIC 关闭并进入退避。
     /// 已入队的数据保持可读——它们是完整字节，上层仍可正常消费。
     fn abortConnection(self: *BackendConn, conn: *QUICConnection, err: TransportError) void {
@@ -421,7 +475,7 @@ const BackendConn = struct {
         // 只清句柄，不从池索引上摘：此刻仍在 picoquic 回调栈内，而池会在
         // 随后的 close 事件里自己 unregister。
         self.cnx = null;
-        self.transport.signalFailure(self.id);
+        self.transport.signalFailure(self.connectionKey());
         self.markFailed(err);
     }
 
@@ -439,7 +493,7 @@ const BackendConn = struct {
 
         // 无论此前是否就绪，都必须离开 ready/connecting 并安排退避，
         // 否则状态会永久停滞、此后所有建连尝试都被误判为"已在进行中"。
-        if (was_ready) self.transport.signalFailure(self.id);
+        if (was_ready) self.transport.signalFailure(self.connectionKey());
         self.markFailed(if (was_ready) TransportError.Closed else TransportError.ConnectionFailed);
     }
 };
@@ -451,8 +505,12 @@ const BackendConn = struct {
 pub const DirectTransport = struct {
     const Self = @This();
 
-    /// stream 句柄低位存放该连接上 QUIC stream id 的位数，高位存连接 id。
-    const stream_id_bits: u6 = 48;
+    /// 后端流句柄布局：`connection id:16 | generation:16 | QUIC stream id:32`。
+    ///
+    /// connection id 定位 endpoint 槽位；generation 区分该槽位先后建立的 QUIC
+    /// 连接；低 32 位保留连接内流号。默认 128 条在途流距离 2^30 条双向流上限极远。
+    const stream_id_bits: u6 = 32;
+    const generation_bits: u6 = 16;
 
     allocator: std.mem.Allocator,
     config: DirectConfig,
@@ -479,15 +537,13 @@ pub const DirectTransport = struct {
     /// 状态标记
     closed: bool,
 
-    /// 等待 Worker 消费的连接失败。
+    /// 等待 Worker 消费的连接故障域。
     ///
-    /// 一轮内只有一条连接失败时保留其 id，Worker 只回收这个副本上的在途流；若多个
-    /// 副本在 Worker 来得及消费前同时失败，则退化为整个 transport，保证不漏请求。
-    pending_failure: bool,
-    pending_failure_conn: u16,
-    pending_failure_all: bool,
-    last_failure_conn: u16,
-    last_failure_all: bool,
+    /// 每个已创建副本至多占一项，容量在创建连接时预留，因此故障回调只做定容入队，
+    /// 不分配内存。多个空闲副本同时关闭时必须逐项通知；把它们合成“整个 transport”
+    /// 会误杀仍有活跃流量的健康副本。
+    pending_failures: std.ArrayList(u32),
+    last_failure_conn: u32,
 
     // ========================================================================
     // 生命周期
@@ -511,20 +567,15 @@ pub const DirectTransport = struct {
             .conns = .{ .items = &.{}, .capacity = 0 },
             .next_conn = 0,
             .closed = false,
-            .pending_failure = false,
-            .pending_failure_conn = 0,
-            .pending_failure_all = false,
+            .pending_failures = .{ .items = &.{}, .capacity = 0 },
             .last_failure_conn = 0,
-            .last_failure_all = true,
         };
     }
 
     pub fn deinit(self: *Self) void {
         if (self.closed) return;
-        if (self.pending_failure) {
-            self.pool.acknowledgeFailure();
-            self.pending_failure = false;
-        }
+        for (self.pending_failures.items) |_| self.pool.acknowledgeFailure();
+        self.pending_failures.deinit(self.allocator);
         for (self.conns.items) |conn| {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -537,15 +588,14 @@ pub const DirectTransport = struct {
     // 内部辅助方法
     // ========================================================================
 
-    fn signalFailure(self: *Self, conn_id: u16) void {
-        if (!self.pending_failure) {
-            self.pending_failure = true;
-            self.pending_failure_conn = conn_id;
-            self.pending_failure_all = false;
-            self.pool.signalFailure();
-            return;
+    fn signalFailure(self: *Self, connection_key: u32) void {
+        for (self.pending_failures.items) |pending| {
+            if (pending == connection_key) return;
         }
-        if (self.pending_failure_conn != conn_id) self.pending_failure_all = true;
+        // getOrCreateConn 为每个连接预留一格；同一连接在消费前重复上报会被上面的
+        // 去重吸收，因此这里不可能扩容，也就能安全地运行在 picoquic 回调栈内。
+        self.pending_failures.appendAssumeCapacity(connection_key);
+        self.pool.signalFailure();
     }
 
     /// 获取 endpoint 对应的池中连接，不存在则新建（按 host:port 去重）。
@@ -554,6 +604,9 @@ pub const DirectTransport = struct {
             if (existing.port == endpoint.port and std.mem.eql(u8, existing.host, endpoint.host)) return existing;
         }
 
+        // 故障回调不能分配内存。在连接对外可见之前，先为它可能产生的一个待处理
+        // 失败通知预留容量；失败则整条连接不创建，保持不变量简单可证。
+        self.pending_failures.ensureUnusedCapacity(self.allocator, 1) catch return TransportError.OutOfMemory;
         const created = self.allocator.create(BackendConn) catch return TransportError.OutOfMemory;
         const conn_id = self.pool.allocConnId() catch {
             self.allocator.destroy(created);
@@ -570,15 +623,22 @@ pub const DirectTransport = struct {
         return created;
     }
 
-    /// 合成跨连接唯一的 stream 句柄：高 16 位连接 id + 低 48 位 QUIC stream id。
-    fn makeHandle(conn_id: u16, stream_id: u64) u64 {
+    /// 合成跨连接且跨代际唯一的 stream 句柄。
+    fn makeHandle(conn_id: u16, generation: u16, stream_id: u64) u64 {
         std.debug.assert(stream_id < (@as(u64, 1) << stream_id_bits));
-        return (@as(u64, conn_id) << stream_id_bits) | stream_id;
+        return (@as(u64, conn_id) << (generation_bits + stream_id_bits)) |
+            (@as(u64, generation) << stream_id_bits) |
+            stream_id;
     }
 
     /// 从句柄还原它属于哪条连接。
     fn handleConnId(handle: u64) u16 {
-        return @intCast(handle >> stream_id_bits);
+        return @intCast(handle >> (generation_bits + stream_id_bits));
+    }
+
+    /// 从句柄还原连接代际。
+    fn handleGeneration(handle: u64) u16 {
+        return @intCast((handle >> stream_id_bits) & std.math.maxInt(u16));
     }
 
     /// 从句柄还原后端连接上的 QUIC stream id。
@@ -685,7 +745,7 @@ pub const DirectTransport = struct {
             const conn = self.connById(handleConnId(value)) orelse return TransportError.Closed;
             if (!conn.isReady()) return TransportError.ConnectionFailed;
             return conn.sendOn(value, data, is_fin) catch |err| {
-                self.signalFailure(conn.id);
+                self.signalFailure(conn.connectionKey());
                 conn.markFailed(err);
                 return err;
             };
@@ -700,7 +760,7 @@ pub const DirectTransport = struct {
             if (!conn.isReady()) continue;
             const new_handle = conn.sendOn(null, data, is_fin) catch |err| {
                 last_error = err;
-                self.signalFailure(conn.id);
+                self.signalFailure(conn.connectionKey());
                 conn.markFailed(err);
                 continue;
             };
@@ -722,20 +782,20 @@ pub const DirectTransport = struct {
         for (self.conns.items) |conn| {
             const ready = self.pool.pop(&conn.queue) orelse continue;
             return .{
-                .stream_id = makeHandle(conn.id, ready.stream_id),
+                // 入队时已经带上当时的 connection id + generation；连接在 Worker
+                // 消费前重建也不能用新代际改写这个旧事件。
+                .stream_id = ready.stream_id,
                 .data = ready.data,
                 .is_fin = ready.is_fin,
+                .kind = ready.kind,
                 // token 复用 handle 的编码：高 16 位连接 id + 低位共享池槽位下标。
-                .token = makeHandle(conn.id, ready.index),
+                .token = ready.index,
                 .peer_initiated = isPeerInitiated(ready.stream_id),
             };
         }
 
-        if (self.pending_failure) {
-            self.last_failure_conn = self.pending_failure_conn;
-            self.last_failure_all = self.pending_failure_all;
-            self.pending_failure = false;
-            self.pending_failure_all = false;
+        if (self.pending_failures.pop()) |connection_key| {
+            self.last_failure_conn = connection_key;
             self.pool.acknowledgeFailure();
             return TransportError.ReceiveFailed;
         }
@@ -743,11 +803,26 @@ pub const DirectTransport = struct {
         return null;
     }
 
-    /// 最近一次 receive 错误的精确故障域。句柄高 16 位是后端连接 id。
+    /// 最近一次 receive 错误的精确故障域。句柄高 32 位是连接 id + generation。
     pub fn failureSelectorImpl(self: *const Self) backend_mod.StreamSelector {
-        if (self.last_failure_all) return .{};
-        const mask = @as(u64, std.math.maxInt(u16)) << stream_id_bits;
+        const mask = @as(u64, std.math.maxInt(u32)) << stream_id_bits;
         return .{ .mask = mask, .value = @as(u64, self.last_failure_conn) << stream_id_bits };
+    }
+
+    /// 一个应用请求达到 Gateway deadline 后，只取消它自己的 QUIC 流。
+    ///
+    /// 多个交换会复用同一条后端连接；在这里关闭连接会把正常的兄弟流一并杀死。
+    /// 句柄中的 connection id + generation 防止旧 deadline 误伤重连后复用编号的新流。
+    pub fn invalidateStreamImpl(self: *Self, handle: u64) void {
+        const conn = self.connById(handleConnId(handle)) orelse return;
+        if (conn.generation != handleGeneration(handle)) return;
+        if (!conn.isReady()) return;
+        const raw = conn.cnx orelse return;
+        var quic_conn = QUICConnection.fromRaw(raw);
+        quic_conn.discardStream(handleStreamId(handle));
+        // discard_stream 只把控制帧排入 picoquic；主动驱动共享客户端，避免取消信号
+        // 最迟等到 QUIC timer 才发出。
+        self.pool.flushClient();
     }
 
     /// 这条 QUIC 流是后端开的还是网关开的。
@@ -766,7 +841,7 @@ pub const DirectTransport = struct {
     /// 剩下的那些，碰不到这一个。而槽位现在来自**共享**池——若因为连接已消失就跳过归还，
     /// 那是从整个 Worker 的接收容量里永久扣掉一格。
     pub fn releaseRecvImpl(self: *Self, recv: TransportRecv) void {
-        self.pool.release(@intCast(handleStreamId(recv.token)));
+        self.pool.release(@intCast(recv.token));
     }
 
     /// 关闭
@@ -872,7 +947,84 @@ test "DirectTransport pools one connection per service replica" {
     // stream 句柄跨连接唯一。连接 id 现在由**共享池**发号，因此跨 transport 也唯一
     // ——早先靠一个进程级 atomic u16 来保证，那是 (realm × 路由 × 副本 × Worker) 的硬上限。
     try std.testing.expect(conn_a.id != conn_b.id);
-    try std.testing.expect(DirectTransport.makeHandle(conn_a.id, 0) != DirectTransport.makeHandle(conn_b.id, 0));
+    try std.testing.expect(DirectTransport.makeHandle(conn_a.id, conn_a.generation, 0) != DirectTransport.makeHandle(conn_b.id, conn_b.generation, 0));
+}
+
+test "simultaneous replica failures keep independent failure selectors" {
+    const allocator = std.testing.allocator;
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var shared = try testPool(&loop);
+    defer shared.deinit();
+
+    const endpoints = [_]Endpoint{
+        .{ .host = "replica-a.internal", .port = 9001 },
+        .{ .host = "replica-b.internal", .port = 9002 },
+    };
+    var static_resolver = StaticResolver{ .address = foundation.net.initIp4(.{ 127, 0, 0, 1 }, 8443) };
+    var transport = try DirectTransport.init(allocator, .{
+        .endpoints = &endpoints,
+    }, &loop, static_resolver.asResolver(), foundation.realm.default_realm, &shared);
+    defer transport.deinit();
+
+    const conn_a = try transport.getOrCreateConn(endpoints[0]);
+    const conn_b = try transport.getOrCreateConn(endpoints[1]);
+    const handle_a = DirectTransport.makeHandle(conn_a.id, conn_a.generation, 0);
+    const handle_b = DirectTransport.makeHandle(conn_b.id, conn_b.generation, 0);
+
+    transport.signalFailure(conn_a.connectionKey());
+    transport.signalFailure(conn_b.connectionKey());
+    // 同一故障域重复上报只能产生一次通知。
+    transport.signalFailure(conn_a.connectionKey());
+    try std.testing.expectEqual(@as(usize, 2), shared.stats().pending_failures);
+
+    try std.testing.expectError(TransportError.ReceiveFailed, transport.receiveImpl());
+    const first = transport.failureSelectorImpl();
+    try std.testing.expect(first.mask != 0);
+    try std.testing.expect(first.matches(handle_a) != first.matches(handle_b));
+    try std.testing.expectEqual(@as(usize, 1), shared.stats().pending_failures);
+
+    try std.testing.expectError(TransportError.ReceiveFailed, transport.receiveImpl());
+    const second = transport.failureSelectorImpl();
+    try std.testing.expect(second.mask != 0);
+    try std.testing.expect(second.matches(handle_a) != second.matches(handle_b));
+    try std.testing.expect(first.value != second.value);
+    try std.testing.expectEqual(@as(usize, 0), shared.stats().pending_failures);
+    try std.testing.expectEqual(@as(?TransportRecv, null), try transport.receiveImpl());
+}
+
+test "a reconnected endpoint resets QUIC streams without reusing backend handles" {
+    const allocator = std.testing.allocator;
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var shared = try testPool(&loop);
+    defer shared.deinit();
+
+    const endpoints = [_]Endpoint{.{ .host = "127.0.0.1", .port = 8443 }};
+    var static_resolver = StaticResolver{ .address = foundation.net.initIp4(.{ 127, 0, 0, 1 }, 8443) };
+    var transport = try DirectTransport.init(allocator, .{
+        .endpoints = &endpoints,
+    }, &loop, static_resolver.asResolver(), foundation.realm.default_realm, &shared);
+    defer transport.deinit();
+
+    const conn = try transport.getOrCreateConn(endpoints[0]);
+    var unused_connection: QUICConnection = undefined;
+
+    BackendConn.hookConnected(conn, &unused_connection);
+    const first = DirectTransport.makeHandle(conn.id, conn.generation, conn.nextBidiStreamId());
+    conn.next_bidi_stream_id = 4096;
+
+    BackendConn.hookConnected(conn, &unused_connection);
+    const second = DirectTransport.makeHandle(conn.id, conn.generation, conn.nextBidiStreamId());
+
+    try std.testing.expectEqual(@as(u64, 0), DirectTransport.handleStreamId(first));
+    try std.testing.expectEqual(@as(u64, 0), DirectTransport.handleStreamId(second));
+    try std.testing.expect(DirectTransport.handleGeneration(first) != DirectTransport.handleGeneration(second));
+    try std.testing.expect(first != second);
 }
 
 test "DirectTransport prepares every configured replica" {
@@ -976,7 +1128,7 @@ test "DirectTransport integration test (Real Server)" {
     defer shared.deinit();
     var transport = try DirectTransport.init(allocator, .{
         .endpoints = &endpoints,
-        .alpn = "lyune/1",
+        .alpn = "lyune/2",
         .verify_cert = false,
     }, &loop, static_resolver.asResolver(), foundation.realm.default_realm, &shared);
     defer transport.deinit();
@@ -1009,6 +1161,7 @@ test "DirectTransport integration test (Real Server)" {
             const frame_data = encoder.encodeOpen(
                 .service,
                 RouteId.init(0x01, 0x00),
+                .required,
                 protocol.frame.Flags.last(),
                 msg,
             ) catch |encode_err| {
@@ -1150,9 +1303,9 @@ test "a connection enqueues into the shared pool and drains in order" {
 
     try std.testing.expect(shared.pop(&conn.queue) == null);
 
-    // 归还走的是 token 编码（高 16 位连接 id + 低位共享池槽位下标）。
-    transport.releaseRecvImpl(.{ .stream_id = 7, .data = first.data, .is_fin = false, .token = DirectTransport.makeHandle(conn.id, first.index) });
-    transport.releaseRecvImpl(.{ .stream_id = 7, .data = second.data, .is_fin = true, .token = DirectTransport.makeHandle(conn.id, second.index) });
+    // token 就是共享池槽位下标；流的连接/代际编码与归还内存无关。
+    transport.releaseRecvImpl(.{ .stream_id = 7, .data = first.data, .is_fin = false, .token = first.index });
+    transport.releaseRecvImpl(.{ .stream_id = 7, .data = second.data, .is_fin = true, .token = second.index });
 
     // 四个槽位全部回到共享池，容量没有单向流失。
     var probe: pool_mod.SlotList = .{};

@@ -2,7 +2,7 @@
 
 Lyune Gateway 是一个使用 Zig 构建的分布式 QUIC 实时通信网关。它负责连接接入、QUIC 收发、流分发、在线推送和后端转发，只解析网关帧协议，不解析业务 Body。
 
-项目当前处于验证优先阶段：核心数据面、单机多 Worker 和主要分布式链路已经形成代码基线，但尚未发布版本，也没有生产环境使用者。真实 MacBook 单机 M0–M9 已通过，包括 Go/SQLite 用户认证、群成员授权、消息持久化和两位浏览器用户的实时群聊；功能演进继续暂停，下一步只把同一套资产迁移到远程 Linux。计划和逐次证据见 [两阶段真实环境验证](docs/validation.md)。
+项目当前处于验证优先阶段：核心数据面、单机多 Worker 和主要分布式链路已经形成代码基线，但尚未发布版本，也没有生产环境使用者。真实 MacBook 单机 M0–M18 已全部通过，包括 Go/SQLite 用户认证、群成员授权、消息持久化、真实 React 群聊、显式无响应交换、连接级 presence、流方向与取消、混合负载、进程故障恢复和资源趋势。Mac 验证基线现已冻结，下一步只迁移同一套资产到远程 Linux；这不代表协议稳定或允许发布。计划和逐次证据见 [两阶段真实环境验证](docs/validation.md)。
 
 ## 当前基线
 
@@ -10,8 +10,10 @@ Lyune Gateway 是一个使用 Zig 构建的分布式 QUIC 实时通信网关。�
 
 - Zig 0.16.0、picoquic/picotls/BoringSSL、libxev 与 c-ares 的构建集成；
 - Thread-per-Core Worker、Linux `SO_REUSEPORT` cBPF 分流和有界跨 Worker 交接；
-- ALPN `lyune/1`、OPEN/DATA/CONTROL/DATAGRAM 帧协议；
+- ALPN `lyune/2`、OPEN/DATA/CONTROL/DATAGRAM 帧协议，以及 OPEN 上显式的 required/none 响应模式；
 - 客户端请求、流式转发、后端响应、认证委托和在线推送闭环；
+- 客户端发起请求与网关发起推送的双向流权限分离，以及 RESET_STREAM/STOP_SENDING 取消传播；
+- 128 位进程隔离 `conn_token`、严格递增 lifecycle sequence 和可续期的连接级 presence 租约；
 - `.peer`、`.multicast`、流式推送与 QUIC DATAGRAM；
 - SNI → realm、多 realm 命名空间隔离和共享资源的 realm 级公平准入；
 - `BackendTransport`、`DirectTransport`、按 `ScopedRoute` 隔离的路由实例，以及每 Worker 共享的后端 QUIC 设施；
@@ -69,10 +71,11 @@ zig build -Doptimize=ReleaseSafe
 zig build test -Denable-integration-tests=true --summary all
 ```
 
-当前冻结前验证结果：
+当前验证结果：
 
 - `zig fmt --check build.zig src` 通过；
-- 默认测试 248 个：247 通过、1 跳过；
+- 默认测试 258 个：257 通过、1 跳过；
+- Reactor 与 client-agent 的 Go 测试通过，React 生产构建通过；
 - `ReleaseSafe` 构建 9/9 步通过。
 
 这些结果覆盖单元测试、确定性模拟和部分 loopback UDP 测试，但不能替代 Linux 内核 cBPF、多网关进程和长时间网络故障测试。
@@ -109,7 +112,7 @@ npm --prefix validation/web-client install
 npm --prefix validation/web-client run dev
 ```
 
-浏览器打开 `http://127.0.0.1:5173`，可注册两个用户、建群、凭邀请码入群并实时互发消息。完整的 Reactor 命令、密码/成员授权判据、M0–M9 结果和压力负对照见 [两阶段真实环境验证](docs/validation.md)。浏览器经 client-agent 使用真实 `lyune/1` QUIC；这不是“浏览器直接打开原生 QUIC”。
+浏览器打开 `http://127.0.0.1:5173`，可注册两个用户、建群、凭邀请码入群并实时互发消息。完整的 Reactor 命令、密码/成员授权判据、M0–M18 验收矩阵和逐次证据见 [两阶段真实环境验证](docs/validation.md)。浏览器经 client-agent 使用真实 `lyune/2` QUIC；这不是“浏览器直接打开原生 QUIC”。
 
 ## 集群部署模式
 
@@ -161,4 +164,4 @@ lyune-gateway/
 
 ## 发布状态
 
-当前没有正式版本、兼容性承诺或生产发布计划。协议仍可能在迭代中调整；发生不兼容变更时应提升 ALPN 版本，而不是在同一个 `lyune/1` 下静默改变线格式。
+当前没有正式版本、兼容性承诺或生产发布计划。协议仍可能继续破坏性调整；每次改变线格式都必须提升 ALPN 版本，不能在同一个 ALPN 下静默改变含义。本轮 OPEN 响应模式与 128 位连接身份已经把 ALPN 从 `lyune/1` 提升为 `lyune/2`。

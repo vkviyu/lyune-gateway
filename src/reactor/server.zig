@@ -60,6 +60,7 @@ pub const ServerDriver = struct {
     user_context: ?*anyopaque = null,
     on_connection: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection) void = null,
     on_stream_data: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, sid: u64, data: []const u8, fin: bool) void = null,
+    on_stream_control: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, sid: u64, event: QUICCallbackEvent) void = null,
     on_datagram: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, data: []const u8) void = null,
     on_connection_close: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, event: QUICCallbackEvent) void = null,
 
@@ -149,6 +150,15 @@ pub const ServerDriver = struct {
         self.on_datagram = on_datagram;
     }
 
+    /// 注册 RESET_STREAM / STOP_SENDING 回调。与 datagram 一样单独设置，保持既有
+    /// 数据回调签名只描述字节与 FIN，不把不同生命周期事件塞进伪造的空数据片段。
+    pub fn setStreamControlCallback(
+        self: *Self,
+        on_stream_control: ?*const fn (?*anyopaque, *QUICConnection, u64, QUICCallbackEvent) void,
+    ) void {
+        self.on_stream_control = on_stream_control;
+    }
+
     /// 启动驱动器 (非阻塞)
     /// 必须由外部调用 event_loop.run() 来实际运转
     pub fn start(self: *Self) void {
@@ -161,6 +171,7 @@ pub const ServerDriver = struct {
         self.endpoint.setUserData(self);
         self.endpoint.onConnection(emitConnection);
         self.endpoint.onStreamData(emitStreamData);
+        self.endpoint.onStreamControl(emitStreamControl);
         self.endpoint.onDatagram(emitDatagram);
         self.endpoint.onConnectionClose(emitConnectionClose);
 
@@ -443,6 +454,11 @@ pub const ServerDriver = struct {
     fn emitStreamData(ctx: ?*anyopaque, conn: *QUICConnection, sid: u64, data: []const u8, fin: bool) void {
         const self = castSelf(ctx.?);
         if (self.on_stream_data) |cb| cb(self.user_context, conn, sid, data, fin);
+    }
+
+    fn emitStreamControl(ctx: ?*anyopaque, conn: *QUICConnection, sid: u64, event: QUICCallbackEvent) void {
+        const self = castSelf(ctx.?);
+        if (self.on_stream_control) |cb| cb(self.user_context, conn, sid, event);
     }
 
     /// 收到一个 QUIC DATAGRAM（不可靠通路，设计文档 §6）。

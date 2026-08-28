@@ -49,7 +49,7 @@ const backend_mod = @import("../backend/mod.zig");
 const ScopedRoute = backend_mod.ScopedRoute;
 const connection = @import("connection.zig");
 const ConnectionContext = connection.ConnectionContext;
-const Exchange = connection.Exchange;
+const InboundExchange = connection.InboundExchange;
 const BackendStream = connection.BackendStream;
 const egress = @import("egress.zig");
 const GatewayWorker = @import("worker.zig").GatewayWorker;
@@ -58,7 +58,7 @@ const GatewayWorker = @import("worker.zig").GatewayWorker;
 ///
 /// 每次进行中的交换都占着一条后端 QUIC 流和一条在途映射。没有这道限制，
 /// 单个客户端只要不断开新流就能吃满 Worker 的在途表和后端的流配额。
-pub const max_exchanges_per_connection: usize = 64;
+pub const max_inbound_exchanges_per_connection: usize = 64;
 
 /// 单帧分派的结果。
 pub const FrameOutcome = enum {
@@ -109,6 +109,26 @@ const FrameDispatcher = struct {
 pub fn handleStreamData(ud: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
     const self = GatewayWorker.castSelf(ud);
     const ctx = self.conn_manager.get(conn) orelse return;
+
+    // 本监听器是 QUIC 服务端。客户端请求只能出现在 client-initiated bidi stream；
+    // server-initiated bidi stream 是网关主动推送留下的反向半边，当前协议只允许对端
+    // 用空 FIN 收尾，不能借它再发起一轮请求。把两类流在入口处分开，避免一条推送流
+    // 被意外解释成客户端 Exchange。
+    switch (quic.stream.StreamType.fromStreamId(stream_id)) {
+        .client_bidi => {},
+        .server_bidi => {
+            if (data.len != 0) {
+                std.log.warn("[STREAM] client sent application data on gateway-initiated stream {}", .{stream_id});
+                closeConnection(ctx, .protocol_violation);
+            }
+            return;
+        },
+        .client_uni, .server_uni => {
+            std.log.warn("[STREAM] unidirectional application stream is not supported: stream={}", .{stream_id});
+            closeConnection(ctx, .protocol_violation);
+            return;
+        },
+    }
 
     var dispatcher = FrameDispatcher{ .worker = self, .ctx = ctx, .stream_id = stream_id };
 
@@ -168,16 +188,75 @@ pub fn handleStreamData(ud: ?*anyopaque, conn: *QUICConnection, stream_id: u64, 
     }
 }
 
+/// 对端显式取消某个 QUIC 方向。
+///
+/// RESET_STREAM 取消的是对端→网关的输入方向：只有尚未收到应用 eof 的交换才作废；
+/// 已完整提交的请求仍可正常返回。STOP_SENDING 取消的是网关→对端的返回方向：请求
+/// 副作用仍可继续，但所有后端响应原地降级为 discard，避免再写一条已被拒收的流。
+pub fn handleStreamControl(
+    ud: ?*anyopaque,
+    conn: *QUICConnection,
+    stream_id: u64,
+    event: quic.c.CallbackEvent,
+) void {
+    const self = GatewayWorker.castSelf(ud);
+    const ctx = self.conn_manager.get(conn) orelse return;
+
+    switch (event) {
+        .stream_reset => resetClientInput(self, ctx, stream_id),
+        .stop_sending => {
+            _ = self.inflight.suppressClientResponse(ctx.cnx_handle, stream_id);
+            _ = self.inflight.suppressAuthResponse(ctx.cnx_handle, stream_id);
+
+            // RFC 9000 的 STOP_SENDING 要求发送方用 RESET_STREAM 收敛自己的发送状态。
+            // 不复用 replyControl：任何应用字节都可能被 reset 丢掉，而且对端已经明确
+            // 表示不再接收这一方向。
+            conn.closeStream(stream_id);
+        },
+        else => unreachable,
+    }
+}
+
+/// 丢弃一条被 RESET_STREAM 中止的输入方向及其局部分帧状态。
+fn resetClientInput(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64) void {
+    ctx.dropFrameSpill(stream_id);
+
+    const active = ctx.inboundExchange(stream_id) orelse {
+        // RESET 可能先于同一流已排队的应用字节到达，picoquic 会按最终大小丢弃那些
+        // 字节。此时还没有 InboundExchange，但返回方向仍必须明确异常结束。
+        var client_conn = QUICConnection.fromRaw(ctx.cnx_handle);
+        client_conn.closeStream(stream_id);
+        return;
+    };
+    if (!active.input_complete) {
+        // 请求没有应用 eof，不能让它继续占着回程映射。DirectTransport 当前用 FIN
+        // 收尾后端输入，让后端能立即发现缺少应用 eof；响应映射随即删除并被丢弃。
+        if (active.backend) |backend| {
+            self.finishBackendStream(backend);
+            self.inflight.closeRoute(backend.key);
+        }
+        if (active.push_session != 0) egress.abortSessionById(self, active.push_session);
+
+        // 输入缺少应用 eof，这次交换不可能再成功。RESET 返回方向让客户端立即得到
+        // 异常结束；若只清内部状态，客户端会一直读到自己的 deadline。
+        var client_conn = QUICConnection.fromRaw(ctx.cnx_handle);
+        client_conn.closeStream(stream_id);
+    }
+    // 已经完整提交的请求只释放输入解析状态，回程映射继续存活；RESET_STREAM 本身
+    // 不等同于 STOP_SENDING，客户端仍可能等待另一方向的响应。
+    ctx.removeInboundExchange(stream_id);
+}
+
 /// 分派一个完整帧。
 ///
 /// 先看这条流有没有在进行中的交换，再决定这一帧的含义——目的地是流级属性，
 /// 只在 OPEN 上声明，所以 DATA 的去向只能从交换状态里查。这也顺带消掉了帧走私：
 /// 后续帧即使伪造 8 字节的 OPEN 帧头，也改不了已经定型的投递目标。
 pub fn dispatchFrame(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, parsed: codec.Frame) FrameOutcome {
-    if (ctx.exchange(stream_id)) |active| {
+    if (ctx.inboundExchange(stream_id)) |active| {
         // eof 之后这条流上不该再有帧。这是无歧义的编码器错误：网关这边条目还在，
         // 说明它确实见过这次交换的结束标记。
-        if (active.completed) {
+        if (active.input_complete) {
             std.log.warn("[STREAM] frame after eof on stream {}", .{stream_id});
             return .close_connection;
         }
@@ -192,7 +271,7 @@ pub fn dispatchFrame(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u
         return appendToExchange(self, ctx, stream_id, active, parsed);
     }
 
-    if (parsed.header.isOpen()) return openExchange(self, ctx, stream_id, parsed);
+    if (parsed.header.isOpen()) return openInboundExchange(self, ctx, stream_id, parsed);
 
     // 查不到交换的 DATA 帧一律丢弃，**不**升级为协议违规。
     //
@@ -207,7 +286,7 @@ pub fn dispatchFrame(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u
 }
 
 /// OPEN 帧：按目的地开一次新交换。
-fn openExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, parsed: codec.Frame) FrameOutcome {
+fn openInboundExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, parsed: codec.Frame) FrameOutcome {
     // 对等网关节点走完全不同的一套白名单：它只能投递，不能请求。
     if (ctx.peer_node) return openPeerNodeExchange(self, ctx, stream_id, parsed);
 
@@ -224,7 +303,7 @@ fn openExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, p
 
     // 每次被接纳的交换都要占一个条目，条目要等 QUIC FIN 才清理。控制交换也算——
     // 否则客户端只要在新流上发心跳而从不关流，就能让这张表无界增长。
-    if (ctx.exchangeCount() >= max_exchanges_per_connection) {
+    if (ctx.inboundExchangeCount() >= max_inbound_exchanges_per_connection) {
         std.log.warn("[STREAM] too many concurrent exchanges on one connection, rejecting stream={}", .{stream_id});
         self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "too many concurrent exchanges");
         return .continue_stream;
@@ -257,6 +336,13 @@ fn openExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, p
 /// 一次性投递（OPEN 带 eof）就地扇出、不留状态；流式投递（OPEN + DATA×N）在本节点
 /// 开一个会话，**这条链路流就是它的身份**（设计文档 §5.3）。
 fn openPeerNodeExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, parsed: codec.Frame) FrameOutcome {
+    // 对等节点发来的都是单向投递语义：接收节点不会生成应用响应。这里钉死模式，
+    // 避免发送方误以为这条跨节点流还存在一轮 request/response 生命周期。
+    if (parsed.header.response_mode != .none) {
+        std.log.warn("[PEER] delivery must use response_mode=none: stream={}", .{stream_id});
+        return .close_connection;
+    }
+
     switch (parsed.header.dest_kind) {
         .peer, .multicast => {},
         .gateway, .service => {
@@ -286,13 +372,13 @@ fn openPeerSession(
 ) FrameOutcome {
     // 流式会话要留条目，因此也要受这条连接的并发上限约束——否则对等节点只要不断
     // 开新流就能让这张表无界增长。
-    if (ctx.exchangeCount() >= max_exchanges_per_connection) {
+    if (ctx.inboundExchangeCount() >= max_inbound_exchanges_per_connection) {
         std.log.warn("[PEER] too many concurrent sessions on one peer link, refusing stream={}", .{stream_id});
         return .continue_stream;
     }
 
     const session_id = egress.beginPeerSession(self, realm, parsed) orelse return .continue_stream;
-    ctx.openExchange(stream_id, .{ .push_session = session_id }) catch |err| {
+    ctx.registerInboundExchange(stream_id, .{ .push_session = session_id, .response_mode = parsed.header.response_mode }) catch |err| {
         err_handler.reportError(.session, "Failed to track a peer streaming session", err);
         // 条目登记不上，后续 DATA 就再也对不上会话，这个会话只能就地作废
         // ——留着它等于让客户端收一段永远等不到尾巴的字节流。
@@ -303,13 +389,13 @@ fn openPeerSession(
 }
 
 /// 会话流上的 DATA 帧：沿会话续传。
-fn continueSessionFrame(self: *GatewayWorker, active: *Exchange, parsed: codec.Frame) FrameOutcome {
+fn continueSessionFrame(self: *GatewayWorker, active: *InboundExchange, parsed: codec.Frame) FrameOutcome {
     egress.continuePeerSession(self, active.push_session, parsed);
     if (parsed.header.isLast()) {
         // 会话已经在 egress 那侧收尾。条目留着当"这条流用过了"的凭据，等 QUIC FIN
         // 时清理；会话号清零，免得收尾路径再去作废一个已经正常结束的会话。
         active.push_session = 0;
-        active.completed = true;
+        active.input_complete = true;
     }
     return .continue_stream;
 }
@@ -327,7 +413,7 @@ fn openGatewayExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
 
     // 记账在处理之前：handleControlFrame 可能置位 close_requested，此后不该再
     // 往这条连接的表里写东西。
-    ctx.openExchange(stream_id, .{ .completed = true }) catch |err| {
+    ctx.registerInboundExchange(stream_id, .{ .response_mode = parsed.header.response_mode, .input_complete = true }) catch |err| {
         err_handler.reportError(.session, "Failed to track control exchange", err);
         self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "gateway busy");
         return .continue_stream;
@@ -395,8 +481,10 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     };
 
     self.inflight.openRoute(backend.key, .{
-        .client_cnx = ctx.cnx_handle,
-        .client_stream_id = stream_id,
+        .target = switch (header.response_mode) {
+            .required => .{ .client = .{ .cnx = ctx.cnx_handle, .stream_id = stream_id } },
+            .none => .discard,
+        },
         .realm = ctx.realm,
         .last_active_at = now,
     }) catch |err| {
@@ -409,9 +497,10 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     };
 
     // 一次性交换不留句柄：后端流已经随首帧 fin，条目只用来拒绝这条流上的后续帧。
-    ctx.openExchange(stream_id, .{
+    ctx.registerInboundExchange(stream_id, .{
         .backend = if (is_last) null else backend,
-        .completed = is_last,
+        .response_mode = header.response_mode,
+        .input_complete = is_last,
     }) catch |err| {
         self.finishBackendStream(backend);
         self.inflight.closeRoute(backend.key);
@@ -419,6 +508,10 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
         self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "gateway busy");
         return .continue_stream;
     };
+
+    if (is_last and header.response_mode == .none) {
+        self.finishResponseWithoutPayload(ctx.cnx_handle, stream_id);
+    }
 
     std.log.info("[ROUTE] client_stream={} -> backend_stream={} realm={} group=0x{x} route=0x{x} single={}", .{ stream_id, handle, ctx.realm, header.group, header.route_key, is_last });
     return .continue_stream;
@@ -432,7 +525,7 @@ fn appendToExchange(
     self: *GatewayWorker,
     ctx: *ConnectionContext,
     stream_id: u64,
-    active: *Exchange,
+    active: *InboundExchange,
     parsed: codec.Frame,
 ) FrameOutcome {
     const backend = active.backend orelse {
@@ -441,7 +534,7 @@ fn appendToExchange(
         // ——将来放开流式控制交换时，这里会明确报出来而不是崩在生产环境。
         std.log.warn("[STREAM] live exchange without a backend stream: stream={}", .{stream_id});
         self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "unsupported exchange continuation");
-        ctx.closeExchange(stream_id);
+        ctx.removeInboundExchange(stream_id);
         return .continue_stream;
     };
 
@@ -450,7 +543,7 @@ fn appendToExchange(
         // 继续发只会拼出一条残缺的字节流，因此这次交换就地作废。
         std.log.warn("[STREAM] transport disappeared mid-exchange: stream={}", .{stream_id});
         self.inflight.closeRoute(backend.key);
-        ctx.closeExchange(stream_id);
+        ctx.removeInboundExchange(stream_id);
         self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "backend unavailable");
         return .continue_stream;
     };
@@ -460,7 +553,7 @@ fn appendToExchange(
     if (!self.inflight.touchRoute(backend.key, quic.c.currentTime())) {
         std.log.warn("[STREAM] in-flight route expired mid-exchange: stream={}", .{stream_id});
         self.finishBackendStream(backend);
-        ctx.closeExchange(stream_id);
+        ctx.removeInboundExchange(stream_id);
         self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "request expired");
         return .continue_stream;
     }
@@ -470,7 +563,7 @@ fn appendToExchange(
         err_handler.reportError(.session, "Failed to append to backend stream", err);
         self.finishBackendStream(backend);
         self.inflight.closeRoute(backend.key);
-        ctx.closeExchange(stream_id);
+        ctx.removeInboundExchange(stream_id);
         self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "backend unavailable");
         return .continue_stream;
     };
@@ -479,7 +572,10 @@ fn appendToExchange(
         // 交换结束但条目留着：它是"这条流已经用过了"的凭据，等 QUIC FIN 时清理。
         // 回程映射不能删——后端的响应还没回来。
         active.backend = null;
-        active.completed = true;
+        active.input_complete = true;
+        if (active.response_mode == .none) {
+            self.finishResponseWithoutPayload(ctx.cnx_handle, stream_id);
+        }
     }
     return .continue_stream;
 }
@@ -495,12 +591,15 @@ pub fn finishClientStream(self: *GatewayWorker, ctx: *ConnectionContext, stream_
         }
         ctx.dropFrameSpill(stream_id);
     }
-    if (ctx.exchange(stream_id)) |active| {
+    if (ctx.inboundExchange(stream_id)) |active| {
         if (active.backend) |backend| self.finishBackendStream(backend);
+        if (!active.input_complete and active.response_mode == .none) {
+            self.finishResponseWithoutPayload(ctx.cnx_handle, stream_id);
+        }
         // 会话流被 FIN 掉却没发过 eof：尾巴永远不会来，就地作废，
         // 否则下游客户端会一直等下去。
         if (active.push_session != 0) egress.abortSessionById(self, active.push_session);
-        ctx.closeExchange(stream_id);
+        ctx.removeInboundExchange(stream_id);
     }
 }
 

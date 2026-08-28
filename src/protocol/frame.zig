@@ -16,7 +16,7 @@
 //! ```
 //! OPEN（一次交换的第一帧，8 字节）
 //! ┌────────────┬───────┬────────────────┬───────────┬──────────┬───────┬───────────┐
-//! │ frame_type │ flags │ body_len (u16) │ dest_kind │ reserved │ group │ route_key │
+//! │ frame_type │ flags │ body_len (u16) │ dest_kind │ response │ group │ route_key │
 //! │ (1B)       │ (1B)  │ (2B)           │ (1B)      │ (1B)     │ (1B)  │ (1B)      │
 //! └────────────┴───────┴────────────────┴───────────┴──────────┴───────┴───────────┘
 //!
@@ -159,6 +159,32 @@ pub const RouteId = packed struct(u16) {
 };
 
 // ============================================================================
+// 响应模式
+// ============================================================================
+
+/// OPEN 发起方是否需要应用层响应。
+///
+/// 两种模式都会正常结束 QUIC 双向流的两个发送方向；区别只在返回方向有没有应用帧：
+///
+/// - `.required`：接收方必须返回一个或多个应用帧，最后以 FIN 收尾；
+/// - `.none`：接收方成功接纳后只发送空 FIN，业务处理结果不再返回。
+///
+/// `.none` 不是可靠业务确认。空 FIN 只表示本端已经完成准入并把请求交给下一层；
+/// 需要 message_id、持久化结果或业务错误的请求必须使用 `.required`。
+pub const ResponseMode = enum(u8) {
+    required = 0x00,
+    none = 0x01,
+
+    pub fn decode(byte: u8) FrameError!ResponseMode {
+        return switch (byte) {
+            @intFromEnum(ResponseMode.required) => .required,
+            @intFromEnum(ResponseMode.none) => .none,
+            else => error.UnknownResponseMode,
+        };
+    }
+};
+
+// ============================================================================
 // 控制帧类型
 // ============================================================================
 
@@ -247,6 +273,10 @@ pub const ControlType = enum(u8) {
     session_resume_ack = 0x31,
     /// 会话恢复失败（Gateway → Client）
     session_resume_fail = 0x32,
+    /// 认证成功后由 Gateway 发给后端的连接级上线事件。
+    session_online = 0x33,
+    /// 连接关闭、被踢或准入过期时由 Gateway 发给后端的连接级下线事件。
+    session_offline = 0x34,
 
     // =========================================================================
     // 组播类 (0x40 - 0x4F)
@@ -372,16 +402,18 @@ pub const FrameHeader = struct {
     flags: Flags = .{},
     body_len: u16 = 0,
     dest_kind: DestKind = .gateway,
+    response_mode: ResponseMode = .required,
     group: u8 = 0x00,
     route_key: u8 = 0x00,
 
     /// 构造一个 OPEN 帧头。
-    pub fn initOpen(dest_kind: DestKind, route: RouteId, flags: Flags, body_len: u16) FrameHeader {
+    pub fn initOpen(dest_kind: DestKind, route: RouteId, response_mode: ResponseMode, flags: Flags, body_len: u16) FrameHeader {
         return .{
             .frame_type = .open,
             .flags = flags,
             .body_len = body_len,
             .dest_kind = dest_kind,
+            .response_mode = response_mode,
             .group = route.group,
             .route_key = route.route_key,
         };
@@ -396,7 +428,7 @@ pub const FrameHeader = struct {
     ///
     /// 控制交换目前都是一次性的（心跳、认证、断开），所以默认带 `eof`。
     pub fn initControl(ctrl_type: ControlType, body_len: u16) FrameHeader {
-        return initOpen(.gateway, RouteId.init(0, @intFromEnum(ctrl_type)), Flags.last(), body_len);
+        return initOpen(.gateway, RouteId.init(0, @intFromEnum(ctrl_type)), .required, Flags.last(), body_len);
     }
 
     /// 序列化到缓冲区（大端序），返回写入的字节数。
@@ -412,7 +444,7 @@ pub const FrameHeader = struct {
 
         if (self.frame_type == .open) {
             buf[4] = @intFromEnum(self.dest_kind);
-            buf[5] = 0;
+            buf[5] = @intFromEnum(self.response_mode);
             buf[6] = self.group;
             buf[7] = self.route_key;
         }
@@ -446,7 +478,7 @@ pub const FrameHeader = struct {
 
         if (frame_type == .open) {
             header.dest_kind = try DestKind.decode(buf[4]);
-            if (buf[5] != 0) return error.ReservedBitsSet;
+            header.response_mode = try ResponseMode.decode(buf[5]);
             header.group = buf[6];
             header.route_key = buf[7];
         }
@@ -514,6 +546,8 @@ pub const FrameError = error{
     UnknownFrameType,
     /// 未定义的 dest_kind
     UnknownDestKind,
+    /// 未定义的响应模式
+    UnknownResponseMode,
     /// 保留位/保留字节非 0
     ReservedBitsSet,
     /// datagram 帧出现在 QUIC 流上
@@ -559,7 +593,7 @@ pub const AppError = enum(u64) {
 // ============================================================================
 
 test "OPEN header encode/decode roundtrip" {
-    const original = FrameHeader.initOpen(.service, RouteId.init(0x02, 0x01), .{ .report = true }, 1024);
+    const original = FrameHeader.initOpen(.service, RouteId.init(0x02, 0x01), .required, .{ .report = true }, 1024);
 
     var buf: [OPEN_HEADER_SIZE]u8 = undefined;
     try std.testing.expectEqual(OPEN_HEADER_SIZE, try original.encode(&buf));
@@ -567,6 +601,7 @@ test "OPEN header encode/decode roundtrip" {
     const decoded = try FrameHeader.decode(&buf);
     try std.testing.expectEqual(FrameType.open, decoded.frame_type);
     try std.testing.expectEqual(DestKind.service, decoded.dest_kind);
+    try std.testing.expectEqual(ResponseMode.required, decoded.response_mode);
     try std.testing.expectEqual(RouteId.init(0x02, 0x01), decoded.routeId().?);
     try std.testing.expectEqual(@as(u16, 1024), decoded.body_len);
     try std.testing.expect(decoded.flags.report);
@@ -605,12 +640,20 @@ test "decode rejects everything outside the whitelist" {
     // 未定义的 dest_kind
     try std.testing.expectError(error.UnknownDestKind, FrameHeader.decode(&[_]u8{ 0x00, 0, 0, 0, 0x09, 0, 0, 0 }));
 
-    // OPEN 的保留字节
-    try std.testing.expectError(error.ReservedBitsSet, FrameHeader.decode(&[_]u8{ 0x00, 0, 0, 0, 0x01, 0x01, 0, 0 }));
+    // 未定义的响应模式
+    try std.testing.expectError(error.UnknownResponseMode, FrameHeader.decode(&[_]u8{ 0x00, 0, 0, 0, 0x01, 0x02, 0, 0 }));
+}
+
+test "OPEN response mode roundtrip" {
+    const original = FrameHeader.initOpen(.service, RouteId.init(1, 2), .none, Flags.last(), 0);
+    var buf: [OPEN_HEADER_SIZE]u8 = undefined;
+    _ = try original.encode(&buf);
+    try std.testing.expectEqual(@as(u8, 1), buf[5]);
+    try std.testing.expectEqual(ResponseMode.none, (try FrameHeader.decode(&buf)).response_mode);
 }
 
 test "decode reports BufferTooSmall until the variable-length header is complete" {
-    const open = FrameHeader.initOpen(.service, RouteId.init(1, 2), .{}, 0);
+    const open = FrameHeader.initOpen(.service, RouteId.init(1, 2), .required, .{}, 0);
     var buf: [OPEN_HEADER_SIZE]u8 = undefined;
     _ = try open.encode(&buf);
 
@@ -635,7 +678,7 @@ test "control exchanges are OPEN frames addressed at the gateway" {
     try std.testing.expect(header.isLast());
 
     // 非 gateway 目的地没有控制类型。
-    const service = FrameHeader.initOpen(.service, RouteId.init(0, 0x10), .{}, 0);
+    const service = FrameHeader.initOpen(.service, RouteId.init(0, 0x10), .required, .{}, 0);
     try std.testing.expectEqual(@as(?ControlType, null), service.controlType());
 
     // DATA 帧同样没有——控制类型在 route_key 里，而 DATA 不带 route_key。
@@ -653,21 +696,21 @@ test "peer and multicast carry their targets in the body, not in the route key" 
     try std.testing.expect(!DestKind.peer.hasRouteKey());
     try std.testing.expect(!DestKind.multicast.hasRouteKey());
 
-    const peer = FrameHeader.initOpen(.peer, RouteId.init(0xAA, 0xBB), .{}, 0);
+    const peer = FrameHeader.initOpen(.peer, RouteId.init(0xAA, 0xBB), .none, .{}, 0);
     try std.testing.expectEqual(@as(?RouteId, null), peer.routeId());
 }
 
 test "peer and multicast reuse the reserved route bytes as a realm hint" {
     // 节点间投递靠这条：那两字节在 .peer / .multicast 下本来是保留的，
     // 而 RealmId 是 u16，正好放得进去，因此不需要新增线格式。
-    const peer = FrameHeader.initOpen(.peer, RouteId.init(0x07, 0x09), .{}, 0);
+    const peer = FrameHeader.initOpen(.peer, RouteId.init(0x07, 0x09), .none, .{}, 0);
     try std.testing.expectEqual(@as(u16, 0x0709), peer.realmHint().?);
 
-    const multicast = FrameHeader.initOpen(.multicast, RouteId.init(0x00, 0x01), .{}, 0);
+    const multicast = FrameHeader.initOpen(.multicast, RouteId.init(0x00, 0x01), .none, .{}, 0);
     try std.testing.expectEqual(@as(u16, 1), multicast.realmHint().?);
 
     // 有路由键的目的地没有 realm 提示——那两字节在那里另有含义。
-    try std.testing.expectEqual(@as(?u16, null), FrameHeader.initOpen(.service, RouteId.init(1, 2), .{}, 0).realmHint());
+    try std.testing.expectEqual(@as(?u16, null), FrameHeader.initOpen(.service, RouteId.init(1, 2), .required, .{}, 0).realmHint());
     try std.testing.expectEqual(@as(?u16, null), FrameHeader.initControl(.heartbeat, 0).realmHint());
     // DATA 上不重复目的地，因此也没有 realm 提示。
     try std.testing.expectEqual(@as(?u16, null), FrameHeader.initData(.{}, 0).realmHint());

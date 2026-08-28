@@ -386,8 +386,8 @@ pub fn deliverFromPeer(self: *GatewayWorker, realm: RealmId, bytes: []const u8) 
 }
 
 /// 解出一个 conn_token 列表；畸形则记日志返回 null。
-fn decodeTokens(payload: []const u8) ?body.TargetList {
-    return body.TargetList.decode(payload) catch |err| {
+fn decodeTokens(payload: []const u8) ?body.TokenList {
+    return body.TokenList.decode(payload) catch |err| {
         std.log.warn("[ROUTE] malformed conn_token list: {}", .{err});
         return null;
     };
@@ -419,6 +419,30 @@ const ReportBuilder = struct {
         std.mem.writeInt(u16, self.buf[frame.DATA_HEADER_SIZE..][0..2], @intCast(self.count), .big);
         const header = frame.FrameHeader.initData(frame.Flags.last(), @intCast(body_len));
         // buf 是启动期按最大帧长分配的，写 4 字节帧头不可能失败。
+        _ = header.encode(self.buf[0..frame.DATA_HEADER_SIZE]) catch unreachable;
+        return self.buf[0 .. frame.DATA_HEADER_SIZE + body_len];
+    }
+};
+
+/// kick 回报必须原样返回没命中的 128 位 conn_token。它与 dest_id 回报线形相似，
+/// 但条目宽度不同；独立类型避免一次无声的 128→64 截断。
+const TokenReportBuilder = struct {
+    buf: []u8,
+    count: usize = 0,
+
+    const list_offset: usize = frame.DATA_HEADER_SIZE + 2;
+
+    fn add(self: *TokenReportBuilder, token: u128) void {
+        if (self.count >= body.max_conn_tokens) return;
+        const offset = list_offset + self.count * body.conn_token_size;
+        std.mem.writeInt(u128, self.buf[offset..][0..body.conn_token_size], token, .big);
+        self.count += 1;
+    }
+
+    fn finish(self: *TokenReportBuilder) []const u8 {
+        const body_len = 2 + self.count * body.conn_token_size;
+        std.mem.writeInt(u16, self.buf[frame.DATA_HEADER_SIZE..][0..2], @intCast(self.count), .big);
+        const header = frame.FrameHeader.initData(frame.Flags.last(), @intCast(body_len));
         _ = header.encode(self.buf[0..frame.DATA_HEADER_SIZE]) catch unreachable;
         return self.buf[0 .. frame.DATA_HEADER_SIZE + body_len];
     }
@@ -502,6 +526,13 @@ pub fn handlePush(self: *GatewayWorker, transport: BackendTransport, realm: Real
         // 否则客户端会一直等下去。
         if (self.egress.sessions.findByOrigin(key)) |session| abortSession(self, session);
     }
+}
+
+/// 后端异常终止一条主动推送流。残帧与流式会话必须一起作废；只删重组缓冲会让
+/// 下游客户端继续等永远不会到来的尾帧。
+pub fn abortBackendPush(self: *GatewayWorker, key: inflight.StreamKey) void {
+    self.egress.dropPush(key);
+    if (self.egress.sessions.findByOrigin(key)) |session| abortSession(self, session);
 }
 
 /// 分派一个完整的推送帧；返回 false 停止分帧。
@@ -601,7 +632,7 @@ fn dispatchBackendControl(
         return dispatchGroupBinding(self, realm, backend_stream, ctrl, parsed);
     }
 
-    const list = body.TargetList.decode(parsed.body) catch |err| {
+    const list = body.TokenList.decode(parsed.body) catch |err| {
         std.log.warn("[KICK] malformed target list on backend_stream={}: {}", .{ backend_stream, err });
         return false;
     };
@@ -701,11 +732,11 @@ fn kickAll(
     transport: ?BackendTransport,
     realm: RealmId,
     backend_stream: u64,
-    list: body.TargetList,
+    list: body.TokenList,
     bytes: []const u8,
     want_report: bool,
 ) void {
-    var report = ReportBuilder{ .buf = self.egress.report_buf };
+    var report = TokenReportBuilder{ .buf = self.egress.report_buf };
     var routes = RouteSet{};
     var kicked: usize = 0;
 
@@ -775,12 +806,7 @@ fn kickOne(self: *GatewayWorker, realm: RealmId, token: connection.ConnToken) bo
     // 吊销是本地状态改动，一定生效；写帧和关连接都可能失败或在竞态里丢掉。这样即使
     // 通知没送到、连接一时还没断，它也已经什么都做不了了——数据帧过不了准入门禁
     // （§10.2），也不再可被 `.peer` 寻址。
-    ctx.authenticated = false;
-    ctx.auth_expires_at = 0;
-    // 通道也一起收走：datagram 的热路径上没有授权查找，所以吊销必须落到通道表上，
-    // 否则这条连接在断开前的那段时间里还能往组里灌状态包（§6.1）。
-    ctx.clearChannels();
-    self.conn_manager.bindDest(ctx.cnx_handle, 0);
+    self.revokeAdmission(ctx, .kicked);
 
     var buf: [128]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
@@ -1012,7 +1038,7 @@ fn encodeUnreliableGroupFrame(self: *GatewayWorker, group_id: u64, payload: []co
     @memcpy(buf[body_start + prefix ..][0..payload.len], payload);
 
     const body_len: u16 = @intCast(prefix + payload.len);
-    const header = frame.FrameHeader.initOpen(.multicast, .{}, .{ .eof = true, .unreliable = true }, body_len);
+    const header = frame.FrameHeader.initOpen(.multicast, .{}, .none, .{ .eof = true, .unreliable = true }, body_len);
     _ = header.encode(buf[0..frame.OPEN_HEADER_SIZE]) catch return null;
     return buf[0 .. body_start + body_len];
 }

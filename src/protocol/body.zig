@@ -27,13 +27,13 @@ const FrameError = frame.FrameError;
 // 认证上下文（auth_request 的前缀）
 // ============================================================================
 
-/// 网关插在 `auth_request` body 前面的定长前缀（设计文档 §10.3）。
+/// 网关插在 `auth_request` body 前面的定长前缀（设计文档 §10.4）。
 ///
 /// ```
 /// 偏移  长度  字段
 /// 0     2     realm (u16, 大端)
-/// 2     8     conn_token (u64, 大端)
-/// 10    ..    客户端原样的认证 body（token 等），网关一个字节都不看
+/// 2     16    conn_token (u128, 大端)
+/// 18    ..    客户端原样的认证 body（token 等），网关一个字节都不看
 /// ```
 ///
 /// 它与 `AuthGrant` 构成一对对称的前缀：请求方向网关告诉后端"这是谁、在哪"，
@@ -50,26 +50,26 @@ const FrameError = frame.FrameError;
 /// `conn_token` 对后端不透明：原样存、原样回传，不解析也不构造。
 pub const AuthContext = struct {
     /// 前缀长度。
-    pub const SIZE: usize = 10;
+    pub const SIZE: usize = 18;
 
     /// 这条连接所属的隔离域。
     realm: u16 = 0,
     /// 这条连接在集群里的唯一标识（见 worker/connection.zig 的 ConnToken）。
-    conn_token: u64 = 0,
+    conn_token: u128 = 0,
 
     pub fn encode(self: AuthContext, buf: []u8) FrameError!void {
         if (buf.len < SIZE) return error.BufferTooSmall;
         std.mem.writeInt(u16, buf[0..2], self.realm, .big);
-        std.mem.writeInt(u64, buf[2..10], self.conn_token, .big);
+        std.mem.writeInt(u128, buf[2..18], self.conn_token, .big);
     }
 
-    /// 解析前缀。短于 10 字节一律拒绝，不做默认值兜底——后端若把一个截断的前缀
+    /// 解析前缀。短于 18 字节一律拒绝，不做默认值兜底——后端若把一个截断的前缀
     /// 当成 `realm = 0`，就会用错误的 token 体系去校验。
     pub fn decode(body: []const u8) FrameError!AuthContext {
         if (body.len < SIZE) return error.BufferTooSmall;
         return .{
             .realm = std.mem.readInt(u16, body[0..2], .big),
-            .conn_token = std.mem.readInt(u64, body[2..10], .big),
+            .conn_token = std.mem.readInt(u128, body[2..18], .big),
         };
     }
 };
@@ -121,6 +121,91 @@ pub const AuthGrant = struct {
         if (buf.len < SIZE) return error.BufferTooSmall;
         std.mem.writeInt(u64, buf[0..8], self.dest_id, .big);
         std.mem.writeInt(u32, buf[8..12], self.ttl_seconds, .big);
+    }
+};
+
+// ============================================================================
+// 连接生命周期（session_online / session_offline 的 body）
+// ============================================================================
+
+/// 一条连接级生命周期事件。Gateway 只报告连接事实，不聚合用户的多设备状态。
+///
+/// ```
+/// 偏移  长度  字段
+/// 0     2     realm (u16, 大端)
+/// 2     16    conn_token (u128, 大端)
+/// 18    8     dest_id (u64, 大端)
+/// 26    8     connected_at (i64 Unix 秒，大端位模式)
+/// 34    8     occurred_at (i64 Unix 秒，大端位模式)
+/// 42    8     sequence (同一 conn_token 上严格递增)
+/// 50    1     reason
+/// ```
+///
+/// Reactor 以 `conn_token` 为会话主键，再按 `dest_id` 聚合多设备。Gateway 不知道
+/// 设备类型、主设备、last_seen 或“用户整体是否在线”，也不应该替业务层做这些判断。
+pub const SessionLifecycle = struct {
+    pub const SIZE: usize = 51;
+
+    pub const Reason = enum(u8) {
+        authenticated = 0x00,
+        transport_closed = 0x01,
+        application_closed = 0x02,
+        stateless_reset = 0x03,
+        client_disconnect = 0x04,
+        kicked = 0x05,
+        admission_expired = 0x06,
+        identity_replaced = 0x07,
+        lease_refresh = 0x08,
+
+        pub fn decode(byte: u8) FrameError!Reason {
+            return switch (byte) {
+                0x00 => .authenticated,
+                0x01 => .transport_closed,
+                0x02 => .application_closed,
+                0x03 => .stateless_reset,
+                0x04 => .client_disconnect,
+                0x05 => .kicked,
+                0x06 => .admission_expired,
+                0x07 => .identity_replaced,
+                0x08 => .lease_refresh,
+                else => error.ReservedBitsSet,
+            };
+        }
+    };
+
+    realm: u16,
+    conn_token: u128,
+    dest_id: u64,
+    connected_at: i64,
+    occurred_at: i64,
+    /// 同一连接内严格递增的事件序号。生命周期事件各走独立 QUIC 流，跨流不保证
+    /// 到达顺序；Reactor 必须靠它拒绝迟到的旧事件，否则 offline 可能覆盖一次
+    /// 更新的 online（身份替换时尤其容易发生）。
+    sequence: u64,
+    reason: Reason,
+
+    pub fn encode(self: SessionLifecycle, buf: []u8) FrameError!void {
+        if (buf.len < SIZE) return error.BufferTooSmall;
+        std.mem.writeInt(u16, buf[0..2], self.realm, .big);
+        std.mem.writeInt(u128, buf[2..18], self.conn_token, .big);
+        std.mem.writeInt(u64, buf[18..26], self.dest_id, .big);
+        std.mem.writeInt(u64, buf[26..34], @bitCast(self.connected_at), .big);
+        std.mem.writeInt(u64, buf[34..42], @bitCast(self.occurred_at), .big);
+        std.mem.writeInt(u64, buf[42..50], self.sequence, .big);
+        buf[50] = @intFromEnum(self.reason);
+    }
+
+    pub fn decode(buf: []const u8) FrameError!SessionLifecycle {
+        if (buf.len < SIZE) return error.BufferTooSmall;
+        return .{
+            .realm = std.mem.readInt(u16, buf[0..2], .big),
+            .conn_token = std.mem.readInt(u128, buf[2..18], .big),
+            .dest_id = std.mem.readInt(u64, buf[18..26], .big),
+            .connected_at = @bitCast(std.mem.readInt(u64, buf[26..34], .big)),
+            .occurred_at = @bitCast(std.mem.readInt(u64, buf[34..42], .big)),
+            .sequence = std.mem.readInt(u64, buf[42..50], .big),
+            .reason = try Reason.decode(buf[50]),
+        };
     }
 };
 
@@ -197,6 +282,45 @@ pub const TargetList = struct {
     }
 };
 
+/// `conn_token` 是带进程 incarnation 的 128 位不透明值，不能再复用 64 位 dest_id
+/// 列表。把两种列表分成独立类型，编译器会阻止 kick/group 路径误用 TargetList。
+pub const conn_token_size: usize = 16;
+pub const max_conn_tokens: usize = (frame.MAX_BODY_SIZE - 2) / conn_token_size;
+
+pub const TokenList = struct {
+    count: u16,
+    entries: []const u8,
+
+    pub fn byteSize(count: usize) usize {
+        return 2 + count * conn_token_size;
+    }
+
+    pub fn decode(input: []const u8) FrameError!TokenList {
+        if (input.len < 2) return error.BufferTooSmall;
+        const count = std.mem.readInt(u16, input[0..2], .big);
+        const end = byteSize(count);
+        if (input.len < end) return error.BufferTooSmall;
+        return .{ .count = count, .entries = input[2..end] };
+    }
+
+    pub fn get(self: TokenList, i: usize) u128 {
+        const offset = i * conn_token_size;
+        return std.mem.readInt(u128, self.entries[offset..][0..conn_token_size], .big);
+    }
+
+    pub fn encode(buf: []u8, tokens: []const u128) FrameError!usize {
+        if (tokens.len > max_conn_tokens) return error.BodyTooLarge;
+        const total = byteSize(tokens.len);
+        if (buf.len < total) return error.BufferTooSmall;
+        std.mem.writeInt(u16, buf[0..2], @intCast(tokens.len), .big);
+        for (tokens, 0..) |token, i| {
+            const offset = 2 + i * conn_token_size;
+            std.mem.writeInt(u128, buf[offset..][0..conn_token_size], token, .big);
+        }
+        return total;
+    }
+};
+
 // ============================================================================
 // 组播成员变更（join_group / leave_group 的 body）
 // ============================================================================
@@ -206,7 +330,7 @@ pub const TargetList = struct {
 /// ```
 /// 偏移  长度  字段
 /// 0     8     group_id (u64, 大端)
-/// 8     ..    TargetList，条目是 conn_token
+/// 8     ..    TokenList，条目是 128 位 conn_token
 /// ```
 ///
 /// **组标识在前、成员列表在后**，因为一次变更天然是"把这批连接加进同一个组"：
@@ -215,28 +339,28 @@ pub const TargetList = struct {
 ///
 /// 成员用 `conn_token` 而不是 `dest_id`：`dest_id` 是一对多的（一个账号多台设备，
 /// §5.6），而"这台设备打开了这个文档"不该把该账号的其他设备也拉进组。后端在认证时
-/// 就拿到了 `conn_token`（§10.3 的 `AuthContext`），本来就要为 `kick_off` 存着它。
+/// 就拿到了 `conn_token`（§10.4 的 `AuthContext`），本来就要为 `kick_off` 存着它。
 pub const GroupBinding = struct {
     /// 组标识前缀长度。
     pub const SIZE: usize = 8;
 
     group_id: u64 = 0,
     /// 成员的 conn_token 列表。
-    members: TargetList,
+    members: TokenList,
 
     pub fn decode(body: []const u8) FrameError!GroupBinding {
         if (body.len < SIZE) return error.BufferTooSmall;
         return .{
             .group_id = std.mem.readInt(u64, body[0..8], .big),
-            .members = try TargetList.decode(body[SIZE..]),
+            .members = try TokenList.decode(body[SIZE..]),
         };
     }
 
     /// 写入一次组成员变更，返回写入的字节数。网关自己不产生它，这个方向给测试与后端 SDK 用。
-    pub fn encode(buf: []u8, group_id: u64, members: []const u64) FrameError!usize {
+    pub fn encode(buf: []u8, group_id: u64, members: []const u128) FrameError!usize {
         if (buf.len < SIZE) return error.BufferTooSmall;
         std.mem.writeInt(u64, buf[0..8], group_id, .big);
-        return SIZE + try TargetList.encode(buf[SIZE..], members);
+        return SIZE + try TokenList.encode(buf[SIZE..], members);
     }
 };
 
@@ -387,6 +511,22 @@ test "AuthGrant ignores whatever follows the prefix" {
     try std.testing.expectEqual(@as(u32, 60), decoded.ttl_seconds);
 }
 
+test "SessionLifecycle roundtrip" {
+    const event: SessionLifecycle = .{
+        .realm = 7,
+        .conn_token = 0x1111_2222_3333_4444,
+        .dest_id = 42,
+        .connected_at = 1_700_000_000,
+        .occurred_at = 1_700_000_123,
+        .sequence = 9,
+        .reason = .application_closed,
+    };
+    var buf: [SessionLifecycle.SIZE]u8 = undefined;
+    try event.encode(&buf);
+    try std.testing.expectEqualDeep(event, try SessionLifecycle.decode(&buf));
+    try std.testing.expectError(error.BufferTooSmall, SessionLifecycle.decode(buf[0 .. SessionLifecycle.SIZE - 1]));
+}
+
 test "a truncated AuthGrant is rejected, not defaulted" {
     // 关键回归：截断必须报错。若默认成 dest_id=0 / ttl=0，一次网络截断就会静默
     // 变成"认证通过、不可寻址、永不过期"。
@@ -472,7 +612,7 @@ test "a truncated AuthContext is rejected, not defaulted" {
 
 test "GroupBinding carries one group and a batch of conn_tokens" {
     var buf: [64]u8 = undefined;
-    const members = [_]u64{ 0x1111, 0x2222, 0x3333 };
+    const members = [_]u128{ 0x1111, 0x2222, 0x3333 };
     const written = try GroupBinding.encode(&buf, 0xABCD_EF01_2345_6789, &members);
 
     const decoded = try GroupBinding.decode(buf[0..written]);

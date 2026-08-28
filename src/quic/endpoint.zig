@@ -83,6 +83,7 @@ pub const Endpoint = struct {
                 .allocator = allocator,
                 .on_connection = null,
                 .on_stream_data = null,
+                .on_stream_control = null,
                 .on_datagram = null,
                 .on_connection_close = null,
                 .user_data = null,
@@ -201,6 +202,7 @@ pub const Endpoint = struct {
         // 因此必须先摘除回调，避免回调打到已析构的对象上。
         self.callback_ctx.on_connection = null;
         self.callback_ctx.on_stream_data = null;
+        self.callback_ctx.on_stream_control = null;
         self.callback_ctx.on_datagram = null;
         self.callback_ctx.on_connection_close = null;
 
@@ -218,6 +220,12 @@ pub const Endpoint = struct {
     /// 设置数据接收回调（收到客户端发送的数据时）
     pub fn onStreamData(self: *Self, callback: *const fn (?*anyopaque, *Connection, u64, []const u8, bool) void) void {
         self.callback_ctx.on_stream_data = callback;
+    }
+
+    /// 设置流控制事件回调。数据/FIN 仍走 onStreamData；这里只转交对端显式发来的
+    /// RESET_STREAM 与 STOP_SENDING，让上层能及时释放交换状态而不是等连接超时。
+    pub fn onStreamControl(self: *Self, callback: *const fn (?*anyopaque, *Connection, u64, quic_c.CallbackEvent) void) void {
+        self.callback_ctx.on_stream_control = callback;
     }
 
     /// 设置 datagram 接收回调（不可靠通路，设计文档 §6）。
@@ -327,6 +335,7 @@ pub const CallbackContext = struct {
     allocator: std.mem.Allocator,
     on_connection: ?*const fn (?*anyopaque, *Connection) void,
     on_stream_data: ?*const fn (?*anyopaque, *Connection, u64, []const u8, bool) void,
+    on_stream_control: ?*const fn (?*anyopaque, *Connection, u64, quic_c.CallbackEvent) void,
     on_datagram: ?*const fn (?*anyopaque, *Connection, []const u8) void,
     on_connection_close: ?*const fn (?*anyopaque, *Connection, quic_c.CallbackEvent) void,
     user_data: ?*anyopaque,
@@ -357,6 +366,11 @@ fn streamCallback(
             if (ctx.on_stream_data) |callback| {
                 const data = if (length > 0) bytes[0..length] else &[_]u8{};
                 callback(ctx.user_data, &connection, stream_id, data, event == .stream_fin);
+            }
+        },
+        .stream_reset, .stop_sending => {
+            if (ctx.on_stream_control) |callback| {
+                callback(ctx.user_data, &connection, stream_id, event);
             }
         },
 

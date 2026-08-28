@@ -53,6 +53,8 @@ pub const RuntimeConfig = struct {
     /// 不带 realm：每个 realm 在同一个路由键上注册自己的认证服务，查表时由连接的
     /// realm 补齐（见 worker/auth.zig）。
     auth_route: ?backend.RouteId,
+    /// 连接级 session_online/session_offline 事件的后端路由；null 表示关闭。
+    lifecycle_route: ?backend.RouteId,
     backend_poll_interval_ms: u64,
     /// 每 Worker 一份的后端传输设施容量（见 backend/pool.zig）。
     ///
@@ -215,6 +217,7 @@ pub fn prepare(allocator: std.mem.Allocator, config: foundation.config.GatewayCo
         } else null,
         .auth_required = config.auth.required,
         .auth_route = if (config.auth.group) |group| backend.RouteId{ .group = group, .route_key = config.auth.route_key } else null,
+        .lifecycle_route = if (config.auth.lifecycle) |route| backend.RouteId{ .group = route.group, .route_key = route.route_key } else null,
         .route_slots = route_slots,
         .route_startup = config.backend.direct.routes.len,
         .routes = .{

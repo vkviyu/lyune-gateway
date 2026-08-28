@@ -36,7 +36,7 @@ realm 隔离、配额和网关侧后端客户端证书能力，但还没有完�
 ### 1.2 校验成本花在不受信任的方向
 
 - **上行（客户端 → 网关）**：客户端是攻击面。逐帧解析、逐帧选路、逐帧过门禁；
-  分帧违规立即 RESET_STREAM，不做重同步。
+  分帧违规关闭连接，不做重同步。业务拒绝只结束当前流，见 §7.5。
 - **下行（后端 → 网关 → 客户端）**：后端由配置指定且经过双向认证，是受信任方。
   网关按流转发字节，不解析。这条正当性**依赖 mTLS**（见 §10.1），
   在 mTLS 落地之前下行的信任假设是不成立的。
@@ -72,7 +72,8 @@ realm 隔离、配额和网关侧后端客户端证书能力，但还没有完�
 | `TransportMode`             | buffered / streaming 的区别被"一次交换有几帧"取代，见 §5.2          |
 | 每帧重复`group + route_key` | 路由是流级属性，只在流的第一帧声明                                  |
 
-新增：`dest_kind`（目的地类型）、`frame_type`（OPEN / DATA / DATAGRAM）。
+新增：`dest_kind`（目的地类型）、`frame_type`（OPEN / DATA / DATAGRAM）以及
+`response_mode`（发起方是否要求应用层响应）。
 
 帧头从固定 16 字节变成：**首帧 8 字节，后续帧 4 字节，datagram 2 字节**。
 
@@ -80,8 +81,9 @@ realm 隔离、配额和网关侧后端客户端证书能力，但还没有完�
 
 ## 3. 连接层
 
-- **ALPN 承载版本**：`lyune/1`。版本不匹配在 QUIC 握手阶段就失败，不进入帧层。
+- **ALPN 承载版本**：`lyune/2`。版本不匹配在 QUIC 握手阶段就失败，不进入帧层。
 - **一个客户端一条 QUIC 连接**。所有逻辑交换复用这条连接上的多条流。
+- 可靠应用协议只使用双向流，默认通告的单向流额度为 0。
 - 单帧上限 **64 KB**（`body_len` 为 u16）。超过的内容由发送方切成多帧。
 
 64 KB 这个数字是有意选的：它让重组缓冲可以做成定容池（16 MB 的旧上限无法预留），
@@ -99,12 +101,20 @@ realm 隔离、配额和网关侧后端客户端证书能力，但还没有完�
 1     1     flags
 2     2     body_len (u16, 大端)
 4     1     dest_kind
-5     1     reserved（必须为 0，解码时校验）
+5     1     response_mode：0=required，1=none；其他取值拒绝
 6     1     group
 7     1     route_key
 ```
 
 `group + route_key` 仅在 `dest_kind = .service` 与 `.gateway` 时有意义。
+
+`response_mode` 是交换级契约：
+
+- `required`：接收方必须返回一个或多个应用帧，并以 FIN 结束返回方向；
+- `none`：接收方接纳完整请求后只回空 FIN，不产生应用响应帧。
+
+空 FIN 只证明请求已被当前层接纳，不是持久化或业务成功确认。需要业务错误、message id
+或提交结果的操作必须使用 `required`；typing、在线续租等可丢失通知可以使用 `none`。
 
 ### 4.2 DATA —— 同一次交换的后续帧（4 字节）
 
@@ -141,6 +151,33 @@ bit 3-7            保留（必须为 0，解码时校验）
 
 被拒绝的交换**不留记录**：网关回了错误帧就当这次交换没发生。这条选择的理由
 在 §7.5 末尾。
+
+### 4.5 流方向与交换归属
+
+“双向流”只表示 QUIC 为同一个 stream id 提供两个发送方向，不表示两端能在同一条流上
+各自再创建一次交换：
+
+- client-initiated bidi stream 承载客户端发起的请求；Gateway 在反向半边返回应用帧或空 FIN；
+- server-initiated bidi stream 承载 Gateway 发起的推送/控制；客户端在反向半边只能空 FIN；
+- 客户端若在 Gateway 发起的流上发送应用字节，属于连接级协议违规；
+- 单向流没有 Lyune 应用语义，传输参数默认不给额度，入口仍失败关闭以防对端违规发送。
+
+因此 Exchange 状态永远由**发起这一轮 OPEN 的一端**保存。流的另一半是响应通道，不是第二个
+Exchange。这个约束消除了“同一个 stream id 上两轮 OPEN 互相覆盖”的状态歧义。
+
+### 4.6 QUIC 流取消不是应用 EOF
+
+QUIC 的两个取消信号作用于不同方向，网关必须分别处理：
+
+- 客户端发 `RESET_STREAM`：取消客户端 → Gateway 的输入。请求尚未完整提交时，Gateway
+  取消对应后端输入并清理 Exchange；若应用 EOF 已经提交，副作用可能已经发生，响应仍可返回。
+- 客户端发 `STOP_SENDING`：取消 Gateway → 客户端的返回。Gateway 不回滚已经提交的请求，
+  只把该 Exchange 的响应目标切换为 discard，并把停止信号传播到对应后端流。
+- 后端对流发 reset/stop：`DirectTransport` 必须把事件连同后端连接和 stream id 交给 Worker，
+  Worker 再精确终止对应客户端流，不能把取消静默退化成客户端 deadline。
+
+应用 `eof`/QUIC FIN 表示正常完整结束；reset/stop 表示取消。两者不能互换，否则接收方会把
+半条流当作完整业务输入，或者让已取消交换继续占用 inflight 与接收槽位。
 
 ---
 
@@ -257,8 +294,7 @@ body 前缀**与 `.peer` 完全同形**：`count (u16) + group_id[count] (每个
   的记账，让目标 Worker 从帧里读它就等于把内部状态暴露成协议字段，而后端可以伪造它。
 - **跨节点用一条专属流**，因为对等链路本来就是 QUIC：一条流天然就是一个会话，接收节点
   看到的形态与后端直连时完全一样（OPEN 然后 DATA），`openPeerNodeExchange` 不需要认识
-  "会话"这个概念。**帧头里没有 8 字节可用**（只有一个保留字节，realm 提示已经占了两个），
-  所以想在跨节点这一跳塞会话号本来也塞不进去——这个约束反过来指向了正确答案。
+  "会话"这个概念。会话身份属于传输层信封，不应挤进已经定型的应用帧头。
 - **客户端侧一条专属推送流**，因为客户端要能重组：同一会话的分片必须按序到达同一条流，
   这和 `.service` 的响应形态一致，客户端不需要为推送再学一套规则。
 - **每 Worker 一张很小的会话表**（会话号 → 冻结下来的目标集合），而**不是**每连接一张。
@@ -559,17 +595,24 @@ QUIC datagram 回调
 
 | 控制类型                     | body                               | 作用                 |
 | ---------------------------- | ---------------------------------- | -------------------- |
-| `kick_off`                   | `TargetList` of `conn_token`       | 断开指定的那几条连接 |
-| `join_group` / `leave_group` | `group_id` + `TargetList` of token | 维护组播组成员       |
+| `kick_off`                   | `TokenList` of `conn_token`        | 断开指定的那几条连接 |
+| `join_group` / `leave_group` | `group_id` + `TokenList`           | 维护组播组成员       |
 
 三者都按 **`conn_token`** 而不是 `dest_id` 定位，理由相同：`dest_id` 是一对多的（§5.6），
 而"换设备登录只踢旧设备"、"这台设备打开了这个文档"都必须精确到一条连接。后端在认证时
-就拿到了 `conn_token`（§10.3 的 `AuthContext`），本来就要为 kick 存着它。
+就拿到了 `conn_token`（§10.4 的 `AuthContext`），本来就要为 kick 存着它。
 
-`conn_token` **自带位置**（`node_id | worker_id | slot | generation`），所以这三种指令的
+`conn_token` **自带位置与进程身份**（`incarnation | node_id | worker_id | slot | generation`），所以这三种指令的
 寻址是精确的：既不需要算 home，也不需要广播。这是 §8.4「两跳都不知道」的破解口——
 它们的前提是连接**已经认证过**，那一刻网关完全知道"我在哪"，只要说出来就行。
 CID 不能事后重贴，token 可以。
+
+线格式是大端 u128（16 字节）：byte 0–7 `incarnation:u64`、8–9 `node_id:u16`、
+10 `worker_id:u8`、11–13 `slot:u24`、14–15 `generation:u16`。后端必须按不透明
+16 字节 BLOB 保存，不能转成 JSON number 或 64 位整数。
+`generation` 防止同一进程内槽位复用产生 ABA；随机 `incarnation` 防止 Gateway 重启后
+node/worker/slot/generation 从初值重新出现。两者缺一，迟到的 kick 或旧 presence 都可能
+误命中新进程中的另一条连接。
 
 两条必须一起成立的约束：
 
@@ -1140,6 +1183,41 @@ N 条连接，亲和会把一个账号的所有设备钉在同一个 Worker 上�
 realm 身份（§12.2、§12.3）。接入方在自己的命名空间里怎么分配 `dest_id` 是它的自由。
 
 `auth_failure` 的 body 仍然是纯文本原因，没有前缀——失败路径不需要这两个字段。
+
+### 10.4 auth_request 的 Gateway 上下文前缀
+
+客户端的认证 body 对 Gateway 不透明；转发给认证服务前，Gateway 插入 18 字节前缀：
+
+```
+偏移  长度  字段
+0     2     realm (u16, 大端)，取自 TLS SNI 映射
+2     16    conn_token (u128, 大端)，本连接的不透明精确身份
+18    ..    客户端认证 body，原样保留
+```
+
+认证服务按 BLOB 保存 `conn_token`，以后用于精确 kick、连接级 presence 或组成员变更；它不解析
+token 内部位段。body 短于 18 字节的前缀必须拒绝，不能默认成 realm 0 或零 token。
+
+### 10.5 连接生命周期与多设备聚合
+
+认证成功后 Gateway 经配置的 lifecycle route 发送 `session_online`，连接结束发送
+`session_offline`；两者都是 `response_mode=none` 的单帧交换。在线事件每 15 秒续租，
+Reactor 默认租约 45 秒，因此 Gateway 崩溃来不及发 offline 时也能最终收敛。
+
+```
+偏移  长度  字段
+0     2     realm
+2     16    conn_token
+18    8     dest_id
+26    8     connected_at（Unix 秒，i64 位模式）
+34    8     occurred_at（Unix 秒，i64 位模式）
+42    8     sequence（同一 conn_token 严格递增）
+50    1     reason
+```
+
+生命周期事件各自使用独立 QUIC 流，跨流没有到达顺序保证；Reactor 必须用 `sequence` 拒绝
+迟到事件。Gateway 只报告单连接事实，用户是否在线由 Reactor 按 `(realm, dest_id)` 聚合所有
+仍在线且租约未过期的 `conn_token`。设备类型、主设备、last_seen 和账号级策略不进入 Gateway。
 
 ---
 

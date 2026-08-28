@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	ALPN        = "lyune/1"
+	ALPN        = "lyune/2"
 	MaxBodySize = 1<<16 - 1
 )
 
@@ -38,13 +38,21 @@ const (
 
 func (f Flags) IsEOF() bool { return f&FlagEOF != 0 }
 
+type ResponseMode uint8
+
+const (
+	ResponseRequired ResponseMode = 0x00
+	ResponseNone     ResponseMode = 0x01
+)
+
 type Header struct {
-	Type     FrameType `json:"type"`
-	Flags    Flags     `json:"flags"`
-	BodyLen  uint16    `json:"body_len"`
-	DestKind DestKind  `json:"dest_kind"`
-	Group    uint8     `json:"group"`
-	RouteKey uint8     `json:"route_key"`
+	Type     FrameType    `json:"type"`
+	Flags    Flags        `json:"flags"`
+	BodyLen  uint16       `json:"body_len"`
+	DestKind DestKind     `json:"dest_kind"`
+	Response ResponseMode `json:"response_mode"`
+	Group    uint8        `json:"group"`
+	RouteKey uint8        `json:"route_key"`
 }
 
 type Frame struct {
@@ -55,16 +63,19 @@ type Frame struct {
 var (
 	ErrUnknownFrameType = errors.New("unknown frame type")
 	ErrUnknownDestKind  = errors.New("unknown destination kind")
+	ErrUnknownResponse  = errors.New("unknown response mode")
 	ErrReservedBits     = errors.New("reserved bits are set")
-	ErrReservedByte     = errors.New("reserved byte is non-zero")
 	ErrBodyTooLarge     = errors.New("frame body exceeds uint16")
 )
 
-func NewOpen(dest DestKind, group, routeKey uint8, flags Flags, body []byte) (*Frame, error) {
+func NewOpen(dest DestKind, group, routeKey uint8, response ResponseMode, flags Flags, body []byte) (*Frame, error) {
 	if len(body) > MaxBodySize {
 		return nil, ErrBodyTooLarge
 	}
 	if err := validateDest(dest); err != nil {
+		return nil, err
+	}
+	if err := validateResponse(response); err != nil {
 		return nil, err
 	}
 	return &Frame{
@@ -73,6 +84,7 @@ func NewOpen(dest DestKind, group, routeKey uint8, flags Flags, body []byte) (*F
 			Flags:    flags,
 			BodyLen:  uint16(len(body)),
 			DestKind: dest,
+			Response: response,
 			Group:    group,
 			RouteKey: routeKey,
 		},
@@ -112,8 +124,9 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 		if err := validateDest(header.DestKind); err != nil {
 			return nil, err
 		}
-		if suffix[1] != 0 {
-			return nil, ErrReservedByte
+		header.Response = ResponseMode(suffix[1])
+		if err := validateResponse(header.Response); err != nil {
+			return nil, err
 		}
 		header.Group = suffix[2]
 		header.RouteKey = suffix[3]
@@ -153,6 +166,10 @@ func WriteFrame(w io.Writer, frame *Frame) error {
 	binary.BigEndian.PutUint16(header[2:4], uint16(len(frame.Body)))
 	if frame.Header.Type == FrameOpen {
 		header[4] = byte(frame.Header.DestKind)
+		if err := validateResponse(frame.Header.Response); err != nil {
+			return err
+		}
+		header[5] = byte(frame.Header.Response)
 		header[6] = frame.Header.Group
 		header[7] = frame.Header.RouteKey
 	}
@@ -172,6 +189,15 @@ func validateDest(dest DestKind) error {
 		return nil
 	default:
 		return fmt.Errorf("%w: 0x%02x", ErrUnknownDestKind, dest)
+	}
+}
+
+func validateResponse(response ResponseMode) error {
+	switch response {
+	case ResponseRequired, ResponseNone:
+		return nil
+	default:
+		return fmt.Errorf("%w: 0x%02x", ErrUnknownResponse, response)
 	}
 }
 

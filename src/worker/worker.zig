@@ -46,6 +46,7 @@ const egress = @import("egress.zig");
 const peer_link = @import("peer_link.zig");
 const push_session = @import("push_session.zig");
 const auth = @import("auth.zig");
+const lifecycle = @import("lifecycle.zig");
 
 const codec = protocol.codec;
 
@@ -54,6 +55,14 @@ pub const AuthPolicy = auth.Policy;
 
 /// drain 等待上限：即使 QUIC 空闲超时配得很大，停机也不应无限期挂着。
 const max_drain_timeout_us: u64 = 60 * std.time.us_per_s;
+const metrics_interval_us: u64 = 60 * std.time.us_per_s;
+/// 后端连接的主动维护周期。
+///
+/// DirectTransport 自己保留精确的指数退避状态；Worker 这里只需低频唤醒每条路由，
+/// 让已经到达 retry_at 的连接重新发起握手。若只在真实请求到来时唤醒，后端恢复后
+/// 每条路由都会先牺牲一个请求来触发重连。1 秒既把恢复延迟限定在秒级，又避免把
+/// 空闲路径重新变成每 10ms 遍历全部路由。
+const backend_maintenance_interval_us: u64 = std.time.us_per_s;
 
 /// 成员变更后双查窗口的长度（微秒）。
 ///
@@ -122,6 +131,9 @@ pub const GatewayWorker = struct {
     /// 必须留着：每轮有限额，从 0 重新开始的话后半张表永远轮不到，那些连接会一直
     /// 留在错位置上。
     rehome_cursor: usize = 0,
+    /// 准入过期巡检游标；与 rehome 分开，两个低频任务互不影响推进速度。
+    admission_cursor: usize = 0,
+    lifecycle_cursor: usize = 0,
     /// 本节点对客户端提供服务的端口。
     ///
     /// 重定向帧要告诉客户端"去连节点 B 的哪个地址"，而 membership 给出的是 gossip
@@ -177,7 +189,7 @@ pub const GatewayWorker = struct {
     egress: egress.Egress,
     /// 转发 `auth_request` 时重编帧用的缓冲。
     ///
-    /// 网关要在 body 前面插入 `AuthContext` 前缀（§10.3），长度变了就必须重编帧头。
+    /// 网关要在 body 前面插入 `AuthContext` 前缀（§10.4），长度变了就必须重编帧头。
     /// 启动期一次分配、之后复用：一帧最坏 64KB，放栈上会炸栈，每次现分配又违背
     /// 运行期零分配。认证是每条连接一次的低频路径，一块缓冲足够。
     auth_scratch: []u8,
@@ -221,6 +233,10 @@ pub const GatewayWorker = struct {
     /// 取 QUIC 空闲超时：存量连接最多再存活这么久，等满一个空闲超时即可
     /// 认为存量已自然收敛，因此不需要额外的配置项。上限见 max_drain_timeout_us。
     drain_timeout_us: u64,
+    /// 上次输出线程本地资源快照的单调时钟；0 表示启动后尚未输出。
+    last_metrics_at_us: u64 = 0,
+    /// 上次主动推进后端重连状态机的时刻。
+    last_backend_maintenance_at_us: u64 = 0,
 
     /// 创建 Worker 实例：建好事件循环、Driver、交接唤醒句柄与后端轮询定时器，但不启动任何东西。
     ///
@@ -434,6 +450,7 @@ pub const GatewayWorker = struct {
 
         // 1. 注册业务回调到 Driver
         self.server_driver.setCallbacks(self, handleNewConnection, ingress.handleStreamData, handleConnectionClose);
+        self.server_driver.setStreamControlCallback(ingress.handleStreamControl);
         // 不可靠通路只对客户端开放（设计文档 §6）。集群监听器刻意不注册它：跨节点那一跳
         // 走的是对等链路上的可靠 `.multicast` 帧，由收方节点在本地再落成 datagram。
         self.server_driver.setDatagramCallback(ingress.handleDatagram);
@@ -443,6 +460,7 @@ pub const GatewayWorker = struct {
         // conn_manager 里查上下文，不关心连接是从哪个监听器进来的。
         if (self.peer_driver) |*driver| {
             driver.setCallbacks(self, handlePeerConnection, ingress.handleStreamData, handleConnectionClose);
+            driver.setStreamControlCallback(ingress.handleStreamControl);
         }
 
         // 2. 启动 Driver (非阻塞)
@@ -580,6 +598,29 @@ pub const GatewayWorker = struct {
         }
     }
 
+    /// 低频推进全部已注册 transport 的重连状态机。
+    ///
+    /// callback 刻意传 null：启动阶段只登记一次可观测回调；维护阶段若在 connecting
+    /// 状态反复登记，会让等待列表随轮询次数增长。DirectTransport.resolve 对 ready /
+    /// connecting / 尚在退避期的连接都是无副作用检查。
+    fn maintainBackendConnections(self: *Self, now: u64) void {
+        if (self.last_backend_maintenance_at_us != 0 and
+            now -| self.last_backend_maintenance_at_us < backend_maintenance_interval_us)
+        {
+            return;
+        }
+        self.last_backend_maintenance_at_us = now;
+        self.maintainPathTransports(.direct);
+        self.maintainPathTransports(.relay);
+    }
+
+    fn maintainPathTransports(self: *Self, path: TransportPath) void {
+        var it = self.transport_registry.iterator(path);
+        while (it.next()) |entry| {
+            entry.value_ptr.resolve(entry.key_ptr.route, null, null);
+        }
+    }
+
     // ========================================================================
     // 业务逻辑回调 (由 Driver 触发)
     // ========================================================================
@@ -653,7 +694,15 @@ pub const GatewayWorker = struct {
 
         // 客户端走了，但它开着的交换在后端还等着结束标记。不主动 fin 的话
         // 这些流会一直挂到后端超时，高并发下持续占用后端的流配额。
-        if (self.conn_manager.get(conn)) |ctx| self.finishOpenExchanges(ctx);
+        if (self.conn_manager.get(conn)) |ctx| {
+            const reason = ctx.offline_reason orelse switch (event) {
+                .application_close => protocol.body.SessionLifecycle.Reason.application_closed,
+                .stateless_reset => .stateless_reset,
+                else => .transport_closed,
+            };
+            lifecycle.publishOffline(self, ctx, reason);
+            self.finishOpenExchanges(ctx);
+        }
 
         // 必须先回收在途后端映射，再从管理器移除。picoquic 在本回调返回后
         // 会释放连接对象，残留条目会让回程路径拿到野指针。
@@ -664,7 +713,7 @@ pub const GatewayWorker = struct {
 
     /// 把一条连接上还没收尾的交换逐条结束掉。
     fn finishOpenExchanges(self: *Self, ctx: *ConnectionContext) void {
-        var it = ctx.exchanges.valueIterator();
+        var it = ctx.inbound_exchanges.valueIterator();
         while (it.next()) |entry| {
             if (entry.backend) |stream| self.finishBackendStream(stream);
         }
@@ -692,8 +741,7 @@ pub const GatewayWorker = struct {
         // 都经由这一个池，所以"池空"就等价于"两条路径都没东西"，判据是精确的。
         if (self.backend_pool) |shared| {
             if (shared.idle()) {
-                self.inflight.purgeExpired(quic.c.currentTime());
-                return false;
+                return self.expireInflight(quic.c.currentTime());
             }
         }
 
@@ -702,8 +750,52 @@ pub const GatewayWorker = struct {
 
         // 已经进入接收队列的响应也是活动。先让 drainTransport 刷新对应映射，再扫描，
         // 避免一个刚在 deadline 前到达的响应因轮询顺序被误判为空闲。
-        self.inflight.purgeExpired(quic.c.currentTime());
+        _ = self.expireInflight(quic.c.currentTime());
         return true;
+    }
+
+    /// 后端没有任何可读事件时，连接层未必能立刻知道对端进程已经消失：请求可能已被
+    /// ACK，但应用响应永远不会到来。到达 inflight deadline 后必须主动结束客户端流，
+    /// 而不是只删映射让客户端继续挂到自己的超时。
+    fn expireInflight(self: *Self, now: u64) bool {
+        if (!self.inflight.expirationDue(now)) return false;
+
+        var expired_any = false;
+        var routes: [64]inflight.ExpiredRoute = undefined;
+        while (true) {
+            const count = self.inflight.takeExpiredRoutes(now, &routes);
+            if (count != 0) expired_any = true;
+            for (routes[0..count]) |expired| {
+                switch (expired.route.target) {
+                    .client => |target| self.replyControl(target.cnx, target.stream_id, .gateway_error, "backend response timeout"),
+                    .discard => {},
+                }
+                if (self.transport_registry.findById(expired.key.transport)) |transport| {
+                    transport.invalidateStream(expired.key.stream);
+                }
+            }
+            if (count < routes.len) break;
+        }
+
+        var auths: [64]inflight.ExpiredAuth = undefined;
+        while (true) {
+            const count = self.inflight.takeExpiredAuths(now, &auths);
+            if (count != 0) expired_any = true;
+            for (auths[0..count]) |expired| {
+                var pending = expired.pending;
+                if (!pending.response_suppressed) {
+                    self.replyControl(pending.client_cnx, pending.client_stream_id, .auth_failure, "authentication backend timeout");
+                }
+                pending.buffer.deinit(self.allocator);
+                if (self.transport_registry.findById(expired.key.transport)) |transport| {
+                    transport.invalidateStream(expired.key.stream);
+                }
+            }
+            if (count < auths.len) break;
+        }
+
+        self.inflight.refreshExpiryDeadline();
+        return expired_any;
     }
 
     fn drainTransportPath(self: *Self, path: TransportPath) void {
@@ -740,6 +832,11 @@ pub const GatewayWorker = struct {
             // 句柄只在这个 transport 实例内部唯一，查表必须用带实例身份的复合键。
             const key = inflight.StreamKey{ .transport = transport.id(), .stream = event.stream_id };
 
+            if (event.kind != .data) {
+                self.handleBackendStreamControl(key, event);
+                continue;
+            }
+
             if (self.inflight.hasAuth(key)) {
                 auth.collectAuthResponse(self, key, event.data, event.is_fin);
                 continue;
@@ -754,20 +851,25 @@ pub const GatewayWorker = struct {
                 continue;
             };
 
-            // 客户端可能在后端响应到达前就断开。此时 picoquic 已释放该连接对象，
-            // 必须确认它仍在管理器中，否则会把野指针交给 picoquic_add_to_stream。
-            if (self.conn_manager.getByHandle(route.client_cnx) == null) {
-                std.log.warn("[ROUTE] client gone before backend response: backend_stream={}", .{event.stream_id});
-                self.inflight.closeRoute(key);
-                continue;
-            }
+            switch (route.target) {
+                .discard => {},
+                .client => |target| {
+                    // 客户端可能在后端响应到达前就断开。此时 picoquic 已释放该连接对象，
+                    // 必须确认它仍在管理器中，否则会把野指针交给 picoquic_add_to_stream。
+                    if (self.conn_manager.getByHandle(target.cnx) == null) {
+                        std.log.warn("[ROUTE] client gone before backend response: backend_stream={}", .{event.stream_id});
+                        self.inflight.closeRoute(key);
+                        continue;
+                    }
 
-            var client_conn = QUICConnection.fromRaw(route.client_cnx);
-            client_conn.streamWrite(route.client_stream_id, event.data, event.is_fin) catch |err| {
-                err_handler.reportError(.session, "Failed to write backend response to client", err);
-                self.inflight.closeRoute(key);
-                continue;
-            };
+                    var client_conn = QUICConnection.fromRaw(target.cnx);
+                    client_conn.streamWrite(target.stream_id, event.data, event.is_fin) catch |err| {
+                        err_handler.reportError(.session, "Failed to write backend response to client", err);
+                        self.inflight.closeRoute(key);
+                        continue;
+                    };
+                },
+            }
 
             if (event.is_fin) {
                 self.inflight.closeRoute(key);
@@ -775,6 +877,40 @@ pub const GatewayWorker = struct {
                 // 成功写回一个完整后端事件才刷新；发送失败会走上面的关闭分支。
                 _ = self.inflight.touchRoute(key, quic.c.currentTime());
             }
+        }
+    }
+
+    /// 后端对单条流做了异常终止。它是这个交换的局部失败，不应放大成整条后端连接
+    /// 故障；同时也绝不能伪装成正常空 FIN，否则 required 请求会被误判成功。
+    fn handleBackendStreamControl(self: *Self, key: inflight.StreamKey, event: backend.transport.TransportRecv) void {
+        const reason = switch (event.kind) {
+            .stream_reset => "backend reset stream",
+            .stop_sending => "backend stopped request stream",
+            .data => unreachable,
+        };
+
+        if (self.inflight.takeAuth(key)) |pending_value| {
+            var pending = pending_value;
+            if (!pending.response_suppressed) {
+                self.replyControl(pending.client_cnx, pending.client_stream_id, .auth_failure, reason);
+            }
+            pending.buffer.deinit(self.allocator);
+            return;
+        }
+
+        if (self.inflight.lookupRoute(key)) |route| {
+            switch (route.target) {
+                .client => |target| self.replyControl(target.cnx, target.stream_id, .gateway_error, reason),
+                .discard => {},
+            }
+            self.inflight.closeRoute(key);
+            return;
+        }
+
+        if (event.peer_initiated) {
+            egress.abortBackendPush(self, key);
+        } else {
+            std.log.warn("[ROUTE] control event for orphan backend stream={}", .{event.stream_id});
         }
     }
 
@@ -788,9 +924,10 @@ pub const GatewayWorker = struct {
         var routes: [64]inflight.Route = undefined;
         while (true) {
             const count = self.inflight.takeFailedRoutes(transport.id(), selector, &routes);
-            for (routes[0..count]) |route| {
-                self.replyControl(route.client_cnx, route.client_stream_id, .gateway_error, "backend connection failed");
-            }
+            for (routes[0..count]) |route| switch (route.target) {
+                .client => |target| self.replyControl(target.cnx, target.stream_id, .gateway_error, "backend connection failed"),
+                .discard => {},
+            };
             if (count < routes.len) break;
         }
 
@@ -799,7 +936,9 @@ pub const GatewayWorker = struct {
             const count = self.inflight.takeFailedAuths(transport.id(), selector, &auths);
             for (auths[0..count]) |pending_value| {
                 var pending = pending_value;
-                self.replyControl(pending.client_cnx, pending.client_stream_id, .auth_failure, "authentication backend failed");
+                if (!pending.response_suppressed) {
+                    self.replyControl(pending.client_cnx, pending.client_stream_id, .auth_failure, "authentication backend failed");
+                }
                 pending.buffer.deinit(self.allocator);
             }
             if (count < auths.len) break;
@@ -824,10 +963,26 @@ pub const GatewayWorker = struct {
             self.replyControl(ctx.cnx_handle, client_stream_id, .gateway_error, "unknown control type");
             return;
         };
+
+        // 控制操作的返回契约是协议的一部分，而不是由实现碰巧决定：断开只触发连接
+        // 关闭，不产生应用响应；其余客户端控制操作都必须拿到明确结果。模式不匹配是
+        // 一次合法编码但不可执行的请求，因此回业务错误，不升级为连接级协议违规。
+        const expected_mode: protocol.frame.ResponseMode = if (ctrl == .disconnect) .none else .required;
+        if (parsed.header.response_mode != expected_mode) {
+            const message = if (expected_mode == .none)
+                "control requires response_mode=none"
+            else
+                "control requires response_mode=required";
+            self.replyControl(ctx.cnx_handle, client_stream_id, .gateway_error, message);
+            return;
+        }
         switch (ctrl) {
             .heartbeat => self.replyControl(ctx.cnx_handle, client_stream_id, .heartbeat_ack, &.{}),
             .ping => self.replyControl(ctx.cnx_handle, client_stream_id, .pong, parsed.body),
-            .disconnect => ctx.close_requested = true,
+            .disconnect => {
+                ctx.offline_reason = .client_disconnect;
+                ctx.close_requested = true;
+            },
             .bind_channel => ingress.bindChannel(self, ctx, client_stream_id, parsed),
             .unbind_channel => ingress.unbindChannel(self, ctx, client_stream_id, parsed),
             .auth_request => auth.delegateAuth(self, ctx, client_stream_id, parsed),
@@ -854,6 +1009,23 @@ pub const GatewayWorker = struct {
         conn.streamWrite(stream_id, data, true) catch |err| {
             err_handler.reportError(.session, "Failed to write control frame to client", err);
         };
+    }
+
+    /// 成功接纳一个 `ResponseMode.none` 请求后关闭返回方向，不发送应用帧。
+    ///
+    /// 空 FIN 是传输层收尾，不是业务确认：它只表示认证、路由、配额检查已经通过，
+    /// 请求也已交给 BackendTransport。后端是否完成业务处理不会再回到客户端。
+    pub fn finishResponseWithoutPayload(self: *Self, cnx: quic.c.QuicCnx, stream_id: u64) void {
+        if (self.conn_manager.getByHandle(cnx) == null) return;
+        var conn = QUICConnection.fromRaw(cnx);
+        conn.streamWrite(stream_id, &.{}, true) catch |err| {
+            err_handler.reportError(.session, "Failed to finish no-response exchange", err);
+        };
+    }
+
+    /// 吊销连接准入并发布一次连接级 offline；用户级多设备聚合不在 Gateway。
+    pub fn revokeAdmission(self: *Self, ctx: *ConnectionContext, reason: protocol.body.SessionLifecycle.Reason) void {
+        lifecycle.revokeAdmission(self, ctx, reason);
     }
 
     /// 武装一次性的后端轮询定时器；每轮回调末尾自己续期。
@@ -885,7 +1057,11 @@ pub const GatewayWorker = struct {
         if (!self.running.load(.acquire)) return .disarm;
 
         const now = quic.c.currentTime();
+        self.logMetrics(now);
+        self.maintainBackendConnections(now);
         self.refreshPlacement(now);
+        self.expireAdmissions(now);
+        self.refreshLifecycleLeases(now);
         self.rehomeDrifted();
         // 后端响应由独立的 UDP client + 本定时器收割，不经过面向客户端的
         // ServerDriver 收包回调。因此 streamWrite 之后必须显式驱动一次服务端
@@ -901,6 +1077,36 @@ pub const GatewayWorker = struct {
             self.scheduleBackendPoll(self.backend_poll_interval_ms);
         }
         return .disarm;
+    }
+
+    /// 每分钟一条稳定、低基数的资源快照，供 soak 与现场诊断判断状态是否在请求结束后
+    /// 回到基线。它只读取当前 Worker 的线程本地计数，不需要锁，也不暴露管理端口。
+    fn logMetrics(self: *Self, now: u64) void {
+        if (self.last_metrics_at_us != 0 and now -| self.last_metrics_at_us < metrics_interval_us) return;
+        self.last_metrics_at_us = now;
+
+        const clients = self.conn_manager.stats();
+        const pool_stats = if (self.backend_pool) |pool| pool.stats() else backend.BackendPool.Stats{
+            .connections = 0,
+            .recv_slots_used = 0,
+            .recv_slots_capacity = 0,
+            .pending_failures = 0,
+        };
+        std.log.info(
+            "[METRICS] worker={} clients={} exchanges={} frame_spills={} inflight_routes={} inflight_auth={} backend_connections={} recv_slots={}/{} pending_backend_failures={}",
+            .{
+                self.conn_manager.workerId(),
+                clients.connections,
+                clients.exchanges,
+                clients.frame_spills,
+                self.inflight.routeCount(),
+                self.inflight.authCount(),
+                pool_stats.connections,
+                pool_stats.recv_slots_used,
+                pool_stats.recv_slots_capacity,
+                pool_stats.pending_failures,
+            },
+        );
     }
 
     /// 后端 transport 解析/建连结果的回调，只记日志。
@@ -1043,6 +1249,38 @@ pub const GatewayWorker = struct {
 
         if (moved != 0) {
             std.log.info("[PLACE] re-homed {} drifted connection(s)", .{moved});
+        }
+    }
+
+    /// 分批吊销已经超过认证 TTL 的连接。QUIC 连接保持打开，客户端可以原地重新认证；
+    /// 但过期以后不再可寻址，也不能继续发送业务流或 datagram。
+    fn expireAdmissions(self: *Self, now: u64) void {
+        var checked: usize = 0;
+        while (checked < rehome_per_tick) : (checked += 1) {
+            const live = self.conn_manager.nextLive(self.admission_cursor) orelse {
+                self.admission_cursor = 0;
+                return;
+            };
+            self.admission_cursor = live.index + 1;
+            const ctx = live.ctx;
+            if (ctx.peer_node or !ctx.authenticated or ctx.auth_expires_at == 0) continue;
+            if (now < ctx.auth_expires_at) continue;
+            self.revokeAdmission(ctx, .admission_expired);
+        }
+    }
+
+    /// 分批刷新连接级在线租约。与 TTL 巡检使用独立游标，避免连接数很大时两类扫描
+    /// 互相改变进度；每 tick 固定预算，刷新成本不会形成事件循环长尾。
+    fn refreshLifecycleLeases(self: *Self, now: u64) void {
+        var checked: usize = 0;
+        while (checked < rehome_per_tick) : (checked += 1) {
+            const live = self.conn_manager.nextLive(self.lifecycle_cursor) orelse {
+                self.lifecycle_cursor = 0;
+                return;
+            };
+            self.lifecycle_cursor = live.index + 1;
+            if (live.ctx.peer_node) continue;
+            lifecycle.refreshOnline(self, live.ctx, now);
         }
     }
 
@@ -1192,14 +1430,14 @@ test "one exchange rides one backend stream and finishes on eof" {
     var buf: [128]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
 
-    const open = try encoder.encodeOpen(.service, test_route, .{}, "head");
+    const open = try encoder.encodeOpen(.service, test_route, .required, .{}, "head");
     try std.testing.expectEqual(
         ingress.FrameOutcome.continue_stream,
         ingress.dispatchFrame(&worker, &ctx, client_stream, try codec.parseExactFrame(open)),
     );
     try std.testing.expectEqual(@as(usize, 1), recorder.opened);
     try std.testing.expectEqual(@as(usize, 0), recorder.fins);
-    try std.testing.expectEqual(StreamRecorder.opened_handle, ctx.exchange(client_stream).?.backend.?.key.stream);
+    try std.testing.expectEqual(StreamRecorder.opened_handle, ctx.inboundExchange(client_stream).?.backend.?.key.stream);
 
     const middle = try encoder.encodeData(.{}, "body");
     _ = ingress.dispatchFrame(&worker, &ctx, client_stream, try codec.parseExactFrame(middle));
@@ -1215,8 +1453,8 @@ test "one exchange rides one backend stream and finishes on eof" {
 
     // eof 之后句柄就该丢掉（后端流已 fin），但条目留着当"这条流用过了"的凭据；
     // 回程映射也要留着等后端响应，且只登记一次。
-    const finished = ctx.exchange(client_stream).?;
-    try std.testing.expect(finished.completed);
+    const finished = ctx.inboundExchange(client_stream).?;
+    try std.testing.expect(finished.input_complete);
     try std.testing.expect(finished.backend == null);
     try std.testing.expectEqual(@as(u32, 1), worker.inflight.routeCount());
 }
@@ -1244,7 +1482,7 @@ test "a frame after eof closes the connection" {
     var encoder = codec.FrameEncoder.init(&buf);
 
     // 一次性交换：OPEN 直接带 eof，开流并 fin。
-    const once = try encoder.encodeOpen(.service, test_route, protocol.frame.Flags.last(), "only");
+    const once = try encoder.encodeOpen(.service, test_route, .required, protocol.frame.Flags.last(), "only");
     _ = ingress.dispatchFrame(&worker, &ctx, 4, try codec.parseExactFrame(once));
     try std.testing.expectEqual(@as(usize, 1), recorder.opened);
     try std.testing.expectEqual(@as(usize, 1), recorder.fins);
@@ -1278,11 +1516,11 @@ test "a second OPEN on a live stream closes the connection" {
     var buf: [128]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
 
-    const first = try encoder.encodeOpen(.service, test_route, .{}, "head");
+    const first = try encoder.encodeOpen(.service, test_route, .required, .{}, "head");
     _ = ingress.dispatchFrame(&worker, &ctx, 4, try codec.parseExactFrame(first));
     try std.testing.expectEqual(@as(usize, 1), recorder.opened);
 
-    const second = try encoder.encodeOpen(.service, test_route, .{}, "again");
+    const second = try encoder.encodeOpen(.service, test_route, .required, .{}, "again");
     try std.testing.expectEqual(
         ingress.FrameOutcome.close_connection,
         ingress.dispatchFrame(&worker, &ctx, 4, try codec.parseExactFrame(second)),
@@ -1315,7 +1553,7 @@ test "a client may not address peers or multicast groups" {
     var encoder = codec.FrameEncoder.init(&buf);
 
     inline for ([_]protocol.frame.DestKind{ .peer, .multicast }, 0..) |dest, i| {
-        const frame_data = try encoder.encodeOpen(dest, test_route, protocol.frame.Flags.last(), "blast");
+        const frame_data = try encoder.encodeOpen(dest, test_route, .required, protocol.frame.Flags.last(), "blast");
         try std.testing.expectEqual(
             ingress.FrameOutcome.close_connection,
             ingress.dispatchFrame(&worker, &ctx, 4 + i * 4, try codec.parseExactFrame(frame_data)),
@@ -1357,7 +1595,7 @@ test "a DATA frame with no live exchange is dropped, not escalated" {
     );
     try std.testing.expectEqual(@as(usize, 0), recorder.opened);
     try std.testing.expectEqual(@as(usize, 0), recorder.appended);
-    try std.testing.expect(ctx.exchange(8) == null);
+    try std.testing.expect(ctx.inboundExchange(8) == null);
     try std.testing.expectEqual(@as(u32, 0), worker.inflight.routeCount());
 }
 
@@ -1391,8 +1629,8 @@ test "a control exchange is handled locally and still leaves a record" {
         ingress.dispatchFrame(&worker, &ctx, 4, try codec.parseExactFrame(heartbeat)),
     );
     try std.testing.expectEqual(@as(usize, 0), recorder.opened);
-    try std.testing.expect(ctx.exchange(4).?.completed);
-    try std.testing.expect(ctx.exchange(4).?.backend == null);
+    try std.testing.expect(ctx.inboundExchange(4).?.input_complete);
+    try std.testing.expect(ctx.inboundExchange(4).?.backend == null);
 
     // 同一条流上再来一个控制交换必须被判违规。
     const again = try encoder.encodeHeartbeat();
@@ -1423,7 +1661,7 @@ test "an unknown route fails the exchange without touching the connection" {
 
     var buf: [128]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
-    const stray = try encoder.encodeOpen(.service, RouteId.init(0x99, 0x99), protocol.frame.Flags.last(), "nowhere");
+    const stray = try encoder.encodeOpen(.service, RouteId.init(0x99, 0x99), .required, protocol.frame.Flags.last(), "nowhere");
 
     try std.testing.expectEqual(
         ingress.FrameOutcome.continue_stream,
@@ -1431,7 +1669,7 @@ test "an unknown route fails the exchange without touching the connection" {
     );
     try std.testing.expectEqual(@as(usize, 0), recorder.opened);
     // 不留条目：后续分片会走"查不到交换"那条丢弃路径，而不是被判违规。
-    try std.testing.expect(ctx.exchange(4) == null);
+    try std.testing.expect(ctx.inboundExchange(4) == null);
 }
 
 /// 拼一个后端主动发起的 `.peer` 推送帧：目标列表前缀 + 负载。
@@ -1446,7 +1684,7 @@ fn testPushFrame(
     @memcpy(body_buf[list_len..][0..payload.len], payload);
 
     var encoder = codec.FrameEncoder.init(frame_buf);
-    return encoder.encodeOpen(.peer, .{}, flags, body_buf[0 .. list_len + payload.len]);
+    return encoder.encodeOpen(.peer, .{}, .none, flags, body_buf[0 .. list_len + payload.len]);
 }
 
 /// 拼一个后端 → 网关的控制帧：目标列表就是 conn_token 列表。
@@ -1458,10 +1696,10 @@ fn testControlFrame(
     frame_buf: []u8,
     body_buf: []u8,
     ctrl: protocol.frame.ControlType,
-    targets: []const u64,
+    targets: []const u128,
     flags: protocol.frame.Flags,
 ) ![]const u8 {
-    const list_len = try protocol.body.TargetList.encode(body_buf, targets);
+    const list_len = try protocol.body.TokenList.encode(body_buf, targets);
     var header = protocol.frame.FrameHeader.initControl(ctrl, @intCast(list_len));
     header.flags = flags;
 
@@ -1705,7 +1943,7 @@ test "a kick reports every target it could not reach" {
         &frame_buf,
         &body_buf,
         .kick_off,
-        &[_]u64{ elsewhere.encode(), stale.encode() },
+        &[_]u128{ elsewhere.encode(), stale.encode() },
         .{ .eof = true, .report = true },
     );
 
@@ -1716,7 +1954,7 @@ test "a kick reports every target it could not reach" {
     try std.testing.expectEqual(@as(?u64, backend_stream), recorder.last_handle);
 
     const report = try codec.parseExactFrame(recorder.lastWrite());
-    const missed = try protocol.body.TargetList.decode(report.body);
+    const missed = try protocol.body.TokenList.decode(report.body);
     try std.testing.expectEqual(@as(u16, 2), missed.count);
     try std.testing.expectEqual(elsewhere.encode(), missed.get(0));
     try std.testing.expectEqual(stale.encode(), missed.get(1));
@@ -1748,7 +1986,7 @@ test "a control type outside the backend whitelist is refused" {
         &frame_buf,
         &body_buf,
         .disconnect,
-        &[_]u64{1},
+        &[_]u128{1},
         .{ .eof = true, .report = true },
     );
 
@@ -1794,7 +2032,7 @@ test "a kick from another realm is refused and leaves the target admitted" {
         &frame_buf,
         &body_buf,
         .kick_off,
-        &[_]u64{token.encode()},
+        &[_]u128{token.encode()},
         .{ .eof = true, .report = true },
     );
 
@@ -1803,7 +2041,7 @@ test "a kick from another realm is refused and leaves the target admitted" {
 
     // 回报成"没踢到"。
     const report = try codec.parseExactFrame(recorder.lastWrite());
-    const missed = try protocol.body.TargetList.decode(report.body);
+    const missed = try protocol.body.TokenList.decode(report.body);
     try std.testing.expectEqual(@as(u16, 1), missed.count);
     try std.testing.expectEqual(token.encode(), missed.get(0));
 
@@ -1832,7 +2070,7 @@ test "a backend push addressed at a service is rejected" {
 
     var frame_buf: [256]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&frame_buf);
-    const push = try encoder.encodeOpen(.service, test_route, protocol.frame.Flags.last(), "nope");
+    const push = try encoder.encodeOpen(.service, test_route, .required, protocol.frame.Flags.last(), "nope");
 
     egress.handlePush(&worker, transport, test_realm, testPushEvent(0x11, push));
 
@@ -1852,7 +2090,7 @@ fn testMulticastFrame(
     @memcpy(body_buf[list_len..][0..payload.len], payload);
 
     var encoder = codec.FrameEncoder.init(frame_buf);
-    return encoder.encodeOpen(.multicast, .{}, flags, body_buf[0 .. list_len + payload.len]);
+    return encoder.encodeOpen(.multicast, .{}, .none, flags, body_buf[0 .. list_len + payload.len]);
 }
 
 /// 拼一个后端 → 网关的组成员变更帧。
@@ -1861,7 +2099,7 @@ fn testGroupFrame(
     body_buf: []u8,
     ctrl: protocol.frame.ControlType,
     group_id: u64,
-    members: []const u64,
+    members: []const u128,
 ) ![]const u8 {
     const body_len = try protocol.body.GroupBinding.encode(body_buf, group_id, members);
     var header = protocol.frame.FrameHeader.initControl(ctrl, @intCast(body_len));
@@ -1895,11 +2133,11 @@ test "a backend can put a connection into a multicast group" {
 
     var frame_buf: [256]u8 = undefined;
     var body_buf: [128]u8 = undefined;
-    const join = try testGroupFrame(&frame_buf, &body_buf, .join_group, 777, &[_]u64{token.encode()});
+    const join = try testGroupFrame(&frame_buf, &body_buf, .join_group, 777, &[_]u128{token.encode()});
     egress.handlePush(&worker, transport, test_realm, testPushEvent(0x31, join));
     try std.testing.expectEqual(@as(usize, 1), worker.conn_manager.groupCount(test_realm, 777));
 
-    const leave = try testGroupFrame(&frame_buf, &body_buf, .leave_group, 777, &[_]u64{token.encode()});
+    const leave = try testGroupFrame(&frame_buf, &body_buf, .leave_group, 777, &[_]u128{token.encode()});
     egress.handlePush(&worker, transport, test_realm, testPushEvent(0x35, leave));
     try std.testing.expectEqual(@as(usize, 0), worker.conn_manager.groupCount(test_realm, 777));
 }
@@ -1929,7 +2167,7 @@ test "a cross-realm group join is refused" {
 
     var frame_buf: [256]u8 = undefined;
     var body_buf: [128]u8 = undefined;
-    const join = try testGroupFrame(&frame_buf, &body_buf, .join_group, 777, &[_]u64{token.encode()});
+    const join = try testGroupFrame(&frame_buf, &body_buf, .join_group, 777, &[_]u128{token.encode()});
     // 从 realm 0（test_realm）的后端发来，目标在 realm 7。
     egress.handlePush(&worker, transport, test_realm, testPushEvent(0x39, join));
 
@@ -2124,7 +2362,7 @@ fn testPeerLinkFrame(
 
     var encoder = codec.FrameEncoder.init(frame_buf);
     const route = RouteId.init(@intCast(realm >> 8), @intCast(realm & 0xFF));
-    return encoder.encodeOpen(.peer, route, flags, body_buf[0 .. list_len + payload.len]);
+    return encoder.encodeOpen(.peer, route, .none, flags, body_buf[0 .. list_len + payload.len]);
 }
 
 // 对等节点连接的权限与客户端正好相反：它能投递，但不能请求。
@@ -2159,11 +2397,11 @@ test "a peer node may deliver but may not request" {
         ingress.dispatchFrame(&worker, &ctx, 4, try codec.parseExactFrame(delivery)),
     );
     // 没有登记交换：这一帧处理完这条流就结束了，留条目只会占额度。
-    try std.testing.expectEqual(@as(usize, 0), ctx.exchangeCount());
+    try std.testing.expectEqual(@as(usize, 0), ctx.inboundExchangeCount());
 
     // `.service` 越权：对等节点有自己的后端，借这条链路调别人的等于绕过路由与配额。
     var encoder = codec.FrameEncoder.init(&frame_buf);
-    const request = try encoder.encodeOpen(.service, test_route, protocol.frame.Flags.last(), "nope");
+    const request = try encoder.encodeOpen(.service, test_route, .required, protocol.frame.Flags.last(), "nope");
     try std.testing.expectEqual(
         ingress.FrameOutcome.close_connection,
         ingress.dispatchFrame(&worker, &ctx, 8, try codec.parseExactFrame(request)),
@@ -2299,7 +2537,7 @@ test "a peer node streaming session carries its id in the envelope, not the fram
     );
 
     try std.testing.expectEqual(@as(usize, 1), worker.egress.sessions.liveCount());
-    const session_id = ctx.exchange(4).?.push_session;
+    const session_id = ctx.inboundExchange(4).?.push_session;
     try std.testing.expect(session_id != 0);
 
     const first = coordinator.messageRouter().pop(1).?;
@@ -2320,8 +2558,8 @@ test "a peer node streaming session carries its id in the envelope, not the fram
     // eof 收掉会话；条目留着当"这条流用过了"的凭据，会话号清零，免得收尾路径
     // 再去作废一个已经正常结束的会话。
     try std.testing.expectEqual(@as(usize, 0), worker.egress.sessions.liveCount());
-    try std.testing.expectEqual(@as(u64, 0), ctx.exchange(4).?.push_session);
-    try std.testing.expect(ctx.exchange(4).?.completed);
+    try std.testing.expectEqual(@as(u64, 0), ctx.inboundExchange(4).?.push_session);
+    try std.testing.expect(ctx.inboundExchange(4).?.input_complete);
 }
 
 // 通道绑定的授权判据是"后端已经把你放进那个组"（设计文档 §6.1）。

@@ -3,11 +3,12 @@ package wire
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
 func TestRoundTripExchange(t *testing.T) {
-	open, _ := NewOpen(DestService, 1, 0, 0, []byte("first"))
+	open, _ := NewOpen(DestService, 1, 0, ResponseRequired, 0, []byte("first"))
 	data, _ := NewData(FlagEOF, []byte("last"))
 
 	var encoded bytes.Buffer
@@ -31,6 +32,29 @@ func TestRoundTripExchange(t *testing.T) {
 	}
 	if gotData.Header != data.Header || !bytes.Equal(gotData.Body, data.Body) {
 		t.Fatalf("DATA mismatch: got=%+v want=%+v", gotData, data)
+	}
+}
+
+func TestResponseNoneRoundTripAndValidation(t *testing.T) {
+	want, err := NewOpen(DestService, 1, 2, ResponseNone, FlagEOF, []byte("typing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := WriteFrame(&encoded, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadFrame(&encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Header.Response != ResponseNone {
+		t.Fatalf("response mode = %d, want none", got.Header.Response)
+	}
+
+	_, err = ReadFrame(bytes.NewReader([]byte{0x00, 0, 0, 0, 0x01, 2, 0, 0}))
+	if !errors.Is(err, ErrUnknownResponse) {
+		t.Fatalf("expected response mode error, got %v", err)
 	}
 }
 

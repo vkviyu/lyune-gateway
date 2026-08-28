@@ -64,15 +64,37 @@ pub const request_timeout_us: u64 = 60 * std.time.us_per_s;
 /// 都是低频路径，用一次全表扫描换热路径零分配是值得的。
 const purge_batch: usize = 64;
 
-/// 后端流 -> 客户端流的回程映射。
+/// 需要把后端响应写回的客户端流。
+pub const ClientResponse = struct {
+    cnx: quic.c.QuicCnx,
+    stream_id: u64,
+};
+
+/// 后端响应的去向。
+///
+/// `.discard` 用于 `ResponseMode.none`：Gateway 已用空 FIN 结束客户端方向，但仍需
+/// 跟踪后端流直到 FIN/失败/超时，避免把合法的收尾误记为孤儿响应，也避免后端流状态
+/// 无界增长。它不携带客户端句柄，因此后续失败不会被错误地写回一个已经结束的流。
+pub const ResponseTarget = union(enum) {
+    client: ClientResponse,
+    discard,
+};
+
+/// 后端流 -> 响应去向的回程映射。
 pub const Route = struct {
-    client_cnx: quic.c.QuicCnx,
-    client_stream_id: u64,
+    target: ResponseTarget,
     /// 发起这条请求的连接所属 realm；配额归还时从这里取（见文件开头）。
     realm: RealmId,
     /// 最近一次成功转发完整应用帧的时刻（微秒）。客户端上行和后端下行都会刷新；
     /// 后端不回包、双方都停止活动或 fin 丢失时，条目最终由空闲超时回收。
     last_active_at: u64,
+};
+
+/// 超时摘出的普通请求。key 仍需保留：Worker 用它找到 transport，并按后端流句柄
+/// 精确淘汰无响应的连接；Route 则决定是否以及向哪个客户端回错。
+pub const ExpiredRoute = struct {
+    key: StreamKey,
+    route: Route,
 };
 
 /// 已转发给认证服务、等待回包的认证请求。
@@ -85,6 +107,14 @@ pub const PendingAuth = struct {
     buffer: std.ArrayList(u8),
     /// 创建时刻（微秒），用于兜底过期。
     created_at: u64,
+    /// 客户端发来 STOP_SENDING 后仍要消费认证结果并完成准入状态变更，但不能再向
+    /// 那条流写响应。把它留在等待项里可避免把合法后端收尾误记为孤儿响应。
+    response_suppressed: bool = false,
+};
+
+pub const ExpiredAuth = struct {
+    key: StreamKey,
+    pending: PendingAuth,
 };
 
 /// 准入判定结果。
@@ -100,10 +130,20 @@ pub const Filter = union(enum) {
     /// 回收活动/创建时刻早于该 deadline 的条目。
     older_than: u64,
 
-    fn matches(self: Filter, cnx: quic.c.QuicCnx, timestamp: u64) bool {
+    fn matchesAuth(self: Filter, cnx: quic.c.QuicCnx, timestamp: u64) bool {
         return switch (self) {
             .connection => |target| cnx == target,
             .older_than => |deadline| timestamp < deadline,
+        };
+    }
+
+    fn matchesRoute(self: Filter, route: Route) bool {
+        return switch (self) {
+            .connection => |target| switch (route.target) {
+                .client => |client| client.cnx == target,
+                .discard => false,
+            },
+            .older_than => |deadline| route.last_active_at < deadline,
         };
     }
 };
@@ -125,9 +165,10 @@ pub const Tables = struct {
     /// 这个池更值得单独限：认证是连接建立的必经一步，被它挡住的表现是
     /// "整个 realm 谁都登录不上"。
     auth_quota: foundation.quota.Quota,
-    /// 上次执行过期回收的时刻（微秒）。
-    /// 用于把全表扫描摊薄到超时周期上，而不是跟随后端轮询频率。
-    last_purge_at: u64 = 0,
+    /// 当前已知的最早过期时刻。它可能因为条目被刷新或提前删除而偏早，但绝不偏晚：
+    /// 到点扫描后重新计算即可。这样既不会每个 backend poll 都扫全表，也不会因固定
+    /// 扫描相位把 60 秒超时放大到接近 120 秒。
+    next_expiry_at: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator) foundation.quota.Error!Tables {
         var route_quota = try foundation.quota.Quota.init(
@@ -172,14 +213,11 @@ pub const Tables = struct {
     // 回程映射
     // ========================================================================
 
-    /// 这个 realm 现在能否再登记一条回程映射；表已满时先做一次过期回收再复查。
-    ///
-    /// 回收必须在配额判定之前：它会归还计数，跳过就会把"刚腾出来的位置"判成超额。
+    /// 这个 realm 现在能否再登记一条回程映射。过期项由 Worker 的统一过期路径摘出并
+    /// 给客户端明确回错；这里不能为了腾位置静默删除，否则旧请求会一直等到自身 deadline。
     pub fn reserveRoute(self: *Tables, realm: RealmId, now: u64) Admit {
-        if (self.routes.count() >= max_requests) {
-            self.purge(.{ .older_than = now -| request_timeout_us });
-            if (self.routes.count() >= max_requests) return .table_full;
-        }
+        _ = now;
+        if (self.routes.count() >= max_requests) return .table_full;
         if (!self.route_quota.allows(realm)) return .realm_over_share;
         return .ok;
     }
@@ -193,6 +231,7 @@ pub const Tables = struct {
         if (entry.found_existing) self.route_quota.release(entry.value_ptr.realm);
         entry.value_ptr.* = route;
         self.route_quota.acquire(route.realm);
+        self.noteExpiry(route.last_active_at);
     }
 
     pub fn lookupRoute(self: *const Tables, key: StreamKey) ?Route {
@@ -213,6 +252,23 @@ pub const Tables = struct {
         self.dropRoute(key);
     }
 
+    /// 客户端不再接收某条流的返回方向时，把目标原地降级为 discard。
+    ///
+    /// 不删除映射：后端请求仍可能已经完整提交，后续 FIN/失败仍需有正常回收路径。
+    /// 这是低频控制事件，O(n) 扫描换取热路径不维护第二张反向索引。
+    pub fn suppressClientResponse(self: *Tables, cnx: quic.c.QuicCnx, stream_id: u64) bool {
+        var it = self.routes.valueIterator();
+        while (it.next()) |route| switch (route.target) {
+            .client => |client| {
+                if (client.cnx != cnx or client.stream_id != stream_id) continue;
+                route.target = .discard;
+                return true;
+            },
+            .discard => {},
+        };
+        return false;
+    }
+
     pub fn routeCount(self: *const Tables) u32 {
         return self.routes.count();
     }
@@ -221,12 +277,11 @@ pub const Tables = struct {
     // 认证等待表
     // ========================================================================
 
-    /// 这个 realm 现在能否再登记一条等待中的认证；表已满时先做一次过期回收再复查。
+    /// 这个 realm 现在能否再登记一条等待中的认证。理由同 reserveRoute：真正过期由
+    /// Worker 回 auth_failure，容量判定不能把它静默吞掉。
     pub fn reserveAuth(self: *Tables, realm: RealmId, now: u64) Admit {
-        if (self.auths.count() >= max_requests) {
-            self.purge(.{ .older_than = now -| request_timeout_us });
-            if (self.auths.count() >= max_requests) return .table_full;
-        }
+        _ = now;
+        if (self.auths.count() >= max_requests) return .table_full;
         if (!self.auth_quota.allows(realm)) return .realm_over_share;
         return .ok;
     }
@@ -241,6 +296,7 @@ pub const Tables = struct {
         }
         entry.value_ptr.* = pending;
         self.auth_quota.acquire(pending.realm);
+        self.noteExpiry(pending.created_at);
     }
 
     pub fn hasAuth(self: *const Tables, key: StreamKey) bool {
@@ -259,6 +315,18 @@ pub const Tables = struct {
 
     pub fn authCount(self: *const Tables) u32 {
         return self.auths.count();
+    }
+
+    /// 认证请求已经交给后端时，STOP_SENDING 只取消返回方向，不撤销请求副作用。
+    /// 后端结果仍会更新连接准入状态；completeAuth 根据该位跳过流写入。
+    pub fn suppressAuthResponse(self: *Tables, cnx: quic.c.QuicCnx, stream_id: u64) bool {
+        var it = self.auths.valueIterator();
+        while (it.next()) |pending| {
+            if (pending.client_cnx != cnx or pending.client_stream_id != stream_id) continue;
+            pending.response_suppressed = true;
+            return true;
+        }
+        return false;
     }
 
     // ========================================================================
@@ -316,6 +384,74 @@ pub const Tables = struct {
     }
 
     // ========================================================================
+    // 有界且可见的超时回收
+    // ========================================================================
+
+    fn noteExpiry(self: *Tables, timestamp: u64) void {
+        const deadline = timestamp +| request_timeout_us;
+        if (self.next_expiry_at == null or deadline < self.next_expiry_at.?) {
+            self.next_expiry_at = deadline;
+        }
+    }
+
+    /// 最早已知 deadline 到达才需要扫表。next_expiry_at 允许偏早，因此 true 只表示
+    /// “应当扫描并重算”，不保证一定能摘到条目。
+    pub fn expirationDue(self: *const Tables, now: u64) bool {
+        return if (self.next_expiry_at) |deadline| now >= deadline else false;
+    }
+
+    /// 摘出空闲达到 request_timeout_us 的普通请求。调用方拥有返回的 Route，并负责向
+    /// client 目标回明确错误；discard 目标只需回收。
+    pub fn takeExpiredRoutes(self: *Tables, now: u64, out: []ExpiredRoute) usize {
+        var keys: [purge_batch]StreamKey = undefined;
+        const limit = @min(keys.len, out.len);
+        if (limit == 0) return 0;
+
+        var count: usize = 0;
+        var it = self.routes.iterator();
+        while (it.next()) |entry| {
+            if (now -| entry.value_ptr.last_active_at < request_timeout_us) continue;
+            keys[count] = entry.key_ptr.*;
+            count += 1;
+            if (count == limit) break;
+        }
+        for (keys[0..count], 0..) |key, index| {
+            out[index] = .{ .key = key, .route = self.takeRoute(key).? };
+        }
+        return count;
+    }
+
+    /// 摘出达到绝对认证 deadline 的等待项；buffer 所有权随条目转移给调用方。
+    pub fn takeExpiredAuths(self: *Tables, now: u64, out: []ExpiredAuth) usize {
+        var keys: [purge_batch]StreamKey = undefined;
+        const limit = @min(keys.len, out.len);
+        if (limit == 0) return 0;
+
+        var count: usize = 0;
+        var it = self.auths.iterator();
+        while (it.next()) |entry| {
+            if (now -| entry.value_ptr.created_at < request_timeout_us) continue;
+            keys[count] = entry.key_ptr.*;
+            count += 1;
+            if (count == limit) break;
+        }
+        for (keys[0..count], 0..) |key, index| {
+            out[index] = .{ .key = key, .pending = self.dropAuth(key).? };
+        }
+        return count;
+    }
+
+    /// 一次到期扫描完成后重新计算最早 deadline。刷新/提前删除只会让旧提示偏早，
+    /// 因而无须在热路径维护堆或反向索引；这次 O(n) 扫描只发生在真实 deadline 到点时。
+    pub fn refreshExpiryDeadline(self: *Tables) void {
+        self.next_expiry_at = null;
+        var routes = self.routes.valueIterator();
+        while (routes.next()) |route| self.noteExpiry(route.last_active_at);
+        var auths = self.auths.valueIterator();
+        while (auths.next()) |pending| self.noteExpiry(pending.created_at);
+    }
+
+    // ========================================================================
     // 回收
     // ========================================================================
 
@@ -337,15 +473,6 @@ pub const Tables = struct {
         return removed.value;
     }
 
-    /// 摊薄的过期回收：距上次扫描不足一个超时周期就跳过。
-    ///
-    /// 后端轮询的频率（默认几毫秒）远高于超时周期（60 秒），跟着它扫全表纯属浪费。
-    pub fn purgeExpired(self: *Tables, now: u64) void {
-        if (now -| self.last_purge_at < request_timeout_us) return;
-        self.purge(.{ .older_than = now -| request_timeout_us });
-        self.last_purge_at = now;
-    }
-
     /// 按给定条件回收两张表里的条目。
     pub fn purge(self: *Tables, filter: Filter) void {
         var keys: [purge_batch]StreamKey = undefined;
@@ -354,7 +481,7 @@ pub const Tables = struct {
             var count: usize = 0;
             var it = self.routes.iterator();
             while (it.next()) |entry| {
-                if (!filter.matches(entry.value_ptr.client_cnx, entry.value_ptr.last_active_at)) continue;
+                if (!filter.matchesRoute(entry.value_ptr.*)) continue;
                 keys[count] = entry.key_ptr.*;
                 count += 1;
                 if (count == keys.len) break;
@@ -367,7 +494,7 @@ pub const Tables = struct {
             var count: usize = 0;
             var it = self.auths.iterator();
             while (it.next()) |entry| {
-                if (!filter.matches(entry.value_ptr.client_cnx, entry.value_ptr.created_at)) continue;
+                if (!filter.matchesAuth(entry.value_ptr.client_cnx, entry.value_ptr.created_at)) continue;
                 keys[count] = entry.key_ptr.*;
                 count += 1;
                 if (count == keys.len) break;
@@ -398,15 +525,30 @@ fn streamKey(stream: u64) StreamKey {
     return .{ .transport = test_transport, .stream = stream };
 }
 
+fn clientRoute(cnx: quic.c.QuicCnx, stream_id: u64, realm: RealmId, last_active_at: u64) Route {
+    return .{
+        .target = .{ .client = .{ .cnx = cnx, .stream_id = stream_id } },
+        .realm = realm,
+        .last_active_at = last_active_at,
+    };
+}
+
+fn routeClient(route: Route) ClientResponse {
+    return switch (route.target) {
+        .client => |client| client,
+        .discard => unreachable,
+    };
+}
+
 test "route lifecycle: open, lookup, close" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
     const cnx = fakeCnx(0x1000);
-    try tables.openRoute(streamKey(7), .{ .client_cnx = cnx, .client_stream_id = 4, .realm = 1, .last_active_at = 100 });
+    try tables.openRoute(streamKey(7), clientRoute(cnx, 4, 1, 100));
 
     const found = tables.lookupRoute(streamKey(7)).?;
-    try std.testing.expectEqual(@as(u64, 4), found.client_stream_id);
+    try std.testing.expectEqual(@as(u64, 4), routeClient(found).stream_id);
     try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
 
     tables.closeRoute(streamKey(7));
@@ -425,12 +567,12 @@ test "the same handle from two transports is two different entries" {
     const from_a = StreamKey{ .transport = 0xA000, .stream = 4 };
     const from_b = StreamKey{ .transport = 0xB000, .stream = 4 };
 
-    try tables.openRoute(from_a, .{ .client_cnx = client_a, .client_stream_id = 1, .realm = 1, .last_active_at = 10 });
-    try tables.openRoute(from_b, .{ .client_cnx = client_b, .client_stream_id = 2, .realm = 2, .last_active_at = 10 });
+    try tables.openRoute(from_a, clientRoute(client_a, 1, 1, 10));
+    try tables.openRoute(from_b, clientRoute(client_b, 2, 2, 10));
 
     try std.testing.expectEqual(@as(u32, 2), tables.routeCount());
-    try std.testing.expectEqual(client_a, tables.lookupRoute(from_a).?.client_cnx);
-    try std.testing.expectEqual(client_b, tables.lookupRoute(from_b).?.client_cnx);
+    try std.testing.expectEqual(client_a, routeClient(tables.lookupRoute(from_a).?).cnx);
+    try std.testing.expectEqual(client_b, routeClient(tables.lookupRoute(from_b).?).cnx);
 
     // 关掉一个不影响另一个。
     tables.closeRoute(from_a);
@@ -448,24 +590,9 @@ test "backend failure takes only streams in its transport and selector" {
     const conn_2 = @as(u64, 2) << 48;
     const client = fakeCnx(0x1000);
 
-    try tables.openRoute(.{ .transport = transport_a, .stream = conn_1 | 4 }, .{
-        .client_cnx = client,
-        .client_stream_id = 4,
-        .realm = 1,
-        .last_active_at = 10,
-    });
-    try tables.openRoute(.{ .transport = transport_a, .stream = conn_2 | 8 }, .{
-        .client_cnx = client,
-        .client_stream_id = 8,
-        .realm = 1,
-        .last_active_at = 10,
-    });
-    try tables.openRoute(.{ .transport = transport_b, .stream = conn_1 | 4 }, .{
-        .client_cnx = client,
-        .client_stream_id = 12,
-        .realm = 2,
-        .last_active_at = 10,
-    });
+    try tables.openRoute(.{ .transport = transport_a, .stream = conn_1 | 4 }, clientRoute(client, 4, 1, 10));
+    try tables.openRoute(.{ .transport = transport_a, .stream = conn_2 | 8 }, clientRoute(client, 8, 1, 10));
+    try tables.openRoute(.{ .transport = transport_b, .stream = conn_1 | 4 }, clientRoute(client, 12, 2, 10));
     try tables.trackAuth(.{ .transport = transport_a, .stream = conn_1 | 12 }, .{
         .client_cnx = client,
         .client_stream_id = 16,
@@ -480,7 +607,7 @@ test "backend failure takes only streams in its transport and selector" {
     };
     var routes: [4]Route = undefined;
     try std.testing.expectEqual(@as(usize, 1), tables.takeFailedRoutes(transport_a, selector, &routes));
-    try std.testing.expectEqual(@as(u64, 4), routes[0].client_stream_id);
+    try std.testing.expectEqual(@as(u64, 4), routeClient(routes[0]).stream_id);
 
     var auths: [4]PendingAuth = undefined;
     try std.testing.expectEqual(@as(usize, 1), tables.takeFailedAuths(transport_a, selector, &auths));
@@ -505,9 +632,9 @@ test "purge by connection removes only that connection's entries" {
     const doomed = fakeCnx(0x1000);
     const survivor = fakeCnx(0x2000);
 
-    try tables.openRoute(streamKey(1), .{ .client_cnx = doomed, .client_stream_id = 0, .realm = 1, .last_active_at = 10 });
-    try tables.openRoute(streamKey(2), .{ .client_cnx = survivor, .client_stream_id = 0, .realm = 1, .last_active_at = 10 });
-    try tables.openRoute(streamKey(3), .{ .client_cnx = doomed, .client_stream_id = 4, .realm = 1, .last_active_at = 10 });
+    try tables.openRoute(streamKey(1), clientRoute(doomed, 0, 1, 10));
+    try tables.openRoute(streamKey(2), clientRoute(survivor, 0, 1, 10));
+    try tables.openRoute(streamKey(3), clientRoute(doomed, 4, 1, 10));
     try tables.trackAuth(streamKey(11), .{
         .client_cnx = doomed,
         .client_stream_id = 8,
@@ -540,7 +667,7 @@ test "purge sweeps more entries than one batch" {
     const total = purge_batch * 2 + 5;
     var i: u64 = 0;
     while (i < total) : (i += 1) {
-        try tables.openRoute(streamKey(i), .{ .client_cnx = cnx, .client_stream_id = i, .realm = 1, .last_active_at = 10 });
+        try tables.openRoute(streamKey(i), clientRoute(cnx, i, 1, 10));
     }
     try std.testing.expectEqual(@as(u32, @intCast(total)), tables.routeCount());
 
@@ -553,8 +680,8 @@ test "purge by age keeps fresh entries" {
     defer tables.deinit();
 
     const cnx = fakeCnx(0x1000);
-    try tables.openRoute(streamKey(1), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .last_active_at = 100 });
-    try tables.openRoute(streamKey(2), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 1, .last_active_at = 900 });
+    try tables.openRoute(streamKey(1), clientRoute(cnx, 0, 1, 100));
+    try tables.openRoute(streamKey(2), clientRoute(cnx, 1, 1, 900));
 
     tables.purge(.{ .older_than = 500 });
 
@@ -562,17 +689,85 @@ test "purge by age keeps fresh entries" {
     try std.testing.expect(tables.lookupRoute(streamKey(2)) != null);
 }
 
-test "route activity refreshes idle deadline without extending auth lifetime" {
+test "no-response routes outlive the client but still expire" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
     const cnx = fakeCnx(0x1000);
     try tables.openRoute(streamKey(1), .{
-        .client_cnx = cnx,
-        .client_stream_id = 0,
+        .target = .discard,
         .realm = 1,
         .last_active_at = 100,
     });
+    try tables.openRoute(streamKey(2), clientRoute(cnx, 4, 1, 100));
+
+    // 连接关闭只能回收仍然引用该连接的响应路由。no-response 已经没有客户端句柄，
+    // 必须留到后端 FIN/失败/超时，否则它的合法收尾会被误报成孤儿响应。
+    tables.purge(.{ .connection = cnx });
+    try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
+    const retained = tables.lookupRoute(streamKey(1)).?;
+    try std.testing.expect(retained.target == .discard);
+
+    // 后端永远不收尾时仍受同一空闲超时约束，不能成为无界泄漏。
+    tables.purge(.{ .older_than = 500 });
+    try std.testing.expectEqual(@as(u32, 0), tables.routeCount());
+    try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
+}
+
+test "backend failure returns discard routes without a client handle" {
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+
+    try tables.openRoute(streamKey(7), .{
+        .target = .discard,
+        .realm = 3,
+        .last_active_at = 10,
+    });
+
+    var failed: [1]Route = undefined;
+    try std.testing.expectEqual(@as(usize, 1), tables.takeFailedRoutes(test_transport, .{}, &failed));
+    try std.testing.expect(failed[0].target == .discard);
+    try std.testing.expectEqual(@as(u32, 0), tables.routeCount());
+    try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
+}
+
+test "STOP_SENDING suppresses response without losing cleanup state" {
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+
+    const cnx = fakeCnx(0x1000);
+    try tables.openRoute(streamKey(3), clientRoute(cnx, 8, 1, 100));
+    try tables.trackAuth(streamKey(4), .{
+        .client_cnx = cnx,
+        .client_stream_id = 12,
+        .realm = 1,
+        .buffer = .{ .items = &.{}, .capacity = 0 },
+        .created_at = 100,
+    });
+
+    try std.testing.expect(tables.suppressClientResponse(cnx, 8));
+    try std.testing.expect(!tables.suppressClientResponse(cnx, 99));
+    switch (tables.lookupRoute(streamKey(3)).?.target) {
+        .discard => {},
+        .client => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(tables.suppressAuthResponse(cnx, 12));
+    try std.testing.expect(!tables.suppressAuthResponse(cnx, 99));
+    try std.testing.expect(tables.authPtr(streamKey(4)).?.response_suppressed);
+
+    // 客户端连接清理不再删除已降级的普通路由，但认证仍属于连接并正常释放。
+    tables.purge(.{ .connection = cnx });
+    try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
+    try std.testing.expectEqual(@as(u32, 0), tables.authCount());
+}
+
+test "route activity refreshes idle deadline without extending auth lifetime" {
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+
+    const cnx = fakeCnx(0x1000);
+    try tables.openRoute(streamKey(1), clientRoute(cnx, 0, 1, 100));
     try tables.trackAuth(streamKey(2), .{
         .client_cnx = cnx,
         .client_stream_id = 4,
@@ -593,29 +788,56 @@ test "route activity refreshes idle deadline without extending auth lifetime" {
     try std.testing.expect(!tables.touchRoute(streamKey(1), 1_000));
 }
 
-// 过期回收必须按超时周期摊薄，不能跟随后端轮询频率。
-test "purgeExpired throttles to one sweep per timeout window" {
+// 过期调度按最早真实 deadline 触发；不能受固定扫描相位影响而多挂一个周期。
+test "expiration follows the earliest real deadline and returns owned entries" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
     const cnx = fakeCnx(0x1000);
-    const now = request_timeout_us * 3;
-    try tables.openRoute(streamKey(1), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .last_active_at = 0 });
+    try tables.openRoute(streamKey(1), clientRoute(cnx, 0, 1, 100));
+    try tables.trackAuth(streamKey(2), .{
+        .client_cnx = cnx,
+        .client_stream_id = 4,
+        .realm = 1,
+        .buffer = .{ .items = &.{}, .capacity = 0 },
+        .created_at = 200,
+    });
 
-    // 第一次调用：last_purge_at 还是 0，距今已超过一个周期，应当真正扫表。
-    tables.purgeExpired(now);
-    try std.testing.expectEqual(@as(u32, 0), tables.routeCount());
-    try std.testing.expectEqual(now, tables.last_purge_at);
+    try std.testing.expect(!tables.expirationDue(100 + request_timeout_us - 1));
+    try std.testing.expect(tables.expirationDue(100 + request_timeout_us));
 
-    // 紧接着再调：不足一个周期，必须直接跳过，连新插入的老条目也不动。
-    try tables.openRoute(streamKey(2), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 1, .last_active_at = 0 });
-    tables.purgeExpired(now + 1);
-    try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
-    try std.testing.expectEqual(now, tables.last_purge_at);
+    var routes: [2]ExpiredRoute = undefined;
+    var auths: [2]ExpiredAuth = undefined;
+    try std.testing.expectEqual(@as(usize, 1), tables.takeExpiredRoutes(100 + request_timeout_us, &routes));
+    try std.testing.expectEqual(streamKey(1), routes[0].key);
+    try std.testing.expectEqual(@as(u64, 0), routeClient(routes[0].route).stream_id);
+    try std.testing.expectEqual(@as(usize, 0), tables.takeExpiredAuths(100 + request_timeout_us, &auths));
+    tables.refreshExpiryDeadline();
 
-    // 又过了一个周期：再次扫表。
-    tables.purgeExpired(now + request_timeout_us);
-    try std.testing.expectEqual(@as(u32, 0), tables.routeCount());
+    try std.testing.expect(!tables.expirationDue(200 + request_timeout_us - 1));
+    try std.testing.expect(tables.expirationDue(200 + request_timeout_us));
+    try std.testing.expectEqual(@as(usize, 1), tables.takeExpiredAuths(200 + request_timeout_us, &auths));
+    try std.testing.expectEqual(streamKey(2), auths[0].key);
+    auths[0].pending.buffer.deinit(std.testing.allocator);
+    tables.refreshExpiryDeadline();
+    try std.testing.expect(tables.next_expiry_at == null);
+}
+
+test "route activity can move a stale earliest deadline later" {
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+
+    const cnx = fakeCnx(0x1000);
+    try tables.openRoute(streamKey(1), clientRoute(cnx, 0, 1, 100));
+    try std.testing.expect(tables.touchRoute(streamKey(1), 900));
+
+    // 旧提示允许偏早：扫描摘不到条目后重算到刷新后的 deadline。
+    try std.testing.expect(tables.expirationDue(100 + request_timeout_us));
+    var routes: [1]ExpiredRoute = undefined;
+    try std.testing.expectEqual(@as(usize, 0), tables.takeExpiredRoutes(100 + request_timeout_us, &routes));
+    tables.refreshExpiryDeadline();
+    try std.testing.expect(!tables.expirationDue(900 + request_timeout_us - 1));
+    try std.testing.expect(tables.expirationDue(900 + request_timeout_us));
 }
 
 test "auth buffers are freed by take, purge and deinit" {
@@ -655,13 +877,13 @@ test "a realm over its fair share is refused while others still get in" {
     var i: u64 = 0;
     while (i < above_watermark) : (i += 1) {
         try std.testing.expectEqual(Admit.ok, tables.reserveRoute(1, 0));
-        try tables.openRoute(streamKey(i), .{ .client_cnx = cnx, .client_stream_id = i, .realm = 1, .last_active_at = 0 });
+        try tables.openRoute(streamKey(i), clientRoute(cnx, i, 1, 0));
     }
 
     // realm 2 进来，活跃变 2，份额腰斩。realm 1 已经超了，realm 2 照常放行
     // ——这就是"只拒超额的那个"。
     try std.testing.expectEqual(Admit.ok, tables.reserveRoute(2, 0));
-    try tables.openRoute(streamKey(above_watermark), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 2, .last_active_at = 0 });
+    try tables.openRoute(streamKey(above_watermark), clientRoute(cnx, 0, 2, 0));
     try std.testing.expectEqual(Admit.realm_over_share, tables.reserveRoute(1, 0));
     try std.testing.expectEqual(Admit.ok, tables.reserveRoute(2, 0));
 }
@@ -678,9 +900,9 @@ test "quota counters return to zero through all three reclaim paths" {
         var realm: RealmId = 1;
         while (realm <= 4) : (realm += 1) {
             const base = @as(u64, realm) * 100;
-            try tables.openRoute(streamKey(base), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = realm, .last_active_at = 0 });
-            try tables.openRoute(streamKey(base + 1), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = realm, .last_active_at = 0 });
-            try tables.openRoute(streamKey(base + 2), .{ .client_cnx = cnx, .client_stream_id = 2, .realm = realm, .last_active_at = 0 });
+            try tables.openRoute(streamKey(base), clientRoute(cnx, 0, realm, 0));
+            try tables.openRoute(streamKey(base + 1), clientRoute(cnx, 1, realm, 0));
+            try tables.openRoute(streamKey(base + 2), clientRoute(cnx, 2, realm, 0));
             try tables.trackAuth(streamKey(base + 3), .{
                 .client_cnx = cnx,
                 .client_stream_id = 3,
@@ -728,8 +950,8 @@ test "reusing a stream key does not leak a quota slot" {
     defer tables.deinit();
 
     const cnx = fakeCnx(0x1000);
-    try tables.openRoute(streamKey(4), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .last_active_at = 0 });
-    try tables.openRoute(streamKey(4), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 2, .last_active_at = 0 });
+    try tables.openRoute(streamKey(4), clientRoute(cnx, 0, 1, 0));
+    try tables.openRoute(streamKey(4), clientRoute(cnx, 1, 2, 0));
     try std.testing.expectEqual(@as(usize, 1), tables.route_quota.total);
     try std.testing.expectEqual(@as(u32, 0), tables.route_quota.count(1));
     try std.testing.expectEqual(@as(u32, 1), tables.route_quota.count(2));

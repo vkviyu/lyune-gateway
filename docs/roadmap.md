@@ -11,17 +11,17 @@
 - [x] 形成当前源码与文档的可推送基线；
 - [x] 本阶段不创建 tag，不生成 release，不承诺协议稳定性。
 
-## 阶段 1：两阶段真实环境验证（当前：Mac 已完成，Linux 待执行）
+## 阶段 1：两阶段真实环境验证（当前：远程 Linux 待执行）
 
 阶段一在真实 MacBook 上使用 Go Reactor、原生 QUIC client-agent 和轻量 React UI，先完成单机最小闭环，再覆盖并发流、生命周期、慢端与超过 60 秒的长流。阶段二把同一套资产迁移到远程 Linux，验证跨平台构建、真实网络、io_uring、reuseport/cBPF 和多 Worker。
 
-Mac 阶段 M0–M9 已全部通过，包含真实 SQLite 用户认证、群成员授权、历史消息和双用户 `.peer` 实时群聊。当前不扩展功能，下一项是把固定资产迁移到远程 Linux，依次验证单 Worker、跨主机 Reactor、Linux 多 Worker/reuseport/cBPF。命令、场景、退出条件和逐次执行结果统一记录在 [两阶段真实环境验证](validation.md)。两个阶段都不创建 tag 或 release。
+Mac 阶段 M0–M18 已通过并冻结：除真实 SQLite IM 闭环外，`lyune/2` 的 required/none、连接级 lifecycle/presence、流方向约束、reset/stop、128 位跨进程连接身份、混合负载、故障恢复和资源趋势都有真实进程证据。下一步保持代码、配置和场景不变迁移到远程 Linux，依次验证单 Worker、跨主机 Reactor、Linux 多 Worker/reuseport/cBPF。命令、退出条件和逐次执行结果统一记录在 [两阶段真实环境验证](validation.md)。两个阶段都不创建 tag 或 release。
 
 ## 阶段 2：正确性和有界资源
 
 按以下顺序处理：
 
-1. （已完成）回程映射由绝对超时改为空闲超时；Mac 120 秒活跃流通过，125 秒静默负对照明确返回 `request expired`；
+1. （已完成）回程映射由绝对超时改为空闲超时；Mac 120 秒活跃流通过，125 秒静默负对照在 60 秒明确返回 `backend response timeout`；deadline 使用 QUIC 单流 discard，不再关闭同连接的正常兄弟流；
 2. （已完成）后端响应写回后主动驱动客户端 QUIC；后端连接/接收池失败按连接精确回收 inflight 并立即回显，不再等待客户端 deadline；
 3. 限制认证响应累计长度，超限时结束单流并回收 pending auth；
 4. 将 UDP 动态发送数组替换为有界队列，明确满载策略和指标；

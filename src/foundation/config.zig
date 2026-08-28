@@ -249,6 +249,14 @@ pub const GatewayConfig = struct {
         group: ?u8 = null,
         /// 认证服务的组内路由，与 group 组合构成完整路由键。
         route_key: u8 = 0,
+        /// 认证成功以后用于接收连接级 online/offline 事件的后端路由。
+        /// null 表示部署不需要生命周期事件；Gateway 不在本地聚合用户在线状态。
+        lifecycle: ?LifecycleRoute = null,
+
+        pub const LifecycleRoute = struct {
+            group: u8,
+            route_key: u8,
+        };
     };
 
     /// 校验端口、容量、路由、认证与集群安全约束；不执行 I/O。
@@ -418,7 +426,7 @@ fn testConfig() GatewayConfig {
             .quic = .{
                 .max_connections = 10_000,
                 .idle_timeout_ms = 30_000,
-                .alpn = "lyune/1",
+                .alpn = "lyune/2",
                 .congestion_control = "bbr",
             },
         },
@@ -428,7 +436,7 @@ fn testConfig() GatewayConfig {
             .root_certificate_file = null,
             .max_receive_queue = 1024,
             .idle_timeout_ms = 30_000,
-            .alpn = "lyune/1",
+            .alpn = "lyune/2",
             .congestion_control = "bbr",
         } },
         .worker = .{ .backend_poll_interval_ms = 10 },

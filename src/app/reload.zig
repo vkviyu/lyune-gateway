@@ -314,7 +314,7 @@ test "only additions are accepted" {
             .listen_port = 8443,
             .certificate_file = "c",
             .private_key_file = "k",
-            .quic = .{ .max_connections = 1, .idle_timeout_ms = 1000, .alpn = "lyune/1", .congestion_control = "bbr" },
+            .quic = .{ .max_connections = 1, .idle_timeout_ms = 1000, .alpn = "lyune/2", .congestion_control = "bbr" },
         },
         .backend = .{ .direct = .{
             .routes = &.{},
@@ -322,7 +322,7 @@ test "only additions are accepted" {
             .root_certificate_file = null,
             .max_receive_queue = 1,
             .idle_timeout_ms = 1000,
-            .alpn = "lyune/1",
+            .alpn = "lyune/2",
             .congestion_control = "bbr",
         } },
         .worker = .{ .backend_poll_interval_ms = 10 },

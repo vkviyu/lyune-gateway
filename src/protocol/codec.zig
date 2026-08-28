@@ -14,10 +14,10 @@
 //! ```zig
 //! // 一次性交换：一个带 eof 的 OPEN 就是全部
 //! var encoder = FrameEncoder.init(&buf);
-//! const once = try encoder.encodeOpen(.service, route, Flags.last(), payload);
+//! const once = try encoder.encodeOpen(.service, route, .required, Flags.last(), payload);
 //!
 //! // 流式交换：OPEN + N × DATA，末帧带 eof
-//! const head = try encoder.encodeOpen(.service, route, .{}, first_chunk);
+//! const head = try encoder.encodeOpen(.service, route, .required, .{}, first_chunk);
 //! const tail = try encoder.encodeData(Flags.last(), last_chunk);
 //!
 //! // 就地扫描（零拷贝）
@@ -35,6 +35,7 @@ const DestKind = frame.DestKind;
 const ControlType = frame.ControlType;
 const RouteId = frame.RouteId;
 const Flags = frame.Flags;
+const ResponseMode = frame.ResponseMode;
 
 // ============================================================================
 // 常量
@@ -66,11 +67,12 @@ pub const FrameEncoder = struct {
         self: *FrameEncoder,
         dest_kind: DestKind,
         route: RouteId,
+        response_mode: ResponseMode,
         flags: Flags,
         body: []const u8,
     ) frame.FrameError![]const u8 {
         if (body.len > MAX_BODY_SIZE) return error.BodyTooLarge;
-        return self.write(FrameHeader.initOpen(dest_kind, route, flags, @intCast(body.len)), body);
+        return self.write(FrameHeader.initOpen(dest_kind, route, response_mode, flags, @intCast(body.len)), body);
     }
 
     /// 编码同一次交换的后续帧（DATA）。
@@ -105,7 +107,7 @@ pub const FrameEncoder = struct {
         ctrl_type: ControlType,
         body: []const u8,
     ) frame.FrameError![]const u8 {
-        return self.encodeOpen(.gateway, RouteId.init(0, @intFromEnum(ctrl_type)), Flags.last(), body);
+        return self.encodeOpen(.gateway, RouteId.init(0, @intFromEnum(ctrl_type)), .none, Flags.last(), body);
     }
 
     /// 编码心跳请求
@@ -294,7 +296,7 @@ test "FrameEncoder emits an OPEN frame that decodes back" {
     var encoder = FrameEncoder.init(&buf);
 
     const payload = "Hello, World!";
-    const frame_data = try encoder.encodeOpen(.service, RouteId.init(0x01, 0), Flags.last(), payload);
+    const frame_data = try encoder.encodeOpen(.service, RouteId.init(0x01, 0), .required, Flags.last(), payload);
 
     try std.testing.expectEqual(OPEN_HEADER_SIZE + payload.len, frame_data.len);
 
@@ -323,7 +325,7 @@ test "FrameScanner yields every whole frame and keeps the trailing partial" {
     var encode_buf: [512]u8 = undefined;
     var encoder = FrameEncoder.init(&encode_buf);
 
-    const first = try encoder.encodeOpen(.service, RouteId.init(0x01, 0), .{}, "one");
+    const first = try encoder.encodeOpen(.service, RouteId.init(0x01, 0), .required, .{}, "one");
     const first_len = first.len;
     @memcpy(stream[0..first_len], first);
 
@@ -369,7 +371,7 @@ test "FrameScanner rejects an unknown frame type from the very first byte" {
 test "FrameScanner needs a full header before deciding" {
     var buf: [1024]u8 = undefined;
     var encoder = FrameEncoder.init(&buf);
-    const frame_data = try encoder.encodeOpen(.service, RouteId.init(0x01, 0), Flags.last(), "Test");
+    const frame_data = try encoder.encodeOpen(.service, RouteId.init(0x01, 0), .required, Flags.last(), "Test");
 
     var scanner = FrameScanner{ .data = frame_data[0 .. OPEN_HEADER_SIZE - 1] };
     try std.testing.expectEqual(@as(?Frame, null), try scanner.next());
@@ -426,6 +428,6 @@ test "FrameEncoder refuses a body that does not fit the buffer" {
     var encoder = FrameEncoder.init(&buf);
     try std.testing.expectError(
         error.BufferTooSmall,
-        encoder.encodeOpen(.service, RouteId.init(1, 1), .{}, "too long for this buffer"),
+        encoder.encodeOpen(.service, RouteId.init(1, 1), .required, .{}, "too long for this buffer"),
     );
 }

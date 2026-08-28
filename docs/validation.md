@@ -2,7 +2,7 @@
 
 > 建立日期：2026-08-27
 >
-> 当前状态：阶段一已完成，Mac M0–M9 全部通过；下一步仅迁移同一基线到远程 Linux。阶段二完成前不创建 release。
+> 当前状态：阶段一已完成，Mac M0–M18 全部通过并冻结；下一步进入远程 Linux。两个阶段完成前都不创建 release。
 
 本文既是验证计划，也是持续更新的验证记录。它回答三个问题：当前真实链路怎样搭建、每一项怎样判定通过、实际执行时观察到了什么。设计能力是否存在仍以源码和 `status.md` 为准；本文件只记录真实进程与真实网络中的证据。
 
@@ -28,11 +28,11 @@ Browser / React UI :5173
         v
 client-agent :8787
         |
-        | QUIC + ALPN lyune/1（真实客户端连接）
+        | QUIC + ALPN lyune/2（真实客户端连接）
         v
 lyune-gateway :8443
         |
-        | QUIC + ALPN lyune/1（真实 DirectTransport）
+        | QUIC + ALPN lyune/2（真实 DirectTransport）
         v
 lyune-reactor :9443
 ```
@@ -41,7 +41,7 @@ lyune-reactor :9443
 
 ### 为什么浏览器旁需要 client-agent
 
-当前客户端协议是自定义 ALPN `lyune/1` 上的原生 QUIC。浏览器 JavaScript 不能打开任意 UDP socket，也不能直接协商自定义原生 QUIC ALPN；WebTransport 则要求服务端实现相应的 HTTP/3/WebTransport 语义，网关目前没有这层协议。
+当前客户端协议是自定义 ALPN `lyune/2` 上的原生 QUIC。浏览器 JavaScript 不能打开任意 UDP socket，也不能直接协商自定义原生 QUIC ALPN；WebTransport 则要求服务端实现相应的 HTTP/3/WebTransport 语义，网关目前没有这层协议。
 
 因此 React 页面负责真实操作和观测，轻量 client-agent 负责浏览器不具备的传输能力。agent 使用独立 QUIC 实现与网关互操作，发送的仍是当前 OPEN/DATA 线格式，网关到 Reactor 也仍走真实 QUIC。这一结构不能被描述为“浏览器直连 QUIC”，但它完整覆盖网关的客户端数据面。为了省掉 agent 而给网关临时增加 WebTransport，不属于本轮冻结验证的范围。
 
@@ -104,7 +104,7 @@ M7 另开 `9444/8444`，不要扰动主 IM 数据库和会话：Reactor 增加 `
 | 编号 | 场景 | 最低通过条件 |
 | --- | --- | --- |
 | M0 | 构建与监听 | 三个原生进程正常构建；`:9443`、`:8443`、`:8787` 分别由预期进程监听 |
-| M1 | 双 QUIC 握手 | agent → Gateway 与 Gateway → Reactor 均协商 `lyune/1`，没有降级或证书误判 |
+| M1 | 双 QUIC 握手 | agent → Gateway 与 Gateway → Reactor 均协商 `lyune/2`，没有降级或证书误判 |
 | M2 | 网关控制交换 | heartbeat/ping 收到正确 ack/pong；Reactor 不应收到该流量 |
 | M3 | 单帧 service echo | `.service(1,0)` 的 OPEN+EOF 到达 Reactor，响应原样回到同一客户端流 |
 | M4 | 多帧 streaming echo | OPEN、多个 DATA、末帧 EOF 顺序不变；首包响应可在请求结束前返回 |
@@ -113,19 +113,28 @@ M7 另开 `9444/8444`，不要扰动主 IM 数据库和会话：Reactor 增加 `
 | M7 | 压力与慢端 | 慢 Reactor、慢读取和队列压力产生可解释的流控/拒绝，不出现静默截断 |
 | M8 | 长流 | 总时长超过 120 秒且至少每 30 秒有一次应用帧的流完整返回；静默超过 60 秒的负对照明确失败而不继续投递 |
 | M9 | 真实 IM | 两个真实注册用户获得不同 `dest_id`；错误密码被拒；未入群用户不能读群历史；邀请入群后，双方经 Gateway 收到同一条后端 `.peer` 实时消息；重读 SQLite 历史与实时消息一致 |
+| M10 | 显式响应模式 | `required` 返回完整业务帧；`none` 只回空 FIN且后端不回业务帧；错误模式与未知取值明确拒绝；typing 使用 `none` 仍产生对端推送 |
+| M11 | 连接级 lifecycle/presence | online/offline、15 秒续租与严格 sequence 生效；同一用户两条连接聚合为 2，关闭一条后仍在线；Gateway 崩溃后孤儿租约在 45 秒内收敛 |
+| M12 | 流方向与单向流 | 客户端请求只在 client-initiated bidi；Gateway 推送只在 server-initiated bidi；客户端向推送流回写会只关闭违规连接；单向流额度为 0且不影响同连接后续合法流 |
+| M13 | 流取消 | 请求输入 RESET、响应 STOP_SENDING、后端 reset/stop 都按方向精确清理/传播；无 Exchange 泄漏、无客户端 deadline 悬挂、同连接其他流可继续 |
+| M14 | 进程重启身份隔离 | `conn_token` 固定 16 字节且含随机 incarnation；重启前后 token 不同，旧 sequence/kick 不命中新连接；旧 presence 只经租约退出 |
+| M15 | 混合负载 | 多真实用户在同一时间混合 required、none、typing、持久消息、推送与取消；成功/拒绝均完整可解释，无串流、错投或长期挂起 |
+| M16 | 反复故障恢复 | 多轮 Reactor/Gateway/agent 中断与恢复；记录首请求语义、重连时间、在途结果和租约收敛，不出现假成功、身份碰撞或无法恢复的池状态 |
+| M17 | soak 与资源趋势 | 真实 IM 活跃流量和定期故障注入持续运行；RSS、FD、连接、Exchange、inflight、接收槽位和 SQLite 增长符合负载，不单调泄漏 |
+| M18 | 干净环境总复跑 | 新数据库、新进程、固定命令完整复跑 M0–M17；源码/文档/配置一致，无阻断项后冻结 Mac 基线并允许进入 Linux |
 
-M0–M4 构成“传输最小闭环”，M9 才构成有业务意义的应用闭环。阶段一必须 M0–M9 全部通过；echo 成功不能代替身份、授权、持久化和主动推送。
+M0–M4 构成“传输最小闭环”，M9 构成有业务意义的应用闭环，M10–M14 固化协议基础能力，M15–M18 才证明这些能力能在混合负载、故障和时间维度下共同工作。阶段一必须 M0–M18 全部通过；echo 成功不能代替身份、授权、持久化、主动推送或资源稳定性。
 
 ### 3.4 阶段一退出条件
 
-- M0–M9 有可复现记录，已知失败有稳定复现步骤和问题编号；
+- M0–M18 有可复现记录，已知失败有稳定复现步骤和问题编号；
 - 至少完成一次全新进程启动后的 M0–M5，而不是复用未知状态的长驻进程；
 - Web UI 展示的结果与三份原生日志能按时间和 stream 对上；
 - Reactor 和 client-agent 的 codec 均有当前线格式单元测试；
 - 文档中的启动命令在新的 shell 会话可直接执行；
 - 阶段一发现的阻断性协议错误先修复并重新验证，再进入远程 Linux。
 
-上述条件已于 2026-08-28 满足。此后 Mac 阶段只接受阻断 Linux 迁移的回归修复，不继续扩展 IM 功能范围。
+截至 2026-08-29，M0–M18 均已满足，阶段一退出条件已经关闭。Mac 基线冻结后不再增加协议或 IM 产品功能；后续只把相同代码、配置、数据库模型和场景迁移到远程 Linux，发现跨平台阻断时再回到对应层修复并完整回归。
 
 ## 4. 阶段二：远程 Linux 真实验证
 
@@ -149,7 +158,7 @@ remote Linux: lyune-reactor
 
 ### 4.2 Linux 增量检查
 
-除重跑 M0–M9 外，至少增加：
+除重跑 M0–M18 中适用于远程拓扑的场景外，至少增加：
 
 - 发行版、内核、CPU 架构、libc、文件描述符和 UDP 缓冲区限制；
 - `io_uring` 实际启用情况及回退路径；
@@ -161,7 +170,7 @@ remote Linux: lyune-reactor
 
 ### 4.3 阶段二退出条件
 
-- Mac client-agent → Linux Gateway → Linux Reactor 的 M0–M9 全部完成；
+- Mac client-agent → Linux Gateway → Linux Reactor 的 M0–M18 适用场景全部完成；
 - Linux 多 Worker 的 reuseport/cBPF 有内核层证据，不只依赖应用日志推断；
 - 至少一次 Reactor 跨主机部署通过 M3–M6；
 - macOS 与 Linux 的差异、规避方式和未解决风险已经写入执行记录；
@@ -246,6 +255,58 @@ remote Linux: lyune-reactor
 - 双向实时消息：Alice 消息和 Bob 回复都先经 `.service(1,2)` 到 Reactor、写入 SQLite，再由 Reactor 主动开 `.peer` 流回 Gateway。每次 Gateway 都记录 `targets=2 delivered=2 routed=0 unreachable=0`；双方 agent 事件队列收到相同目标 `[3,4]` 与完整 JSON 消息，历史接口按 id 返回同样两条记录。
 - 浏览器复验：两个真实浏览器标签页分别登录不同用户、加入同一群并双向发送；页面在对端长轮询周期内实时出现消息。修复了 React effect 把 `scrollIntoView()` 返回的 Promise 误当 cleanup 导致状态更新后崩溃的问题，修复后控制台无错误。
 - 结果：M9 PASS；M0–M9 至此全部通过，Mac 阶段完成。SQLite 数据位于临时目录，仅作本地验证证据，不是生产数据。
+
+> 后续协议基础能力扩展使原“Mac 阶段完成”结论失效；该记录仍准确描述当时的 M0–M9，
+> 当前阶段门禁已经扩展为 M0–M18，以本文顶部状态和 3.3/3.4 为准。
+
+### 2026-08-28 / macos-protocol-v2-003 / M10–M14
+
+- 代码：Gateway、Reactor、client-agent 与 Web UI 均为 dirty 开发工作树；当前不做兼容层，ALPN 破坏性提升为 `lyune/2`。Gateway 默认测试 254 pass、1 skip，共 255 项；ReleaseSafe 构建通过；Reactor/client-agent Go 测试和 React 生产构建通过。
+- M10：PASS。OPEN byte 5 从保留字节改为显式 `response_mode`。required 的持久消息返回业务结果；typing 使用 none，在 0.7 ms 左右只收到空 FIN，而 Bob 收到真实 `.peer` typing 推送。Gateway/peer/lifecycle 的模式白名单和错误模式均有回归覆盖。
+- M11：PASS。Gateway 在认证后发 online、关闭时发 offline、每 15 秒发续租；Reactor 默认租约 45 秒并按 sequence 拒绝迟到事件。Alice 两连接聚合为 2，关闭一条后为 1；崩溃来不及发 offline 时由租约收敛。聚合属于 Reactor，Gateway 不关心设备类型或“用户整体在线”。
+- M12：PASS。client-initiated bidi 承载请求，server-initiated bidi 承载推送且反向只接受空 FIN。故意让 Alice 在推送流写应用帧后，Gateway 以 protocol violation 只关闭 Alice；Bob 的连接继续 ping/收发。单向流传输额度为 0，尝试打开在 deadline 内失败，之后同连接合法 bidi 仍工作。
+- M13：PASS。客户端在首帧竞态中 RESET 输入能立即收到 reset 确认而不悬挂；STOP 返回方向后请求可继续处理，后续同连接 ping 成功。picoquic 的 stream_reset/stop_sending 事件已贯通 ServerDriver、ClientDriver、DirectTransport/BackendPool 和 Worker，后端取消不再只靠超时回收。
+- M14 发现：旧 64 位 token 仅含 node/worker/slot/generation，Gateway 重启后确定性复用；旧 presence 的高 sequence 会吞掉新进程的 sequence=1，迟到 kick 也可能误伤新连接。没有清空数据库规避，而是把 token 改成含 64 位随机 incarnation 的 128 位不透明身份，AuthContext 18 字节、SessionLifecycle 51 字节、kick/group 使用独立 TokenList，SQLite 按 BLOB 存储。
+- M14 复验：PASS。全新 SQLite 中 token 长度均为 16。Gateway 崩溃前 Alice token 为 `1430C16A752388800001000000010001`，重启后为 `6CFE7886CB4DCF8E0001000000000001`；新 token 的 sequence=1 正常入库。短暂窗口显示 Alice 2 条在线租约，旧租约过期后收敛为 1，Bob 的孤儿租约收敛为 0。
+- 真实业务复验：错误密码 HTTP 401；Bob 入群前历史授权失败；入群后 typing 与持久消息均经 Gateway 到达双方；presence 为两用户各一连接。数据库确认消息持久化和 16 字节 token。随后真实 React 页面登录 Alice，展示 `dest_id=2`、`lyune/2`、在线汇总和 SQLite 历史，并从页面发送持久消息 #2。
+- 已知行为：长时间挂起/系统休眠使后端 QUIC 空闲关闭后，DirectTransport 仍可能让恢复后的第一个请求明确失败并触发重连，下一次成功；没有假成功，但不是透明恢复。此项纳入 M16，不以本轮成功掩盖。
+- 结果：M10–M14 PASS；Mac 阶段整体为 M0–M14 PASS、M15–M18 PENDING，尚不允许进入 Linux。
+- 下一步：依次执行 M15 混合负载、M16 多轮故障恢复、M17 soak/资源趋势、M18 干净环境总复跑；不增加新的 IM 产品功能。
+
+### 2026-08-29 / macos-m15-mixed-001 / M15
+
+- 工具：新增 `validation/client-agent/cmd/im-mixed-load`。它只驱动 loopback agent API；每个用户仍由 agent 建立独立原生 QUIC 连接，业务命令仍经 Gateway 到 Reactor/SQLite，不用内存假数据替代任一段链路。
+- 单轮负载：8 个真实注册用户加入同一群，并发完成 32 条 required 持久消息、64 个 none typing、32 次 history/presence 查询；每位用户都精确收到 32 条 message push 和 64 条 typing push，SQLite 重读包含全部 32 条消息。
+- 同时诊断：16/16 required echo、16/16 none echo、8/8 请求输入 RESET、8/8 响应 STOP_SENDING，取消后的同连接 ping 1/1。没有串流、错投、重复 push、客户端 deadline 挂起或 Exchange 遗留。
+- 结果：M15 PASS。真实业务负载与协议取消/无响应模式可以同时工作，不能再用“分别跑过”掩盖组合问题。
+
+### 2026-08-29 / macos-m16-recovery-001 / M16
+
+- Reactor、Gateway、agent 均做过多轮停止/重启，并在每次恢复后继续执行混合负载。后端连接句柄加入 16 位 generation，QUIC 重连从原始 stream 0 重新编号时不会与旧 inflight 发生 ABA。
+- Gateway 强制终止时，在途客户端请求于自身 10,001 ms deadline 明确失败，没有假成功；Gateway 重启并重新认证后首个 echo 7 ms 成功。相同用户重启前后 token 分别为 `A5CA992675F9E0E80001000000080003` 与 `76DD95F8CF29A67B0001000000000001`，均为 16 字节且 incarnation 不同。
+- Reactor 停机后下一请求 0 ms 收到 `backend unavailable`；Reactor 使用同一 SQLite 重启后首次重试即在 1 ms 成功。agent 重启后第二轮 8 用户、32 消息、64 typing、32 查询混合负载在 802 ms 完成。
+- 失败通知不再折叠为一个“全部 transport”标志：DirectTransport 为每个连接代际定容保留并逐项消费 failure selector，多个副本同时失败也不会误杀健康副本或漏掉失败域。
+- 结果：M16 PASS。恢复语义仍是“失败可见、调用方重试”，不是承诺在途请求透明重放。
+
+### 2026-08-29 / macos-m17-soak-001 / M17
+
+- 初轮 soak 曾出现 64 个 typing push 偶发只有 63 个。线级诊断定位到 Reactor `protocol.WriteFrame` 把 header/body 分两次写且忽略短写计数；并发 server-initiated push 因而可能在流上出现不完整帧。修复为先 `MarshalFrame` 得到不可变完整线帧，再循环写到全部字节完成，并加入短写 writer 回归测试。
+- 修复后连续 70 批真实混合负载全部通过；每批 4 用户、8 条持久消息、64 个 typing、8 次查询，并包含 required/none、RESET、STOP 与取消后 ping。第 10 批后重启 Reactor，第 15 批后重启 Gateway+agent，后续批次仍全部通过。
+- 其中连续 50 批资源窗口的 SQLite 计数从 `users/groups/members/messages/sessions/presence = 168/41/164/328/168/168` 精确增长到 `368/91/364/728/368/368`，文件从 139,264 增到 278,528 字节，与 200 个用户、50 个群、400 条消息完全对应。
+- 同一窗口 Reactor/Gateway/agent RSS 由 `23248/3456/10016 KiB`，中点 `124496/5216/22800 KiB`，结束时回落到 `26320/4544/21184 KiB`；FD 始终为 `14/9/8`。Gateway 空闲快照始终为 4 条后端连接，Exchange、inflight、recv slot 和 pending failure 全部归零。
+- 结果：M17 PASS。该记录证明受控 workload 下没有单调资源泄漏，不是生产容量、无限时长稳定性或 Linux 行为宣称。
+
+### 2026-08-29 / macos-m18-final-001 / M0–M18
+
+- 环境：macOS 26.3.1（25D2128）arm64；Zig 0.16.0；Go 1.27.0；Node 22.23.2；npm 10.9.8。Gateway 基点 `564b897` + 本轮 dirty，Reactor 基点 `00d553e` + 本轮 dirty；全新数据库 `/private/tmp/lyune-im-v2-m18-001.sqlite`，全新 Reactor/Gateway/agent 进程。
+- M0–M7：`:9443/:8443/:8787` 归属正确，双段 ALPN 均为 `lyune/2`；ping 0 ms，单帧 echo 11 ms，streaming 在请求完成前逐帧返回，32/32 单连接并发通过。M7 的 8 槽负对照仍为 8 个完整成功、24 个约 278 ms 明确失败；连接恢复后 3,001 ms 慢读取拿到完整响应。
+- M8 在总复跑中发现新的复用隔离错误：活跃流与静默流的后端句柄高 32 位相同、低 32 位分别为 stream 0/4；静默流到 deadline 后，旧 `invalidateStream` 关闭了整条后端连接，导致活跃兄弟流在 60 秒被错误终止。修复为 picoquic `discard_stream`，只对目标流发送 RESET_STREAM + STOP_SENDING 并立即 flush，共享连接保持 ready。
+- M8 最终复验：活跃流在 `0/30,001/60,003/90,005/120,007 ms` 发出，五个响应在 `8/30,003/60,009/90,012/120,015 ms` 全部返回；同连接静默流在 60,007 ms 收到 `backend response timeout`。此时后端连接仍为 4，随后同一认证连接 ping 0 ms、echo 8 ms。
+- M9–M14：错误密码拒绝；未入群历史拒绝；入群后两位用户分别发送消息 33/34，双方收到目标 `[2,11]` 的相同 `.peer` 事件，SQLite 历史一致。同用户双连接 presence 为 2，关一条后为 1。非法向 Gateway-initiated 流回写只关闭违规用户，健康用户 echo 10 ms；单向流在 3,005 ms 被拒，后续 bidi 3 ms 成功。RESET/STOP 混合诊断均通过，Gateway 崩溃前后 16 字节 token 不同。
+- M15–M17 代表性复跑：两轮 8 用户、32 消息、64 typing、32 查询均通过；之后 10 批 4 用户短 soak 全部通过。10 批前后 Gateway RSS `5648→5776 KiB`，Reactor `121392→92960 KiB`，agent `25120→23904 KiB`；FD 为 `9/14/8` 不变。SQLite 精确新增 40 用户、10 群、40 成员和 80 条消息，文件 `73728→90112` 字节。
+- 最终浏览器：两个 React 标签页分别注册为 `dest_id=60/61`，创建并加入 group 14；两边均显示 2/2 在线、2 条连接，并实时看到对方经 Gateway 发送、SQLite 分配 id 148/149 的双向消息。两个页面控制台均无 error。
+- 最终静态门禁：`zig fmt --check build.zig src`、257 pass/1 skip 的 Zig 测试、ReleaseSafe、Reactor/client-agent Go 测试、React production build 和两个仓库 `git diff --check` 全部通过。
+- 结果：M0–M18 PASS，阶段一关闭。冻结当前 Mac 验证资产并允许开始远程 Linux；不创建 tag、release 或生产承诺。
 
 ## 7. 与 CI、发布和后续演进的关系
 

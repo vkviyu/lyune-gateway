@@ -45,25 +45,29 @@ type statusResponse struct {
 }
 
 type exchangeRequest struct {
-	Kind        string   `json:"kind"`
-	Group       uint8    `json:"group"`
-	RouteKey    uint8    `json:"route_key"`
-	Chunks      []string `json:"chunks"`
-	DelayMS     int      `json:"delay_ms"`
-	ReadDelayMS int      `json:"read_delay_ms"`
-	TimeoutMS   int      `json:"timeout_ms"`
-	Parallel    int      `json:"parallel"`
+	Kind            string   `json:"kind"`
+	Group           uint8    `json:"group"`
+	RouteKey        uint8    `json:"route_key"`
+	Chunks          []string `json:"chunks"`
+	DelayMS         int      `json:"delay_ms"`
+	ReadDelayMS     int      `json:"read_delay_ms"`
+	TimeoutMS       int      `json:"timeout_ms"`
+	Parallel        int      `json:"parallel"`
+	ResponseMode    string   `json:"response_mode"`
+	ResetInputAfter int      `json:"reset_input_after,omitempty"`
+	StopResponse    bool     `json:"stop_response,omitempty"`
 }
 
 type observedFrame struct {
-	Type       string `json:"type"`
-	Flags      uint8  `json:"flags"`
-	EOF        bool   `json:"eof"`
-	DestKind   uint8  `json:"dest_kind,omitempty"`
-	Group      uint8  `json:"group,omitempty"`
-	RouteKey   uint8  `json:"route_key,omitempty"`
-	Body       string `json:"body"`
-	ObservedMS int64  `json:"observed_ms"`
+	Type         string `json:"type"`
+	Flags        uint8  `json:"flags"`
+	EOF          bool   `json:"eof"`
+	DestKind     uint8  `json:"dest_kind,omitempty"`
+	Group        uint8  `json:"group,omitempty"`
+	RouteKey     uint8  `json:"route_key,omitempty"`
+	ResponseMode uint8  `json:"response_mode,omitempty"`
+	Body         string `json:"body"`
+	ObservedMS   int64  `json:"observed_ms"`
 }
 
 type exchangeResult struct {
@@ -73,6 +77,7 @@ type exchangeResult struct {
 	RequestFinMS   int64           `json:"request_fin_ms"`
 	DurationMS     int64           `json:"duration_ms"`
 	Error          string          `json:"error,omitempty"`
+	Termination    string          `json:"termination,omitempty"`
 }
 
 type exchangeResponse struct {
@@ -95,8 +100,10 @@ func main() {
 	mux.HandleFunc("/api/im/auth", agent.handleIMAuth)
 	mux.HandleFunc("/api/im/status", agent.handleIMStatus)
 	mux.HandleFunc("/api/im/command", agent.handleIMCommand)
+	mux.HandleFunc("/api/im/exchange", agent.handleIMExchange)
 	mux.HandleFunc("/api/im/events", agent.handleIMEvents)
 	mux.HandleFunc("/api/im/logout", agent.handleIMLogout)
+	mux.HandleFunc("/api/im/violate-server-stream", agent.handleIMViolateServerStream)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alpn": wire.ALPN})
 	})
@@ -195,21 +202,8 @@ func (a *Agent) handleExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if len(request.Chunks) == 0 {
-		request.Chunks = []string{"hello through lyune"}
-	}
-	if request.TimeoutMS <= 0 {
-		request.TimeoutMS = 10_000
-	}
-	if request.DelayMS < 0 || request.ReadDelayMS < 0 || request.ReadDelayMS > 60_000 || request.TimeoutMS > 180_000 {
-		writeError(w, http.StatusBadRequest, errors.New("delays must be non-negative, read_delay_ms at most 60000, and timeout_ms at most 180000"))
-		return
-	}
-	if request.Parallel <= 0 {
-		request.Parallel = 1
-	}
-	if request.Parallel > 128 {
-		writeError(w, http.StatusBadRequest, errors.New("parallel must be at most 128"))
+	if err := prepareExchangeRequest(&request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -218,14 +212,48 @@ func (a *Agent) handleExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
+	writeExchangeResponse(w, runExchanges(r.Context(), conn, request))
+}
 
+func prepareExchangeRequest(request *exchangeRequest) error {
+	if len(request.Chunks) == 0 {
+		request.Chunks = []string{"hello through lyune"}
+	}
+	if request.TimeoutMS <= 0 {
+		request.TimeoutMS = 10_000
+	}
+	if request.DelayMS < 0 || request.ReadDelayMS < 0 || request.ReadDelayMS > 60_000 || request.TimeoutMS > 180_000 {
+		return errors.New("delays must be non-negative, read_delay_ms at most 60000, and timeout_ms at most 180000")
+	}
+	if request.Parallel <= 0 {
+		request.Parallel = 1
+	}
+	if request.Parallel > 128 {
+		return errors.New("parallel must be at most 128")
+	}
+	if request.ResponseMode == "" {
+		request.ResponseMode = "required"
+	}
+	if request.ResponseMode != "required" && request.ResponseMode != "none" {
+		return errors.New("response_mode must be required or none")
+	}
+	if request.ResetInputAfter < 0 || request.ResetInputAfter >= len(request.Chunks) {
+		return errors.New("reset_input_after must be zero or stop before the final chunk")
+	}
+	if request.ResetInputAfter > 0 && request.StopResponse {
+		return errors.New("reset_input_after and stop_response are mutually exclusive")
+	}
+	return nil
+}
+
+func runExchanges(ctx context.Context, conn *quic.Conn, request exchangeRequest) exchangeResponse {
 	results := make([]exchangeResult, request.Parallel)
 	var wait sync.WaitGroup
 	for index := range results {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			results[index] = runExchange(r.Context(), conn, request)
+			results[index] = runExchange(ctx, conn, request)
 		}()
 	}
 	wait.Wait()
@@ -238,6 +266,10 @@ func (a *Agent) handleExchange(w http.ResponseWriter, r *http.Request) {
 			response.Failed++
 		}
 	}
+	return response
+}
+
+func writeExchangeResponse(w http.ResponseWriter, response exchangeResponse) {
 	status := http.StatusOK
 	if response.Failed > 0 {
 		status = http.StatusBadGateway
@@ -249,6 +281,21 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(parent, time.Duration(request.TimeoutMS)*time.Millisecond)
 	defer cancel()
+	if request.Kind == "uni" {
+		stream, err := conn.OpenUniStreamSync(ctx)
+		if err != nil {
+			return exchangeResult{
+				DurationMS:  time.Since(started).Milliseconds(),
+				Termination: "unidirectional_stream_refused",
+			}
+		}
+		stream.CancelWrite(0x103)
+		return exchangeResult{
+			StreamID:   uint64(stream.StreamID()),
+			DurationMS: time.Since(started).Milliseconds(),
+			Error:      "Gateway advertised an unsupported unidirectional stream credit",
+		}
+	}
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -257,36 +304,47 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 	deadline := started.Add(time.Duration(request.TimeoutMS) * time.Millisecond)
 	_ = stream.SetDeadline(deadline)
 	result := exchangeResult{StreamID: uint64(stream.StreamID())}
+	if request.StopResponse {
+		// Send STOP_SENDING before the request bytes. The Gateway must suppress its return
+		// direction while keeping the QUIC connection usable for other streams.
+		stream.CancelRead(0x102)
+	}
 
 	type readResult struct {
 		frames []observedFrame
 		err    error
 	}
 	readDone := make(chan readResult, 1)
-	go func() {
-		if request.ReadDelayMS > 0 {
-			select {
-			case <-ctx.Done():
-				readDone <- readResult{err: ctx.Err()}
-				return
-			case <-time.After(time.Duration(request.ReadDelayMS) * time.Millisecond):
-			}
-		}
-		var frames []observedFrame
-		for {
-			frame, readErr := wire.ReadFrame(stream)
-			if readErr != nil {
-				if readErr == io.EOF {
-					readErr = nil
+	if !request.StopResponse {
+		go func() {
+			if request.ReadDelayMS > 0 {
+				select {
+				case <-ctx.Done():
+					readDone <- readResult{err: ctx.Err()}
+					return
+				case <-time.After(time.Duration(request.ReadDelayMS) * time.Millisecond):
 				}
-				readDone <- readResult{frames: frames, err: readErr}
-				return
 			}
-			frames = append(frames, observe(frame, time.Since(started)))
-		}
-	}()
+			var frames []observedFrame
+			for {
+				frame, readErr := wire.ReadFrame(stream)
+				if readErr != nil {
+					if readErr == io.EOF {
+						readErr = nil
+					}
+					readDone <- readResult{frames: frames, err: readErr}
+					return
+				}
+				frames = append(frames, observe(frame, time.Since(started)))
+			}
+		}()
+	}
 
 	dest := wire.DestService
+	responseMode := wire.ResponseRequired
+	if request.ResponseMode == "none" {
+		responseMode = wire.ResponseNone
+	}
 	group := request.Group
 	routeKey := request.RouteKey
 	if request.Kind == "control" {
@@ -305,7 +363,7 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 		}
 		var frame *wire.Frame
 		if index == 0 {
-			frame, err = wire.NewOpen(dest, group, routeKey, flags, []byte(chunk))
+			frame, err = wire.NewOpen(dest, group, routeKey, responseMode, flags, []byte(chunk))
 		} else {
 			frame, err = wire.NewData(flags, []byte(chunk))
 		}
@@ -320,6 +378,27 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 			return exchangeResult{StreamID: result.StreamID, Error: fmt.Sprintf("write frame: %v", err)}
 		}
 		result.RequestFrames = append(result.RequestFrames, observe(frame, time.Since(started)))
+		if request.ResetInputAfter == index+1 {
+			// RESET_STREAM ends only the client→Gateway direction. Because the application
+			// request has no eof, Gateway must explicitly terminate its response direction
+			// as an error instead of leaving the reader suspended until its deadline.
+			stream.CancelWrite(0x101)
+			result.RequestFinMS = time.Since(started).Milliseconds()
+			select {
+			case read := <-readDone:
+				result.ResponseFrames = read.frames
+				if read.err == nil {
+					result.Error = "reset input ended with a clean response stream"
+				} else {
+					result.Termination = "reset_input_confirmed"
+				}
+			case <-ctx.Done():
+				stream.CancelRead(1)
+				result.Error = fmt.Sprintf("reset input was not acknowledged: %v", ctx.Err())
+			}
+			result.DurationMS = time.Since(started).Milliseconds()
+			return result
+		}
 		if request.DelayMS > 0 && index != len(request.Chunks)-1 {
 			select {
 			case <-ctx.Done():
@@ -334,14 +413,21 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 	if err := stream.Close(); err != nil {
 		return exchangeResult{StreamID: result.StreamID, Error: fmt.Sprintf("close request side: %v", err)}
 	}
+	if request.StopResponse {
+		result.Termination = "stop_response_sent"
+		result.DurationMS = time.Since(started).Milliseconds()
+		return result
+	}
 
 	select {
 	case read := <-readDone:
 		result.ResponseFrames = read.frames
 		if read.err != nil {
 			result.Error = fmt.Sprintf("read response: %v", read.err)
-		} else if len(read.frames) == 0 {
+		} else if len(read.frames) == 0 && responseMode == wire.ResponseRequired {
 			result.Error = "gateway returned an empty response stream"
+		} else if len(read.frames) != 0 && responseMode == wire.ResponseNone {
+			result.Error = "gateway returned application frames for a no-response exchange"
 		} else {
 			for _, frame := range read.frames {
 				if frame.Type == "OPEN" && frame.DestKind == uint8(wire.DestGateway) && frame.RouteKey == 0xF0 {
@@ -369,14 +455,15 @@ func observe(frame *wire.Frame, elapsed time.Duration) observedFrame {
 		typeName = "OPEN"
 	}
 	return observedFrame{
-		Type:       typeName,
-		Flags:      uint8(frame.Header.Flags),
-		EOF:        frame.Header.Flags.IsEOF(),
-		DestKind:   uint8(frame.Header.DestKind),
-		Group:      frame.Header.Group,
-		RouteKey:   frame.Header.RouteKey,
-		Body:       string(frame.Body),
-		ObservedMS: elapsed.Milliseconds(),
+		Type:         typeName,
+		Flags:        uint8(frame.Header.Flags),
+		EOF:          frame.Header.Flags.IsEOF(),
+		DestKind:     uint8(frame.Header.DestKind),
+		ResponseMode: uint8(frame.Header.Response),
+		Group:        frame.Header.Group,
+		RouteKey:     frame.Header.RouteKey,
+		Body:         string(frame.Body),
+		ObservedMS:   elapsed.Milliseconds(),
 	}
 }
 

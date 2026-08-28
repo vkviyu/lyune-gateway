@@ -181,7 +181,7 @@ test "aligned frames are dispatched without touching the spill buffer" {
 
     var buf: [256]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
-    const one = try encoder.encodeOpen(.service, RouteId.init(1, 2), Flags.last(), "payload");
+    const one = try encoder.encodeOpen(.service, RouteId.init(1, 2), .required, Flags.last(), "payload");
 
     var spill: Spill = .{ .items = &.{}, .capacity = 0 };
     defer spill.deinit(allocator);
@@ -200,7 +200,7 @@ test "a frame split across callbacks is reassembled exactly once" {
 
     var buf: [256]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
-    const one = try encoder.encodeOpen(.service, RouteId.init(3, 4), .{}, "split-me");
+    const one = try encoder.encodeOpen(.service, RouteId.init(3, 4), .required, .{}, "split-me");
 
     var spill: Spill = .{ .items = &.{}, .capacity = 0 };
     defer spill.deinit(allocator);
@@ -246,7 +246,7 @@ test "frames following a straddling frame stay on the zero-copy path" {
     var buf: [256]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
 
-    const first = try encoder.encodeOpen(.service, RouteId.init(1, 1), .{}, "first");
+    const first = try encoder.encodeOpen(.service, RouteId.init(1, 1), .required, .{}, "first");
     @memcpy(stream[0..first.len], first);
     const first_len = first.len;
     const second = try encoder.encodeData(Flags.last(), "second");
@@ -310,7 +310,7 @@ test "an oversized frame is rejected from its header alone" {
 
     var buf: [256]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
-    const one = try encoder.encodeOpen(.service, RouteId.init(1, 1), Flags.last(), "0123456789");
+    const one = try encoder.encodeOpen(.service, RouteId.init(1, 1), .required, Flags.last(), "0123456789");
 
     var spill: Spill = .{ .items = &.{}, .capacity = 0 };
     defer spill.deinit(allocator);
@@ -335,7 +335,7 @@ test "onFrame can stop the drain and leave the rest unprocessed" {
     const first = try encoder.encodeDisconnect();
     @memcpy(stream[0..first.len], first);
     const first_len = first.len;
-    const second = try encoder.encodeOpen(.service, RouteId.init(1, 1), Flags.last(), "never-seen");
+    const second = try encoder.encodeOpen(.service, RouteId.init(1, 1), .required, Flags.last(), "never-seen");
     @memcpy(stream[first_len..][0..second.len], second);
     const total = first_len + second.len;
 

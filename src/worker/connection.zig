@@ -28,7 +28,7 @@ pub const BackendStream = struct {
     scope: ScopedRoute,
 };
 
-/// 一条客户端流上的交换状态。
+/// 本端在一条入站流上接收应用交换时保存的状态。
 ///
 /// 协议规定"一条 QUIC 流 = 一次交换"（OPEN + N×DATA，末帧带 eof）。条目的存在
 /// 表示"这条流上有一次已被接纳的交换"，由此得到两条判据（设计文档 §7.5）：
@@ -41,9 +41,12 @@ pub const BackendStream = struct {
 /// 顺带杀掉整条连接。
 ///
 /// 条目在 QUIC FIN 或流被终止时清理，因此"客户端发了 eof 却迟迟不发 FIN"会
-/// 让条目滞留。这只会占用它自己那份 `max_exchanges_per_connection` 额度，
+/// 让条目滞留。这只会占用它自己那份 `max_inbound_exchanges_per_connection` 额度，
 /// 伤不到别的连接。
-pub const Exchange = struct {
+/// 它只描述“对端正在向本端发送什么”，不代表完整的请求/响应生命周期；请求转给
+/// 后端后的相关性由 `inflight.Tables` 单独持有。这个边界让请求输入完成后仍可等待
+/// 流式响应，而不会把 QUIC 流、入站解析和后端在途三个生命周期混为一谈。
+pub const InboundExchange = struct {
     /// 后端流；仅当目的地是 `.service` 且交换仍在进行时有值。
     ///
     /// 一次性交换（OPEN 直接带 eof）不留句柄：后端流已经随首帧 fin 了，
@@ -54,8 +57,10 @@ pub const Exchange = struct {
     /// 只可能出现在**对等网关节点**的连接上：那一侧的入站流是别的节点开的会话流，
     /// 会话身份就是这条流。客户端连接上永远是 0——客户端无权寻址 `.peer`。
     push_session: u64 = 0,
-    /// 已收到带 eof 的帧，这次交换结束了，但流还没被 QUIC FIN 收走。
-    completed: bool = false,
+    /// 发起方是否需要应用层响应；`.none` 成功接纳后只回空 FIN。
+    response_mode: protocol.frame.ResponseMode = .required,
+    /// 已收到带 eof 的帧，这次入站输入结束了，但流还没被 QUIC FIN 收走。
+    input_complete: bool = false,
 };
 
 /// 一条连接在整个集群里的唯一标识。
@@ -71,7 +76,7 @@ pub const Exchange = struct {
 ///
 /// 对后端**不透明**：它只负责原样存下、原样回传。位段布局是网关的内部约定，
 /// 后端不解析、也不构造。
-pub const ConnToken = packed struct(u64) {
+pub const ConnToken = packed struct(u128) {
     /// 槽位复用计数器，防 ABA：槽位被新连接复用后，旧 token 必须失配。
     ///
     /// u16 意味着同一槽位被复用 65536 次之后会绕回。要撞上得让一个后端持有某个
@@ -85,12 +90,16 @@ pub const ConnToken = packed struct(u64) {
     /// 这条连接所在的节点。
     node_id: u16 = 0,
 
-    /// 线格式是大端 u64（与 body.TargetList 的条目一致）。
-    pub fn encode(self: ConnToken) u64 {
+    /// Gateway 进程启动时生成的随机 incarnation。同一 node/worker/slot/generation 在
+    /// 进程重启后会重新出现；没有它，旧 presence/kick 会与新连接确定性碰撞。
+    incarnation: u64 = 0,
+
+    /// 线格式是大端 u128；后端把它当不透明 16 字节值存储。
+    pub fn encode(self: ConnToken) u128 {
         return @bitCast(self);
     }
 
-    pub fn decode(raw: u64) ConnToken {
+    pub fn decode(raw: u128) ConnToken {
         return @bitCast(raw);
     }
 };
@@ -146,6 +155,12 @@ pub const ConnectionContext = struct {
     /// （见 `groupConnections`），与 `dest_id == 0` 表示"不可寻址"是同一套约定。
     channels: [protocol.datagram.max_channels]u64 = @splat(0),
     connected_at: i64,
+    /// 生命周期事件在同一 conn_token 上的严格递增序号。不同事件使用不同 QUIC 流，
+    /// 只有这个序号能让 Reactor 在跨流乱序时稳定选择最新状态。
+    lifecycle_sequence: u64 = 0,
+    /// 最近一次尝试发布 online/refresh 的单调时钟。Reactor 把 online 当租约，
+    /// Gateway 周期刷新；进程崩溃来不及发 offline 时，租约也会自行失效。
+    lifecycle_refreshed_at: u64 = 0,
 
     // owning GatewayWorker pointer, kept opaque to avoid an import cycle.
     gateway_ctx: ?*anyopaque = null,
@@ -156,14 +171,16 @@ pub const ConnectionContext = struct {
     /// 也不会发生任何堆分配。
     frame_spills: std.AutoHashMap(u64, protocol.framing.Spill),
 
-    /// 进行中的交换：客户端 stream_id -> 交换状态。
-    exchanges: std.AutoHashMap(u64, Exchange),
+    /// 入站 stream_id -> 接收状态。它不保存后端响应本身的生命周期。
+    inbound_exchanges: std.AutoHashMap(u64, InboundExchange),
 
     /// 本次分帧循环结束后需要关闭这条连接。
     ///
     /// 不能在循环里就地关闭：正在分派的帧指向 spill 缓冲，连接一旦被销毁
     /// 后续迭代就会读到已释放内存。因此这里只置位，由分帧调用方收尾时处理。
     close_requested: bool = false,
+    /// 主动关闭路径给生命周期事件留下的业务原因；null 时由 QUIC close event 推导。
+    offline_reason: ?protocol.body.SessionLifecycle.Reason = null,
 
     pub fn init(allocator: std.mem.Allocator, cnx: quic.c.QuicCnx, realm: RealmId) ConnectionContext {
         return .{
@@ -172,7 +189,7 @@ pub const ConnectionContext = struct {
             .realm = realm,
             .connected_at = foundation.time.timestampSeconds(),
             .frame_spills = std.AutoHashMap(u64, protocol.framing.Spill).init(allocator),
-            .exchanges = std.AutoHashMap(u64, Exchange).init(allocator),
+            .inbound_exchanges = std.AutoHashMap(u64, InboundExchange).init(allocator),
         };
     }
 
@@ -180,7 +197,7 @@ pub const ConnectionContext = struct {
         var it = self.frame_spills.valueIterator();
         while (it.next()) |spill| spill.deinit(self.allocator);
         self.frame_spills.deinit();
-        self.exchanges.deinit();
+        self.inbound_exchanges.deinit();
     }
 
     /// 取这条流的残帧缓冲；没有残帧时返回 null。
@@ -206,25 +223,25 @@ pub const ConnectionContext = struct {
 
     /// 取这条客户端流的交换状态；这条流还没收过 OPEN 时返回 null。
     ///
-    /// 返回指针是为了让调用方就地推进状态（收到 eof 改 `.completed`、
+    /// 返回指针是为了让调用方就地推进状态（收到 eof 改 `.input_complete`、
     /// 业务失败改 `.failed`），省掉一次哈希查找。
-    pub fn exchange(self: *ConnectionContext, stream_id: u64) ?*Exchange {
-        return self.exchanges.getPtr(stream_id);
+    pub fn inboundExchange(self: *ConnectionContext, stream_id: u64) ?*InboundExchange {
+        return self.inbound_exchanges.getPtr(stream_id);
     }
 
     /// 登记一次新交换。
-    pub fn openExchange(self: *ConnectionContext, stream_id: u64, entry: Exchange) !void {
-        try self.exchanges.put(stream_id, entry);
+    pub fn registerInboundExchange(self: *ConnectionContext, stream_id: u64, entry: InboundExchange) !void {
+        try self.inbound_exchanges.put(stream_id, entry);
     }
 
     /// 移除交换状态（QUIC FIN，或这条流被终止）。
-    pub fn closeExchange(self: *ConnectionContext, stream_id: u64) void {
-        _ = self.exchanges.remove(stream_id);
+    pub fn removeInboundExchange(self: *ConnectionContext, stream_id: u64) void {
+        _ = self.inbound_exchanges.remove(stream_id);
     }
 
     /// 当前这条连接上的交换数量，用于按连接限流。
-    pub fn exchangeCount(self: *const ConnectionContext) usize {
-        return self.exchanges.count();
+    pub fn inboundExchangeCount(self: *const ConnectionContext) usize {
+        return self.inbound_exchanges.count();
     }
 
     /// 这条连接此刻是否仍然被准入。
@@ -563,6 +580,8 @@ pub const ConnectionManager = struct {
     node_id: u16,
     /// 本 Worker 编号；只用于签发/校验 ConnToken。
     worker_id: u8,
+    /// 本进程实例的随机身份，签入每个 ConnToken，重启即改变。
+    incarnation: u64,
     slots: []Slot,
     index: IndexTable,
     /// (realm, dest_id) -> 槽位链表头。空表示当前没有任何连接被绑定过标识。
@@ -653,10 +672,16 @@ pub const ConnectionManager = struct {
         var group_quota = try foundation.quota.Quota.init(allocator, foundation.quota.max_tracked_realms, groups.edges.len, foundation.quota.default_watermark_percent);
         errdefer group_quota.deinit(allocator);
 
+        var incarnation_bytes: [8]u8 = undefined;
+        std.Io.Threaded.global_single_threaded.io().random(&incarnation_bytes);
+        var incarnation = std.mem.readInt(u64, &incarnation_bytes, .big);
+        if (incarnation == 0) incarnation = 1;
+
         return .{
             .allocator = allocator,
             .node_id = node_id,
             .worker_id = worker_id,
+            .incarnation = incarnation,
             .slots = slots,
             .index = index,
             .dest_index = dest_index,
@@ -754,6 +779,7 @@ pub const ConnectionManager = struct {
             .worker_id = self.worker_id,
             .slot = @intCast(slot_index),
             .generation = self.slots[slot_index].generation,
+            .incarnation = self.incarnation,
         };
     }
 
@@ -769,7 +795,7 @@ pub const ConnectionManager = struct {
     /// 单独比对（见 worker/egress.zig 的 kick 执行）。放在这里会让"定位"与"授权"
     /// 混成一个函数，而两者失败时的处置不同。
     pub fn byToken(self: *ConnectionManager, token: ConnToken) ?*ConnectionContext {
-        if (token.node_id != self.node_id or token.worker_id != self.worker_id) return null;
+        if (token.node_id != self.node_id or token.worker_id != self.worker_id or token.incarnation != self.incarnation) return null;
         if (token.slot >= self.slots.len) return null;
         const slot = &self.slots[token.slot];
         if (!slot.in_use) return null;
@@ -1077,9 +1103,32 @@ pub const ConnectionManager = struct {
         return self.live;
     }
 
+    pub const Stats = struct {
+        connections: usize,
+        exchanges: usize,
+        frame_spills: usize,
+    };
+
+    /// 低频诊断快照。槽位池定容，遍历成本与 max_connections 成正比；只供周期性
+    /// metrics 日志使用，不能放到逐包或逐帧热路径。
+    pub fn stats(self: *const ConnectionManager) Stats {
+        var exchanges: usize = 0;
+        var frame_spills: usize = 0;
+        for (self.slots) |*slot| {
+            if (!slot.in_use) continue;
+            exchanges += slot.ctx.inbound_exchanges.count();
+            frame_spills += slot.ctx.frame_spills.count();
+        }
+        return .{ .connections = self.live, .exchanges = exchanges, .frame_spills = frame_spills };
+    }
+
     /// 池容量，即配置允许的最大并发连接数。
     pub fn capacity(self: *const ConnectionManager) usize {
         return self.slots.len;
+    }
+
+    pub fn workerId(self: *const ConnectionManager) u8 {
+        return self.worker_id;
     }
 
     /// 获取连接上下文
@@ -1368,7 +1417,7 @@ test "a ConnToken locates exactly one connection and expires with its slot" {
     try std.testing.expectEqual(test_worker, token.worker_id);
     try std.testing.expectEqual(first.inner, manager.byToken(token).?.cnx_handle);
 
-    // 线格式往返：后端只原样存回一个大端 u64。
+    // 线格式往返：后端只原样存回一个大端 u128。
     try std.testing.expectEqual(token, ConnToken.decode(token.encode()));
 
     // 连接关掉后 token 立刻失效。
@@ -1394,6 +1443,34 @@ test "a ConnToken locates exactly one connection and expires with its slot" {
     elsewhere = fresh;
     elsewhere.slot = 99;
     try std.testing.expect(manager.byToken(elsewhere) == null);
+}
+
+test "a ConnToken from a previous process incarnation never locates a new connection" {
+    var previous = try testManager(1);
+    defer previous.deinit();
+    var current = try testManager(1);
+    defer current.deinit();
+
+    // 固定成不同值，让回归测试确定而不依赖随机碰撞概率。
+    previous.incarnation = 0x1111_2222_3333_4444;
+    current.incarnation = 0x5555_6666_7777_8888;
+
+    var old_connection = QUICConnection{ .inner = @ptrFromInt(0x1000) };
+    var new_connection = QUICConnection{ .inner = @ptrFromInt(0x2000) };
+    _ = try previous.add(&old_connection, test_realm, null);
+    _ = try current.add(&new_connection, test_realm, null);
+
+    const old_token = previous.tokenFor(old_connection.inner).?;
+    const new_token = current.tokenFor(new_connection.inner).?;
+
+    // node/worker/slot/generation 在重启后可以完全相同，incarnation 仍保证隔离。
+    try std.testing.expectEqual(old_token.node_id, new_token.node_id);
+    try std.testing.expectEqual(old_token.worker_id, new_token.worker_id);
+    try std.testing.expectEqual(old_token.slot, new_token.slot);
+    try std.testing.expectEqual(old_token.generation, new_token.generation);
+    try std.testing.expect(old_token.incarnation != new_token.incarnation);
+    try std.testing.expect(current.byToken(old_token) == null);
+    try std.testing.expectEqual(new_connection.inner, current.byToken(new_token).?.cnx_handle);
 }
 
 test "admission needs both a successful auth and a live TTL" {

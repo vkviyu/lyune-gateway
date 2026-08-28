@@ -112,6 +112,15 @@ pub const Connection = struct {
         _ = quic_c.c.picoquic_reset_stream(self.inner, stream_id, 0);
     }
 
+    /// 废弃一条双向 stream，但保留承载它的 QUIC 连接。
+    ///
+    /// RESET_STREAM 只终止本端的发送方向；STOP_SENDING 才会要求对端停止响应。
+    /// picoquic_discard_stream 同时完成两者并清除该 stream 的应用上下文，适合
+    /// request deadline、主动取消等不应扩大到整条复用连接的场景。
+    pub fn discardStream(self: *Connection, stream_id: u64) void {
+        _ = quic_c.c.picoquic_discard_stream(self.inner, stream_id, 0);
+    }
+
     /// 关闭连接（正常关闭，application error code = 0）
     pub fn close(self: *Connection) void {
         self.closeWithError(0);

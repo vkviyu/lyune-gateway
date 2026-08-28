@@ -3,6 +3,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 're
 type User = { id: number; username: string }
 type Group = { id: number; name: string; invite_code: string; owner_id: number; joined_at?: string }
 type Message = { id: number; group_id: number; sender: User; text: string; created_at: string }
+type Presence = { user: User; online: boolean; online_sessions: number }
 
 type SessionStatus = {
   session_id: string
@@ -28,6 +29,8 @@ type CommandResponse = {
   groups?: Group[]
   message?: Message
   messages?: Message[]
+  presence?: Presence[]
+  group_id?: number
 }
 
 type PushEvent = {
@@ -64,6 +67,8 @@ function App() {
   const [groups, setGroups] = useState<Group[]>([])
   const [activeGroupID, setActiveGroupID] = useState<number | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
+  const [presence, setPresence] = useState<Presence[]>([])
+  const [typingUsers, setTypingUsers] = useState<User[]>([])
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [address, setAddress] = useState('127.0.0.1:8443')
@@ -77,6 +82,7 @@ function App() {
   const [pushState, setPushState] = useState<'idle' | 'listening' | 'retrying'>('idle')
   const lastEventSeq = useRef(0)
   const chatEnd = useRef<HTMLDivElement | null>(null)
+  const lastTypingSentAt = useRef(0)
 
   const activeGroup = useMemo(
     () => groups.find((group) => group.id === activeGroupID) ?? null,
@@ -101,9 +107,14 @@ function App() {
   const openGroup = useCallback(async (groupID: number) => {
     setBusy('history')
     try {
-      const result = await command({ type: 'history', group_id: groupID })
+      const [result, presenceResult] = await Promise.all([
+        command({ type: 'history', group_id: groupID }),
+        command({ type: 'presence', group_id: groupID }),
+      ])
       setActiveGroupID(groupID)
       setMessages(result.messages ?? [])
+      setPresence(presenceResult.presence ?? [])
+      setTypingUsers([])
       setNotice(null)
     } catch (error) {
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : String(error) })
@@ -150,6 +161,13 @@ function App() {
                 setNotice({ tone: 'info', text: `${message.sender.username} 发来一条新消息` })
               }
             }
+            if (event.payload.type === 'typing' && event.payload.user && event.payload.group_id === activeGroupID && event.payload.user.id !== session.user?.id) {
+              const typingUser = event.payload.user
+              setTypingUsers((current) => [...current.filter((user) => user.id !== typingUser.id), typingUser])
+              window.setTimeout(() => {
+                setTypingUsers((current) => current.filter((user) => user.id !== typingUser.id))
+              }, 2200)
+            }
           }
         } catch {
           if (controller.signal.aborted) return
@@ -164,6 +182,33 @@ function App() {
       controller.abort()
     }
   }, [session?.session_id, session?.authenticated, session?.user?.id, activeGroupID])
+
+  useEffect(() => {
+    if (!activeGroupID || !session?.authenticated) return
+    let stopped = false
+    const refresh = async () => {
+      try {
+        const result = await command({ type: 'presence', group_id: activeGroupID })
+        if (!stopped) setPresence(result.presence ?? [])
+      } catch {
+        // Presence is supplementary UI state; command and push failures remain visible elsewhere.
+      }
+    }
+    const timer = window.setInterval(() => void refresh(), 5000)
+    void refresh()
+    return () => { stopped = true; window.clearInterval(timer) }
+  }, [activeGroupID, session?.authenticated, command])
+
+  useEffect(() => {
+    if (!draft.trim() || !activeGroupID || !session?.authenticated) return
+    const timer = window.setTimeout(() => {
+      const now = Date.now()
+      if (now - lastTypingSentAt.current < 1200) return
+      lastTypingSentAt.current = now
+      void command({ type: 'typing', group_id: activeGroupID }).catch(() => undefined)
+    }, 220)
+    return () => window.clearTimeout(timer)
+  }, [draft, activeGroupID, session?.authenticated, command])
 
   useEffect(() => {
     chatEnd.current?.scrollIntoView({ behavior: 'smooth' })
@@ -201,6 +246,8 @@ function App() {
     setSession(null)
     setGroups([])
     setMessages([])
+    setPresence([])
+    setTypingUsers([])
     setActiveGroupID(null)
     setNotice(null)
   }
@@ -351,7 +398,10 @@ function App() {
           </div>
         ) : (
           <>
-            <div className="invite-strip"><span>邀请码</span><code>{activeGroup.invite_code}</code><button onClick={() => void navigator.clipboard.writeText(activeGroup.invite_code)}>复制</button></div>
+            <div className="invite-strip">
+              <span>邀请码</span><code>{activeGroup.invite_code}</code><button onClick={() => void navigator.clipboard.writeText(activeGroup.invite_code)}>复制</button>
+              <span className="presence-summary">{presence.filter((item) => item.online).length}/{presence.length} 位用户在线 · {presence.reduce((total, item) => total + item.online_sessions, 0)} 条连接</span>
+            </div>
             <div className="message-list">
               {messages.length === 0 && <div className="day-divider"><span>消息已由 Reactor 从 SQLite 读取</span></div>}
               {messages.map((message) => {
@@ -365,6 +415,7 @@ function App() {
               })}
               <div ref={chatEnd} />
             </div>
+            <div className="typing-state">{typingUsers.length > 0 ? `${typingUsers.map((user) => user.username).join('、')} 正在输入…` : ' '}</div>
             <form className="composer" onSubmit={sendMessage}>
               <textarea rows={2} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => {
                 if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() }
@@ -374,7 +425,7 @@ function App() {
           </>
         )}
         <footer className="protocol-footer">
-          <span>AUTH TTL {session.admission_ttl_seconds}s</span><span>SESSION {session.session_id.slice(0, 8)}…</span><span>后端业务授权 + 批量 .peer</span>
+          <span>AUTH TTL {session.admission_ttl_seconds}s</span><span>SESSION {session.session_id.slice(0, 8)}…</span><span>lyune/2 · required / none · lifecycle</span>
         </footer>
       </section>
     </main>

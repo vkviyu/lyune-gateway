@@ -34,6 +34,7 @@ pub const AsyncClient = struct {
     // 用户回调
     on_connected: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection) void = null,
     on_stream_data: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void = null,
+    on_stream_control: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, event: quic_c.CallbackEvent) void = null,
     on_close: ?*const fn (ctx: ?*anyopaque, conn: *QUICConnection, event: quic_c.CallbackEvent) void = null,
     user_context: ?*anyopaque = null,
 
@@ -91,6 +92,14 @@ pub const AsyncClient = struct {
         self.on_close = on_close;
     }
 
+    /// 单独注册流控制事件，避免把 RESET_STREAM / STOP_SENDING 伪装成空数据 FIN。
+    pub fn setStreamControlCallback(
+        self: *Self,
+        callback: ?*const fn (?*anyopaque, *QUICConnection, u64, quic_c.CallbackEvent) void,
+    ) void {
+        self.on_stream_control = callback;
+    }
+
     /// 启动客户端（非阻塞）
     /// 必须在 connect 之前调用
     pub fn start(self: *Self) void {
@@ -102,6 +111,7 @@ pub const AsyncClient = struct {
         self.endpoint.setUserData(self);
         self.endpoint.onConnection(emitConnected);
         self.endpoint.onStreamData(emitStreamData);
+        self.endpoint.onStreamControl(emitStreamControl);
         self.endpoint.onConnectionClose(emitClose);
 
         // 3. 启动 IO 监听（只注册 fd 到 loop，不阻塞）
@@ -292,6 +302,11 @@ pub const AsyncClient = struct {
         if (self.on_stream_data) |cb| {
             cb(self.user_context, conn, stream_id, data, is_fin);
         }
+    }
+
+    fn emitStreamControl(ctx: ?*anyopaque, conn: *QUICConnection, stream_id: u64, event: quic_c.CallbackEvent) void {
+        const self = castSelf(ctx.?);
+        if (self.on_stream_control) |cb| cb(self.user_context, conn, stream_id, event);
     }
 
     /// 连接终止。.close / .application_close / .stateless_reset 三种事件共用此路径。

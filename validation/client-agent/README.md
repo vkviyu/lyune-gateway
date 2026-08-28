@@ -1,6 +1,6 @@
 # Lyune Validation Client Agent
 
-这是浏览器旁的轻量 Go 客户端，用于 Mac 与 Linux 两阶段真实环境验证。浏览器不能直接打开自定义 ALPN `lyune/1` 的原生 QUIC，因此 agent 暴露本地 HTTP API，并使用 quic-go 与 Gateway 互操作；Gateway 与 Reactor 之间仍是另一段真实 QUIC。
+这是浏览器旁的轻量 Go 客户端，用于 Mac 与 Linux 两阶段真实环境验证。浏览器不能直接打开自定义 ALPN `lyune/2` 的原生 QUIC，因此 agent 暴露本地 HTTP API，并使用 quic-go 与 Gateway 互操作；Gateway 与 Reactor 之间仍是另一段真实 QUIC。
 
 两类入口同时保留：
 

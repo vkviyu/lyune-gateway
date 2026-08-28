@@ -62,6 +62,14 @@ pub const TransportError = error{
 /// - err: 如果操作失败则包含错误码，成功时为 null
 pub const ResolveCallback = *const fn (ctx: ?*anyopaque, err: ?TransportError) void;
 
+/// 后端流回调的种类。RESET_STREAM 与 STOP_SENDING 必须保持为异常终止，不能伪装成
+/// 空 FIN；后者会让上层把被取消的响应误判成一次成功的空响应。
+pub const RecvKind = enum {
+    data,
+    stream_reset,
+    stop_sending,
+};
+
 /// 后端传输接收事件。
 ///
 /// `data` 是对 transport 内部接收缓冲的**借用**，不是调用方拥有的内存：处理完必须
@@ -74,6 +82,7 @@ pub const TransportRecv = struct {
     stream_id: u64,
     data: []const u8,
     is_fin: bool,
+    kind: RecvKind = .data,
     token: u64 = 0,
     /// 这条流是**对端（后端）主动开的**，不是网关开的。
     ///
@@ -89,8 +98,8 @@ pub const TransportRecv = struct {
 /// 一次 transport 接收失败影响哪些后端流。
 ///
 /// `mask == 0` 表示这个 transport 上的全部流；其余实现可以用句柄中稳定的位域
-/// 精确圈定故障域。DirectTransport 的句柄高 16 位是连接 id，因此单个后端副本
-/// 断开时不必误伤同一逻辑服务的健康副本。
+/// 精确圈定故障域。DirectTransport 用句柄高 32 位的 connection id + generation
+/// 定位一个连接代际，因此副本断开时不会误伤健康副本或重连后的新流。
 pub const StreamSelector = struct {
     mask: u64 = 0,
     value: u64 = 0,
@@ -184,6 +193,12 @@ pub const BackendTransport = struct {
         /// error 后读取它。
         failureSelector: *const fn (ptr: *anyopaque) StreamSelector,
 
+        /// 某条流已达到应用层 deadline，只废弃该流。
+        ///
+        /// transport 不得因此关闭承载它的共享连接，否则同一连接上仍然健康的交换
+        /// 会被连带终止。没有流取消能力的实现可以不实现，接口层会安全退化为 no-op。
+        invalidateStream: *const fn (ptr: *anyopaque, stream: u64) void,
+
         /// 关闭连接
         ///
         /// 释放资源，断开与后端的连接。
@@ -238,6 +253,11 @@ pub const BackendTransport = struct {
         return self.vtable.failureSelector(self.ptr);
     }
 
+    /// 请求超时后取消对应后端流；共享连接及其余流必须继续存活。
+    pub fn invalidateStream(self: BackendTransport, stream: u64) void {
+        self.vtable.invalidateStream(self.ptr, stream);
+    }
+
     /// 关闭连接
     pub fn close(self: BackendTransport) void {
         return self.vtable.close(self.ptr);
@@ -246,7 +266,8 @@ pub const BackendTransport = struct {
     /// 这个 transport 实例的身份。
     ///
     /// `sendStream` 返回的句柄**只在单个实例内部唯一**：direct 实现用
-    /// `conn_id << 48 | stream_id` 合成，而 conn_id 是每个实例各自从 0 开始编号的。
+    /// `connection_id:16 | generation:16 | stream_id:32` 合成，而 connection_id
+    /// 是每个实例各自从 0 开始编号的。
     /// 因此凡是按后端流做索引的表（在途映射、推送重组缓冲）都必须把实例身份并进键里，
     /// 否则两个实例发出同一个句柄时，后一次登记会顶掉前一次，随后 A 的响应被写进
     /// B 的客户端流——跨路由、跨 realm 的串话。
@@ -307,6 +328,13 @@ pub const BackendTransport = struct {
                 return .{};
             }
 
+            fn invalidateStreamImpl(ptr: *anyopaque, stream: u64) void {
+                if (@hasDecl(T, "invalidateStreamImpl")) {
+                    const self: *T = @ptrCast(@alignCast(ptr));
+                    self.invalidateStreamImpl(stream);
+                }
+            }
+
             fn closeImpl(ptr: *anyopaque) void {
                 const self: *T = @ptrCast(@alignCast(ptr));
                 return self.closeImpl();
@@ -318,6 +346,7 @@ pub const BackendTransport = struct {
                 .receive = receiveImpl,
                 .releaseRecv = releaseRecvImpl,
                 .failureSelector = failureSelectorImpl,
+                .invalidateStream = invalidateStreamImpl,
                 .close = closeImpl,
             };
         };
