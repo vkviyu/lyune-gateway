@@ -2,7 +2,7 @@
 
 本目录按“当前事实、演进计划、稳定设计”三个层次组织。阅读和维护时应先判断问题属于哪一层，避免把完成状态、历史讨论和协议规范混在一起。
 
-当前门禁摘要：`TransportSession` 的 Raw QUIC 与 WSS binding 均已实现；两者的 Mac 自动化 M0–M18 均已通过，覆盖真实密码认证、混合 SQLite 群聊、协议/负例、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障和混合 soak。人工浏览器验证已确认 WSS 会话可读取 Raw 用户的持久化消息，且 WSS 消息可实时推送到 Raw 会话；Raw→WSS 同时在线实时推送和完整 UI 负例清单仍待人工关闭。当前主线已经切换为源码逐行审计，功能演进和远程 Linux 验证暂停；仍不创建 tag/release，也不把 Mac 结果外推为 Linux 或生产结论。当前方向以 `code_audit.md` 为准，代码事实和运行证据分别以 `status.md`、`validation.md` 为准。
+当前门禁摘要：`TransportSession` 的 Raw QUIC 与 WSS binding 均已实现；两者的 Mac 自动化 M0–M18 均已通过，覆盖真实密码认证、混合 SQLite 群聊、协议/负例、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障和混合 soak。人工浏览器验证已确认共享 SQLite 历史，并完成 Raw→WSS、WSS→Raw 两个方向的同时在线实时消息；因此多传输双向实时互通的人工证据已经关闭，剩余完整 UI 操作/负例清单单独跟踪。当前主线已经切换为源码逐行审计，功能演进和远程 Linux 验证暂停；仍不创建 tag/release，也不把 Mac 结果外推为 Linux 或生产结论。当前方向以 `code_audit.md` 为准，代码事实和运行证据分别以 `status.md`、`validation.md` 为准。
 
 ## 推荐阅读顺序
 

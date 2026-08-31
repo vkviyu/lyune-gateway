@@ -6,7 +6,7 @@
 >
 > 本文描述当前源码事实，不构成兼容性或发布时间承诺。
 
-真实 MacBook 单机 Raw QUIC M0–M18 最初冻结在 `425f2a6`。随后加入 `TransportSession` 与 WSS，两种 binding 均已通过 Mac 自动化 M0–M18；WSS 轮还覆盖真实认证/IM、协议并发与取消、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障与混合 soak。人工浏览器验证已经确认 WSS 会话能读取 Raw 用户持久化的群消息，且 WSS 发出的消息能实时推送到 Raw 会话；Raw→WSS 同时在线实时推送和完整 UI 负例清单仍待人工关闭。当前不再以“验收完成后立即进入 Linux”为默认顺序，而是冻结功能演进，先完成 [源码逐行审计](code_audit.md)，再由项目所有者决定方向。这里的“冻结”不是 release、兼容性承诺或生产就绪结论；运行证据以 [两阶段真实环境验证](validation.md) 为准。
+真实 MacBook 单机 Raw QUIC M0–M18 最初冻结在 `425f2a6`。随后加入 `TransportSession` 与 WSS，两种 binding 均已通过 Mac 自动化 M0–M18；WSS 轮还覆盖真实认证/IM、协议并发与取消、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障与混合 soak。人工浏览器验证已经确认共享用户与 SQLite 历史，并完成 Raw→WSS、WSS→Raw 两个方向的同时在线实时消息；多传输双向实时互通的人工证据已经关闭，完整 UI 操作/负例清单仍单独跟踪。当前不再以“验收完成后立即进入 Linux”为默认顺序，而是冻结功能演进，先完成 [源码逐行审计](code_audit.md)，再由项目所有者决定方向。这里的“冻结”不是 release、兼容性承诺或生产就绪结论；运行证据以 [两阶段真实环境验证](validation.md) 为准。
 
 ## 1. 已形成闭环的能力
 
@@ -83,13 +83,14 @@
 3. [ ] 在证据和风险排序完成前，不新增功能、不做机会主义重构、不进入远程 Linux；
 4. [ ] 审计结束后由项目所有者明确下一阶段，再更新 roadmap。
 
-### 已完成门禁：客户端传输抽象
+### 客户端传输抽象（已完成）与 UI 记录（待补）
 
 1. [x] Worker 的客户端写流、主动推送、临时消息、取消和关闭已收口为类型擦除 `TransportSession`；具体 binding 通过 `session.Handler`/`Acceptor` 由 app 装配，Worker 不导入 WSS；
 2. [x] `RawQuicSession` 已重新通过 Mac M0–M18；
 3. [x] slot/generation-backed `SessionHandle` 与 WSS/TLS/TCP binding 已实现，真实 QUIC↔WSS 双用户群聊第一轮通过；
 4. [x] WSS/混合 binding 的反复进程故障、受控 soak、资源趋势和 M18 干净自动化总复跑均已完成；
-5. [ ] 人工验收部分完成：用户已手工信任开发证书，并用真实 Raw/WSS 用户验证共享历史和 WSS→Raw 实时推送；Raw→WSS 同时在线实时推送及完整 UI 负例仍待关闭。完整决策见 [多传输客户端会话设计](transport_session_design.md)，当前 WSS 线格式与边界见 [WSS 传输 binding](wss_transport.md)。
+5. [x] 用户已手工信任开发证书，并用真实 Raw/WSS 用户验证共享历史及两个方向的同时在线实时推送；
+6. [ ] 错误密码、注册、建群/邀请码入群等完整 UI 操作清单尚未形成逐项人工记录。完整决策见 [多传输客户端会话设计](transport_session_design.md)，当前 WSS 线格式与边界见 [WSS 传输 binding](wss_transport.md)。
 
 ### 优先级 A：正确性与资源上界
 

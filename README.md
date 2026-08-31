@@ -2,7 +2,7 @@
 
 Lyune Gateway 是一个使用 Zig 构建的分布式实时通信网关。它负责 Raw QUIC/WSS 连接接入、流分发、在线推送和后端转发，只解析网关帧协议，不解析业务 Body。
 
-项目当前处于源码审计阶段：核心数据面、单机多 Worker 和主要分布式链路已经形成代码基线，但尚未发布版本，也没有生产环境使用者。客户端 I/O 已抽象为传输无关的 `TransportSession`；保持现有 `lyune/2` 线格式的 Raw QUIC 与新的 `lyune.v2` WSS binding 均已完成 Mac 自动化 M0–M18。WSS/Raw 真实 SQLite 群聊、协议并发与取消、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障和混合 soak 均已通过。人工浏览器验证已经确认 WSS 与 Raw QUIC 共享真实用户、SQLite 历史和在线推送路径，但完整双向实时/UI 负例清单尚未关闭。当前冻结功能演进和远程 Linux 验证，先由项目所有者逐行审计源码，再决定后续方向。审计范围见 [源码逐行审计](docs/code_audit.md)，真实运行证据见 [两阶段真实环境验证](docs/validation.md)。
+项目当前处于源码审计阶段：核心数据面、单机多 Worker 和主要分布式链路已经形成代码基线，但尚未发布版本，也没有生产环境使用者。客户端 I/O 已抽象为传输无关的 `TransportSession`；保持现有 `lyune/2` 线格式的 Raw QUIC 与新的 `lyune.v2` WSS binding 均已完成 Mac 自动化 M0–M18。WSS/Raw 真实 SQLite 群聊、协议并发与取消、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障和混合 soak 均已通过。人工浏览器验证也已经确认两种 binding 共享真实用户与 SQLite 历史，并完成 Raw QUIC→WSS、WSS→Raw QUIC 两个方向的同时在线实时消息；完整 UI 操作/负例清单仍单独记录。当前冻结功能演进和远程 Linux 验证，先由项目所有者逐行审计源码，再决定后续方向。审计范围见 [源码逐行审计](docs/code_audit.md)，真实运行证据见 [两阶段真实环境验证](docs/validation.md)。
 
 ## 当前基线
 

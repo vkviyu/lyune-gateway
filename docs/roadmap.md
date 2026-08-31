@@ -11,7 +11,7 @@
 - [x] 形成当前源码与文档的可推送基线；
 - [x] 本阶段不创建 tag，不生成 release，不承诺协议稳定性。
 
-## 阶段 1：客户端多传输接入与真实环境验证（Mac 自动化已完成，人工验收部分完成）
+## 阶段 1：客户端多传输接入与真实环境验证（自动化与双向实时人工验收已完成）
 
 阶段一在真实 MacBook 上使用 Go Reactor、原生 QUIC client-agent 和轻量 React UI，先完成单机最小闭环，再覆盖并发流、生命周期、慢端与超过 60 秒的长流。阶段二把同一套资产迁移到远程 Linux，验证跨平台构建、真实网络、io_uring、reuseport/cBPF 和多 Worker。
 
@@ -20,7 +20,7 @@ Mac 阶段 M0–M18 已通过并冻结：除真实 SQLite IM 闭环外，`lyune/
 在迁移到远程 Linux 前插入两道新的 Mac 门禁：
 
 1. （已完成）客户端 I/O 已收口为传输无关的 `TransportSession`；该步骤当时只启用映射到现有 picoquic 的 `RawQuicSession`。ALPN、OPEN/DATA 线格式、QUIC stream、datagram 和全部业务行为不变；Raw-only M0–M18 已重新通过；
-2. （自动化门禁已完成）TLS/TCP 上的 WSS binding 已让浏览器可直接连接 Gateway；真实 WSS↔Raw QUIC SQLite 群聊、协议/负例、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障、混合 soak 与 M18 干净总复跑均已通过。用户已手工信任开发证书，并验证 WSS 可读取 Raw 用户的历史消息、WSS 消息可实时到达 Raw 会话；Raw→WSS 同时在线实时推送和完整 UI 负例仍待关闭。
+2. （自动化门禁与双向实时人工验收已完成）TLS/TCP 上的 WSS binding 已让浏览器可直接连接 Gateway；真实 WSS↔Raw QUIC SQLite 群聊、协议/负例、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障、混合 soak 与 M18 干净总复跑均已通过。用户已手工信任开发证书，并验证共享历史以及 Raw→WSS、WSS→Raw 两个方向的同时在线实时消息；完整 UI 操作/负例清单仍单独跟踪。
 
 详细边界和“无损、无差异”的验收定义见 [多传输客户端会话设计](transport_session_design.md)，命令与逐次证据继续统一记录在 [两阶段真实环境验证](validation.md)。本阶段仍不创建 tag 或 release。
 
