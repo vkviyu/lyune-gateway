@@ -2,16 +2,16 @@
 
 > 建立日期：2026-08-27
 >
-> 当前状态：阶段一已完成，Mac M0–M18 全部通过并冻结；下一步进入远程 Linux。两个阶段完成前都不创建 release。
+> 当前状态：Raw QUIC 与 WSS 的 Mac 自动化 M0–M18 均已通过。用户已在真实浏览器完成一轮 Raw/WSS 混合 IM 操作，确认共享历史和 WSS→Raw 实时推送；Raw→WSS 同时在线实时推送及完整 UI 负例仍待关闭。当前先暂停验证扩展，进入源码逐行审计；不进入远程 Linux，也不创建 release。
 
-本文既是验证计划，也是持续更新的验证记录。它回答三个问题：当前真实链路怎样搭建、每一项怎样判定通过、实际执行时观察到了什么。设计能力是否存在仍以源码和 `status.md` 为准；本文件只记录真实进程与真实网络中的证据。
+本文既是验证计划，也是持续更新的验证记录。它回答三个问题：当前真实链路怎样搭建、每一项怎样判定通过、实际执行时观察到了什么。设计能力是否存在仍以源码和 `status.md` 为准；本文件只记录真实进程与真实网络中的证据。多传输的代码边界与门禁以 [多传输客户端会话设计](transport_session_design.md) 为准。
 
 ## 1. 验证目标与边界
 
-本轮先证明现有代码可以形成真实闭环，再继续补功能：
+本文保留完整的两阶段验证计划，但当前执行停在 Mac 阶段与源码审计之间：
 
-1. 在真实 MacBook 上启动带 SQLite、真实用户和群成员授权的 Go 后端、Zig 网关与轻量客户端，跑通登录、业务鉴权、持久化群消息和双用户实时推送；
-2. 阶段一稳定后，把相同组件和场景迁移到远程 Linux，验证跨平台构建、网络 I/O 与 Linux 专属路径；
+1. 在真实 MacBook 上启动带 SQLite、真实用户和群成员授权的 Go 后端、Zig 网关与轻量客户端，让浏览器 WSS 与 Raw QUIC 都跑通登录、业务鉴权、持久化群消息和双用户实时推送；
+2. Mac 证据和源码审计均通过后，再由项目所有者决定是否把相同组件和场景迁移到远程 Linux，验证跨平台构建、网络 I/O 与 Linux 专属路径；
 3. 每次执行保留环境、命令、配置、日志、预期结果、实际结果和问题编号，不能只留下“测试过”的结论；
 4. 当前没有生产环境和外部用户。本轮不创建 tag、release、镜像或兼容性承诺。
 
@@ -19,36 +19,44 @@
 
 ## 2. 组件与真实数据路径
 
-阶段一使用以下四个独立进程。主验收链路不是 echo，而是带真实业务状态的 IM：
+阶段一使用以下四个独立进程。主验收链路不是 echo，而是带真实业务状态的 IM；浏览器可直接走 WSS，也可经轻量 agent 走 Raw QUIC：
 
 ```text
 Browser / React UI :5173
-        |
-        | HTTP/JSON（控制、展示结果）
-        v
-client-agent :8787
-        |
-        | QUIC + ALPN lyune/2（真实客户端连接）
-        v
-lyune-gateway :8443
+        ├── WSS + subprotocol lyune.v2 ───────────────> Gateway TCP :8444
+        └── HTTP/JSON ─> client-agent :8787
+                              └── QUIC + ALPN lyune/2 ─> Gateway UDP :8443
+                                                              |
+                                                              | 共用 Worker/认证/Exchange/路由
+                                                              v
+                                                        DirectTransport
         |
         | QUIC + ALPN lyune/2（真实 DirectTransport）
         v
 lyune-reactor :9443
 ```
 
-端口 `8443` 只属于网关；Reactor 固定使用 `9443`，避免默认配置中前后端争用同一端口。主验收使用 `config/validation-im-macos.json`：认证路由 `.service(1,1)`、IM 路由 `.service(1,2)`、认证门禁和 `.peer` 回推全部开启。`config/validation-macos.json` 只保留为协议 echo/长流诊断配置，`config/validation-pressure-macos.json` 只用于人为缩小队列的 M7 压力负对照；三者都不改写日常默认配置。
+端口 `8443/UDP` 与 `8444/TCP` 只属于网关；Reactor 固定使用 `9443/UDP`，默认配置与验证配置均保持前后端端口分离。主验收使用 `config/validation-im-macos.json`：WSS 精确 Origin 白名单、认证路由 `.service(1,1)`、IM 路由 `.service(1,2)`、认证门禁和 `.peer` 回推全部开启。`config/validation-macos.json` 只保留为协议 echo/长流诊断配置，`config/validation-pressure-macos.json` 只用于人为缩小队列的 M7 压力负对照；三者都不改写日常默认配置。
 
-### 为什么浏览器旁需要 client-agent
+### 为什么仍保留 client-agent
 
-当前客户端协议是自定义 ALPN `lyune/2` 上的原生 QUIC。浏览器 JavaScript 不能打开任意 UDP socket，也不能直接协商自定义原生 QUIC ALPN；WebTransport 则要求服务端实现相应的 HTTP/3/WebTransport 语义，网关目前没有这层协议。
+浏览器 JavaScript 不能打开任意 UDP socket，也不能直接协商自定义 `lyune/2` QUIC ALPN。现在浏览器默认通过 `lyune.v2` WSS 直接连接 Gateway；client-agent 不再是浏览器使用网关的必需组件，但仍是同一页面切换到 Raw QUIC、对照两种 binding 和验证 UDP 首选路径的必要工具。
 
-因此 React 页面负责真实操作和观测，轻量 client-agent 负责浏览器不具备的传输能力。agent 使用独立 QUIC 实现与网关互操作，发送的仍是当前 OPEN/DATA 线格式，网关到 Reactor 也仍走真实 QUIC。这一结构不能被描述为“浏览器直连 QUIC”，但它完整覆盖网关的客户端数据面。为了省掉 agent 而给网关临时增加 WebTransport，不属于本轮冻结验证的范围。
+两种 binding 的 payload 都是相同 OPEN/DATA：WSS 只在 WebSocket binary message 外增加逻辑 stream envelope，agent 则使用真实 QUIC stream。两者在 Worker 内汇入相同 `TransportSession` 事件，网关到 Reactor 仍走真实 QUIC。WebTransport 当前不在前置路径中。
 
 对应资产：
 
-- `validation/web-client`：真实登录、建群、邀请码入群、历史消息与实时聊天页面；
+- `validation/web-client`：浏览器直连 WSS / Raw QUIC 对照的真实登录、建群、邀请码入群、历史消息与实时聊天页面；
 - `validation/client-agent`：每个浏览器会话一条独立 QUIC 连接，保存应用 token，并接收后端主动打开的 `.peer` 流；
+- `validation/wss-smoke.mjs`：无第三方依赖的 TLS/Upgrade/envelope 登录探针；
+- `validation/wss-mixed-im.mjs`：创建两个一次性 WSS 用户与一个 Raw QUIC 用户，执行真实授权、三向群聊、推送和历史一致性检查；
+- `validation/wss-negative.mjs`、`validation/wss-capacity.mjs`：逻辑流/WebSocket 违规和每 Worker 连接容量的真实负门禁；
+- `validation/wss-protocol.mjs`：WSS ping、单帧/多帧 echo、请求结束前响应、32 并发、required/none 与 RESET/STOP；
+- `validation/wss-reconnect-im.mjs`：WSS 接收者离线期间持久化、重新登录后的 SQLite 历史补偿与实时推送恢复；
+- `validation/wss-slow-consumer.mjs`：暂停一个真实 WSS TCP 接收端，压满其独立输出边界并确认健康会话继续持久化、请求和接收推送；
+- `validation/wss-presence.mjs`：同账号双 WSS 连接聚合、单连接退出、跨续租周期和最终离线；
+- `validation/wss-long-stream.mjs`：120 秒活跃流、60 秒静默 sibling、75 秒迟到 DATA 与后续连接复用；
+- `validation/wss-fault-recovery.mjs`：自管临时数据库与进程，反复停止 Reactor、强杀 Gateway，并核验恢复时间和 `conn_token` incarnation；
 - `../lyune-reactor/reactor`：Go/quic-go + SQLite 后端，负责密码校验、session、群成员授权、消息持久化与推送目标计算；
 - `config/validation-im-macos.json`：阶段一真实 IM 主配置；
 - `config/validation-macos.json`、`config/validation-pressure-macos.json`：协议诊断与 M7 专用配置。
@@ -69,7 +77,17 @@ lyune-reactor :9443
 
 ### 3.2 启动顺序
 
-从各项目根目录执行：
+推荐先从 Gateway 根目录使用一键脚本；它构建并启动四个进程、检查端口、保留日志与 SQLite，按 `Ctrl+C` 有序关闭：
+
+```bash
+./run-im-demo.sh
+```
+
+Mac 多 Worker/reuseport 增量门禁使用 `./run-im-demo.sh --workers 2`。脚本只在
+`/private/tmp/lyune-im-demo/gateway-config.json` 生成运行期配置，不修改版本库中的
+单 Worker 基线文件。
+
+首次使用浏览器 WSS 前，在 macOS“钥匙串访问”中导入项目根目录的 `server.crt` 并仅用于本地开发。证书包含 `localhost` 和 `127.0.0.1` SAN，但自签名证书仍必须由用户明确设置信任；页面代码不能绕过 TLS 校验。需要逐进程诊断时再从各项目根目录执行：
 
 ```bash
 # 1. Go 后端，监听 127.0.0.1:9443
@@ -80,7 +98,7 @@ go -C reactor run . \
   --key ../../lyune-gateway/server.key \
   --db /private/tmp/lyune-im-mac-stage.sqlite
 
-# 2. Zig 网关，监听 127.0.0.1:8443，并连接 Reactor :9443
+# 2. Zig 网关，监听 127.0.0.1:8443/UDP 与 :8444/TCP，并连接 Reactor :9443
 cd ../lyune-gateway
 zig build run -- server --config config/validation-im-macos.json
 
@@ -95,7 +113,7 @@ npm run dev
 
 正式记录时分别保存 Reactor、Gateway、agent 三份日志，不要只保留浏览器截图。
 
-M7 另开 `9444/8444`，不要扰动主 IM 数据库和会话：Reactor 增加 `--echo-delay 250ms`，Gateway 使用 `config/validation-pressure-macos.json`。该配置故意把 `max_receive_queue` 设为 8，只用于证明满载时的失败是完整、及时且可解释的，不能拿它做吞吐结论。
+M7 Raw QUIC 压力负对照另开 Reactor `9444/UDP` 和 Gateway `8444/UDP`；UDP 与主验证的 WSS `8444/TCP` 可共用端口号，但日志必须写明协议。Reactor 增加 `--echo-delay 250ms`，Gateway 使用 `config/validation-pressure-macos.json`。该配置故意把 `max_receive_queue` 设为 8，只用于证明满载时的失败是完整、及时且可解释的，不能拿它做吞吐结论。
 
 ### 3.3 场景顺序
 
@@ -103,7 +121,7 @@ M7 另开 `9444/8444`，不要扰动主 IM 数据库和会话：Reactor 增加 `
 
 | 编号 | 场景 | 最低通过条件 |
 | --- | --- | --- |
-| M0 | 构建与监听 | 三个原生进程正常构建；`:9443`、`:8443`、`:8787` 分别由预期进程监听 |
+| M0 | 构建与监听 | 原生进程正常构建；`:9443/UDP`、`:8443/UDP`、`:8444/TCP`、`:8787/TCP` 分别由预期进程监听 |
 | M1 | 双 QUIC 握手 | agent → Gateway 与 Gateway → Reactor 均协商 `lyune/2`，没有降级或证书误判 |
 | M2 | 网关控制交换 | heartbeat/ping 收到正确 ack/pong；Reactor 不应收到该流量 |
 | M3 | 单帧 service echo | `.service(1,0)` 的 OPEN+EOF 到达 Reactor，响应原样回到同一客户端流 |
@@ -121,7 +139,7 @@ M7 另开 `9444/8444`，不要扰动主 IM 数据库和会话：Reactor 增加 `
 | M15 | 混合负载 | 多真实用户在同一时间混合 required、none、typing、持久消息、推送与取消；成功/拒绝均完整可解释，无串流、错投或长期挂起 |
 | M16 | 反复故障恢复 | 多轮 Reactor/Gateway/agent 中断与恢复；记录首请求语义、重连时间、在途结果和租约收敛，不出现假成功、身份碰撞或无法恢复的池状态 |
 | M17 | soak 与资源趋势 | 真实 IM 活跃流量和定期故障注入持续运行；RSS、FD、连接、Exchange、inflight、接收槽位和 SQLite 增长符合负载，不单调泄漏 |
-| M18 | 干净环境总复跑 | 新数据库、新进程、固定命令完整复跑 M0–M17；源码/文档/配置一致，无阻断项后冻结 Mac 基线并允许进入 Linux |
+| M18 | 干净环境总复跑 | 新数据库、新进程、固定命令完整复跑 M0–M17；源码/文档/配置一致，无阻断项后形成候选 Mac 基线；进入 Linux 还需通过源码审计并由项目所有者明确决定 |
 
 M0–M4 构成“传输最小闭环”，M9 构成有业务意义的应用闭环，M10–M14 固化协议基础能力，M15–M18 才证明这些能力能在混合负载、故障和时间维度下共同工作。阶段一必须 M0–M18 全部通过；echo 成功不能代替身份、授权、持久化、主动推送或资源稳定性。
 
@@ -132,11 +150,35 @@ M0–M4 构成“传输最小闭环”，M9 构成有业务意义的应用闭环
 - Web UI 展示的结果与三份原生日志能按时间和 stream 对上；
 - Reactor 和 client-agent 的 codec 均有当前线格式单元测试；
 - 文档中的启动命令在新的 shell 会话可直接执行；
-- 阶段一发现的阻断性协议错误先修复并重新验证，再进入远程 Linux。
+- 阶段一发现的阻断性协议错误先修复并重新验证；是否进入远程 Linux 还取决于源码审计结论和项目所有者决定。
 
-截至 2026-08-29，M0–M18 均已满足，阶段一退出条件已经关闭。Mac 基线冻结后不再增加协议或 IM 产品功能；后续只把相同代码、配置、数据库模型和场景迁移到远程 Linux，发现跨平台阻断时再回到对应层修复并完整回归。
+截至 2026-08-29，commit `425f2a6` 的原始 Raw QUIC M0–M18 和之后的 TransportSession Raw-only M0–M18 均已满足。2026-08-30 加入 WSS 后，又独立完成真实 QUIC↔WSS 混合用户闭环、协议并发/取消、畸形输入、慢消费者、断线补偿、presence、120 秒长流、双 Worker、反复进程故障、混合 soak 与干净 M18 自动化总复跑。2026-08-31 的人工浏览器操作已经证明 WSS 与 Raw 共享用户/历史路径，以及 WSS→Raw 的实时推送；尚未单独记录 Raw→WSS 同时在线实时推送、错误密码、注册和建群/入群的完整人工清单。自动化证据继续有效，但人工门禁目前只能标记为部分完成。
+
+### 3.5 多传输增量门禁
+
+WSS 轮逐项复用 M0–M18 的业务判据，并至少覆盖三种会话组合：WSS↔WSS、WSS↔Raw QUIC、Raw QUIC↔Raw QUIC。除此之外必须增加：
+
+- 有效/缺失/错误 Origin、Host-SNI 不一致、错误 path/subprotocol、未 masked、分片、超大或畸形 frame；
+- 单 WSS 会话输出队列打满时只隔离该会话，其他 WSS/QUIC 用户仍可收发；EPHEMERAL 可丢，可靠消息不能静默丢；
+- WSS TCP 中断、Gateway/Reactor 重启后失败明确，重连后按 `message_id`/cursor 补齐持久消息，typing 等瞬时事件不重放；
+- `threads > 1` 时 TCP reuseport、连接所有权和 SessionHandle generation 正确；
+- 混合负载后的 RSS、accepted/listener FD、clients、Exchange、inflight、receive slot 和 SQLite 趋势有明确基线。
+
+### 3.6 人工浏览器验收状态
+
+| 检查项 | 当前状态 | 说明 |
+| --- | --- | --- |
+| 浏览器信任本地开发证书并建立 WSS | 已完成 | 用户已在 macOS 钥匙串中信任 `server.crt`，真实页面可登录 |
+| WSS 读取 Raw 用户已持久化的群消息 | 已完成 | 证明两种 binding 汇入相同认证、路由和 SQLite 历史路径 |
+| WSS→Raw 同时在线实时推送 | 已完成 | WSS 用户发送的两条消息均由 Raw 用户实时看到 |
+| Raw→WSS 同时在线实时推送 | 待补证据 | 当前观察到的 Raw 消息是在 WSS 登录后从历史中看到，不能据此断言为实时推送 |
+| 错误密码、注册、建群/邀请码入群 | 待完整人工记录 | 自动化已覆盖，但仍需 UI 级证据才能关闭人工清单 |
+
+这组未完成项不再自动触发下一阶段。当前先执行 [源码逐行审计](code_audit.md)，之后再决定补齐人工清单、修改实现或进入 Linux 的顺序。
 
 ## 4. 阶段二：远程 Linux 真实验证
+
+> 当前暂停。以下内容保留为未来可执行计划，不代表已经批准开始。
 
 阶段二不重新发明测试工具。应固定阶段一通过时的 Gateway、Reactor、client-agent、场景数据和记录格式，只改变操作系统、网络边界和 Linux 专属配置。
 
@@ -306,10 +348,79 @@ remote Linux: lyune-reactor
 - M15–M17 代表性复跑：两轮 8 用户、32 消息、64 typing、32 查询均通过；之后 10 批 4 用户短 soak 全部通过。10 批前后 Gateway RSS `5648→5776 KiB`，Reactor `121392→92960 KiB`，agent `25120→23904 KiB`；FD 为 `9/14/8` 不变。SQLite 精确新增 40 用户、10 群、40 成员和 80 条消息，文件 `73728→90112` 字节。
 - 最终浏览器：两个 React 标签页分别注册为 `dest_id=60/61`，创建并加入 group 14；两边均显示 2/2 在线、2 条连接，并实时看到对方经 Gateway 发送、SQLite 分配 id 148/149 的双向消息。两个页面控制台均无 error。
 - 最终静态门禁：`zig fmt --check build.zig src`、257 pass/1 skip 的 Zig 测试、ReleaseSafe、Reactor/client-agent Go 测试、React production build 和两个仓库 `git diff --check` 全部通过。
-- 结果：M0–M18 PASS，阶段一关闭。冻结当前 Mac 验证资产并允许开始远程 Linux；不创建 tag、release 或生产承诺。
+- 当时结果：Raw QUIC M0–M18 PASS，并冻结了该验证资产。后续因增加 WSS/TCP 回退而重新打开 Mac 阶段；本条历史记录不再代表当前允许进入远程 Linux。不创建 tag、release 或生产承诺。
+
+### 2026-08-29 / macos-transport-session-raw-001 / M0–M18
+
+- 目标与隔离：只引入 tagged `TransportSession` 和唯一的 `RawQuicSession`。客户端 ALPN、OPEN/DATA 字节、真实 QUIC stream/datagram、Gateway → Reactor 和 peer link 均保持不变；本轮没有 WSS listener、WebSocket envelope 或 TCP 代码。
+- 结构结果：`ConnectionContext.transport` 成为 Worker 客户端写流、主动开流、临时消息、RESET/STOP/discard 和关闭的统一入口；服务端主动流号 1/5/9… 的分配也归属 Raw binding。代码扫描确认客户端业务路径不再直接调用 `QUICConnection.fromRaw`，剩余调用只位于 binding 本身和明确排除的 Gateway peer link。
+- M0–M7：双段仍协商 `lyune/2`；ping、单帧、请求 FIN 前逐帧响应和同连接 32 并发均通过。修复后单独重跑 M7：250 ms 慢 Reactor 的单请求在 255 ms 完整返回；8 槽负对照仍为 8 个完整成功、24 个在 254 ms 明确 `backend connection failed`；压力后请求 257 ms 恢复，延迟读取 3,000 ms 时在 3,001 ms 得到完整帧。
+- M8 首次结果：FAIL，并暴露原实现已有的流/连接故障分类错误。静默 sibling 在 60 秒被周期回收后，client-agent 仍按负对照计划于 75 秒发送迟到 DATA；Gateway 又尝试给已经 discard 的后端流补 FIN。picoquic 正确返回单流 `SendFailed`，但 DirectTransport 把它错误放大为共享后端连接故障，导致同连接上每 30 秒活跃的 120 秒长流在约 90 秒被误杀。
+- M8 修复与复验：过期 route 的迟到 DATA 现在只清理本地 inbound 状态，不再二次结束已经 discard 的后端流；已有流上的 `SendFailed/Closed` 视为 exchange-local，只有明确的 `ConnectionFailed` 才使共享连接失效。复验中活跃流在 `0/30,001/60,002/90,003/120,004 ms` 发出，响应在 `10/30,004/60,015/90,016/120,011 ms` 全部返回；静默 sibling 在 `60,013 ms` 明确得到 `backend response timeout`，75 秒迟到 DATA 没有影响活跃流或其他后端连接。
+- M9–M15：错误密码 HTTP 401；两名真实用户 `raw_gate_alice/raw_gate_bob` 获得不同 `dest_id=10/11`。Bob 入群前历史授权失败，凭邀请码入群后，双方消息 33/34 经 Gateway 主动推送到目标 `[10,11]` 且 SQLite 历史一致。同用户双连接 presence 为 2，关闭一条后为 1；违规回写 server-initiated 流只关闭 Alice，Bob 后续 ping 0 ms；单向流被拒后合法 bidi 仍为 0 ms。required/none、RESET、STOP、typing、查询和推送混合负载均通过。
+- M14/M16：Gateway 重启前后 Bob 的 16 字节 token 分别为 `81FEAF8753503D950001000000080002` 与 `FBC22EE63209B6BB0001000000000001`，incarnation 不同。两轮 Reactor 停止都使下一请求 0 ms 明确 `backend unavailable`，重启后分别在 10/11 ms 成功；强制终止 Gateway 时请求在 5,001 ms deadline 失败，重启、显式重连后 5 ms 成功，无假成功。
+- M17：修复后连续 10 批真实混合负载全部通过；每批 4 用户、8 条持久消息、32 typing、8 查询，并同时完成 required 16/16、none 16/16、RESET 8/8、STOP 8/8 和取消后 ping。SQLite 精确增加 40 用户、10 群、40 成员、80 消息、40 session/presence；Gateway 空闲时 Exchange/inflight/recv slot/pending failure 全部归零，FD 维持稳定。
+- 静态门禁：`zig fmt --check build.zig src`、259 pass/1 skip 的 Zig 测试、ReleaseSafe、Reactor/client-agent Go 测试、React production build 和两个仓库 `git diff --check` 全部通过。
+- 结果：TransportSession Raw-only M0–M18 PASS。该结构基线允许开始 WSS 阶段，但不等于 WSS 已实现，也不允许跳过 WSS 自身的浏览器直连、QUIC↔WSS 混合用户、TCP 回退、慢消费者和断线恢复矩阵；当前不创建 tag 或 release。
+
+### 2026-08-30 / macos-wss-initial-001 / WSS 第一轮混合门禁
+
+- 实现范围：新增 libxev TCP listener、BoringSSL TLS BIO driver、严格 HTTP Upgrade/Origin/Host-SNI、RFC 6455 parser、固定 20 字节逻辑流 envelope、单会话定容输出队列和 `WssSession` vtable；Worker 的认证、Exchange、路由、push、lifecycle 和 Reactor 路径没有复制分叉。默认配置继续关闭 WSS，`validation-im-macos.json` 才显式监听 `127.0.0.1:8444/TCP`。
+- 协议边界：有效 Origin 的 Upgrade 返回 HTTP 101 和 `Sec-WebSocket-Protocol: lyune.v2`；缺失 Origin 的原生 WebSocket 被拒绝；重复 Host/version、错误版本、header folding、非法 masking/长度、分片控制帧、错误 envelope 和 close code 均有纯字节测试。新的开发证书沿用现有私钥并补 `DNS:localhost`、`IP:127.0.0.1` SAN，Gateway 实际下发 TLS 1.3 证书已核验；它仍是自签名证书，浏览器必须由用户显式信任。
+- 真实登录：无第三方依赖的 Node TLS/WebSocket 客户端经 WSS 使用真实用户 `m15_8decc2797a_01` 登录成功，得到 `dest_id=2`、TTL 3600 秒并读取 1 个 SQLite 群。React 页面已默认选择浏览器直连 `wss://localhost:8444/lyune/v2` 并完成生产构建；实际浏览器登录仍保留为用户手工信任开发证书后的门禁，自动化不得绕过证书安全页。
+- 混合 IM：最终验证程序创建两个一次性 WSS 用户 `wss_a_b66c974373`/`wss_b_b66c974373`（`dest_id=60/61`）与 Raw QUIC 用户 `raw_b66c974373`（`dest_id=62`）。WSS A 创建真实 SQLite group 16；WSS B 和 Raw 入群前读取历史均被拒，凭邀请码入群后，三个方向消息 123/124/125 都持久化并分别以 `.peer` 主动流送达三个目标，日志三次均为 `targets=3 delivered=3`；WSS 重读历史同时找到三条消息。typing 使用 `response_mode=none` 得到空 FIN。
+- 负门禁：真实 TLS/WebSocket 连接分别尝试复用 client logical stream 0、伪造尚未由 Gateway 创建的 server stream 1、发送未 masked client frame；三者都只关闭自己的会话并收到 close code 1002，随后健康 WSS 登录仍成功。WSS 对首次 OPEN 使用单调 high-water，永久补齐 QUIC 原生的 stream id 不可复用保证；Gateway 主动 stream 也只允许按 1/5/9… 创建。
+- 容量与资源回收：修复 macOS/kqueue 下把需要 thread pool 的异步 `xev.TCP.close` 错当成已完成所造成的 accepted FD 残留；现在只在 read/write completion 均不活跃后同步关闭并由 listener 周期泵回收。12 路并发登录退出和 64 条同时完成 TLS+Upgrade 均成功；配置上限为 64 时第 65 条被明确拒绝，全部关闭后 `lsof` 只显示 `8444` listener FD，Worker 指标回到 clients/exchanges/inflight/receive-slots 全零。
+- 诊断修复：Raw QUIC 的 `getConnectionIdBytes` 曾返回指向局部 CID 副本的悬空切片，使 close 日志打印栈垃圾；改为在日志调用域内持有按值 CID 后，真实 Raw 会话关闭稳定输出 `4c590100010075592ae06c4c`。
+- 静态门禁：`zig build test --summary all` 为 282 pass/1 skip（283 total）；ReleaseSafe、React production build、Node 语法检查和 WSS/Raw 混合真实进程验证通过。
+- 结果：WSS 实现与第一轮混合 IM PASS，但不是完整 WSS M0–M18。慢消费者/队列打满、畸形网络输入、断线游标补偿、WSS↔WSS、进程故障矩阵、多 Worker TCP reuseport 和混合 soak 仍需执行；这些完成前不冻结新的 Mac 基线、不进入远程 Linux、不创建 tag/release。
+
+### 2026-08-30 / macos-wss-resilience-002 / WSS 增量门禁
+
+- 协议路径：`validation/wss-protocol.mjs` 在一条真实 WSS 上完成 Gateway ping、单帧 echo、OPEN+DATA+DATA 三帧 streaming echo、同连接 32 并发、required/none 和 RESET/STOP。三段响应的首段在 12 ms 返回且早于请求 FIN；两个取消场景之后的新 ping 均成功，未扩大为连接故障。
+- 网络负例：`validation/wss-negative.mjs` 扩展为 14 类实际网络拒绝，包括 stream reuse、未来 server stream、未 masked、RSV、非 canonical length、分片控制帧、超大 frame、错误 envelope version、Origin、Host/SNI、path、subprotocol、WebSocket version 与超大 HTTP head；协议违规均为 1002 或 Upgrade 前 TCP 拒绝，只影响本会话。合法 binary fragments 中插入 ping 可重组，全部负例后真实认证仍成功。
+- 断线与慢端：接收者离线期间消息 1346 已先写 SQLite，重连历史补齐后消息 1347 实时推送恢复。真实暂停 TCP reader 后连续写入 1200 条约 1900 字节消息，慢会话在独立输出边界关闭；健康发送者随后请求成功并收到消息 2548 的 push，Gateway 只剩 listener FD。
+- lifecycle 与长流：同账号两条 WSS 的 presence 为 `2 → 1 → 跨 16 秒续租仍为 1 → 0`。120,007 ms 活跃流在 `11/30,014/60,011/90,009/120,005 ms` 收到五段响应；静默 sibling 在 60,012 ms 得到 `backend response timeout`，75 秒迟到 DATA 被隔离，之后同连接 ping 成功。
+- 双 Worker：`./run-im-demo.sh --workers 2` 启动两套 Raw UDP listener、WSS TCP listener、事件循环和每 Worker 4 条后端连接。首次三用户混合测试暴露旧 `.peer` 路径把 HRW 首选 Worker 当成实际连接所有者：三条会话都由 reuseport 放在 worker 1，但一个目标被错误转投 worker 0，日志为 `targets=3 delivered=2 routed=1` 并最终 push timeout。
+- 修复：HRW 继续只决定跨节点 home；目标节点内无论 WSS/Raw 都对其他 Worker 各交接一次，并在发起 Worker 无条件查本地索引。一次性 `.peer`、peer 入站和流式 OPEN 共用这一规则，布尔 RouteSet 保证每个 Worker 每帧最多一份。新增单测专门钉住“HRW 首选为当前 Worker 时仍必须探测其他 Worker”。修复后连续五轮两个 WSS + 一个 Raw 群聊全部通过，四次 push/轮均为 `targets=3 delivered=3 routed=1 unreachable=0`；断线、负例、慢消费者和 64/65 容量随后在双 Worker 配置复跑通过。
+- 静态门禁：新增回归后 `zig build test --summary all` 为 283 pass/1 skip（284 total）；代码格式检查通过。完整 ReleaseSafe、Go、React 与文档一致性在本轮最终收口时统一复跑。
+- 结果：WSS 的 M2–M5、M7–M13 主要传输语义和多 Worker 增量风险已关闭；仍需反复 Gateway/Reactor/agent 故障恢复、混合 soak/资源趋势、M18 新数据库总复跑，以及用户手工信任开发证书后的真实浏览器双标签页。此前不进入远程 Linux、不创建 tag/release。
+
+### 2026-08-30 / macos-wss-m18-final-003 / WSS M14–M18 与自动化总复跑
+
+- 故障矩阵：`validation/wss-fault-recovery.mjs` 使用独立临时 SQLite 与自管 Reactor/Gateway 进程。连续 3 次停止 Reactor 后，现有 WSS 的下一请求均明确失败，停止到失败为 `3/5/5 ms`；同一 WSS 会话在 Reactor 重启后分别于 `236/245/249 ms` 恢复。随后连续 2 次 `SIGKILL` Gateway，客户端均观察到传输关闭，新 Gateway 启动、WSS 重连、同用户登录和 SQLite 查询分别在 `125/123 ms` 内完成。
+- 身份隔离：初始进程和两次 Gateway 重启共观察到 3 个不同的 128 位 `conn_token` incarnation；旧连接身份没有命中新进程会话。失败语义仍是“明确失败、调用方重试”，不承诺在途请求透明重放。
+- 干净综合轮：`./run-im-demo.sh --reset --no-open --workers 2` 从新 SQLite 启动。协议、14 类负例、20 轮 WSS↔WSS↔Raw 群聊、断线补偿、presence、64/65 容量、1200 条大消息慢消费者和 120 秒长流全部通过。长流五段响应为 `11/30015/60007/90012/120010 ms`；静默 sibling 在 `60019 ms` 结束，75 秒迟到 DATA 被隔离，后续 ping 正常。慢端退出后 Gateway 只保留两个 reuseport listener FD；两条预期 `StreamWriteFailed` 与慢会话关闭时间一致，健康会话继续收发。
+- 独立资源轮：再次清空数据库，以固定的 2 WSS + 1 Raw 三用户群聊连续运行 30 批，精确得到 90 用户、30 群、90 成员、90 条消息。Gateway RSS 在 baseline/10/20/30 批为 `19600/22000/22448/22464 KiB`，Reactor 为 `22160/188672/188832/188880 KiB`，第 10 批后进入平台区；agent 为 `11744/18032/19232/19552 KiB`。三者 FD 始终为 `15/15/9`，Gateway/Reactor 严格 error/fatal/panic 计数为 0。这是受控 M17 趋势，不是生产容量或无限时长稳定性宣称。
+- 静态门禁：`zig fmt --check build.zig src`、283 pass/1 skip（284 total）的 Zig 测试、ReleaseSafe 9/9、Reactor/client-agent Go 测试、React production build、全部 Node 脚本语法检查和 `git diff --check` 通过。
+- 结果：WSS/混合 binding 自动化 M0–M18 PASS。阶段一仍未最终关闭，因为浏览器证书安全页不能由自动化绕过；用户手工信任本地开发证书后，还需在两个真实标签页完成注册、建群/邀请码、双向实时消息、错误密码和历史重读。该人工门禁通过前不进入远程 Linux、不创建 tag/release。
+
+### 2026-08-30 / macos-session-boundary-refactor-004 / 架构重构回归
+
+- 结构：客户端会话契约提升到顶层 `session/`，WSS Listener 与 Worker 改经
+  `Handler`/`Acceptor` 装配；`TransportSession` 改为类型擦除 vtable，Raw QUIC adapter
+  归入 `quic/session.zig`。Worker 不再 import WSS，WSS 不再经 session 间接依赖 picoquic。
+- 资源修复：运行期 DirectTransport 创建后若注册失败，会回滚最后一个工厂槽位，避免
+  后续重试耗尽定容 route capacity；工厂测试覆盖回滚后同一地址可安全复用。
+- 静态门禁：`zig fmt --check build.zig src`、284 pass/1 skip（285 total）、ReleaseSafe
+  9/9 与 `git diff --check` 通过。
+- 真实进程：`./run-im-demo.sh --reset --no-open --workers 2` 启动全新 SQLite、Reactor、
+  双 Worker Gateway、client-agent 与 Web；`node validation/wss-mixed-im.mjs` 创建两个 WSS
+  用户和一个 Raw QUIC 用户，共同加入 group 1，三方向消息 1/2/3 均持久化并推送到三人，
+  `response_mode=none` 返回空 FIN，历史一致。结果 PASS。
+- 结论：本次依赖倒置与类型擦除没有改变 Raw/WSS 可观察协议语义；它是结构回归，不替代
+  已完成的 M0–M18，也不关闭仍需用户手工完成的真实浏览器双标签页门禁。
+
+### 2026-08-31 / macos-browser-manual-005 / Raw QUIC↔WSS 人工体验
+
+- 环境：用户在 macOS 钥匙串中导入并信任项目开发证书，使用真实 Web UI、Gateway、Reactor 和 SQLite 数据库；Raw 用户为 `raw_deea39849a`，WSS 用户为 `wss_a_deea39849a`。
+- 实际：Raw 用户先发送消息；WSS 用户登录后能看到该消息。随后 WSS 用户分别向 `dest_id=3` 和 `dest_id=2` 发送两条消息，Raw 用户均能看到；网关日志显示 Raw/WSS 会话分别认证成功，并出现 `targets=3 delivered=2` 的在线推送记录。SQLite 中对应持久消息连续写入。
+- 能证明：真实证书与浏览器 WSS 握手成功；两种 transport binding 汇入同一用户认证、群路由、SQLite 历史和消息投递路径；WSS→Raw 实时投递成功。
+- 不能单独证明：Raw 的首条消息是在 WSS 登录前发送，WSS 后来看见它属于历史读取证据，不是 Raw→WSS 同时在线实时推送证据；本轮也没有逐项记录错误密码、注册、建群和邀请码入群 UI 操作。
+- 结果：PARTIAL PASS。多传输基础链路已由真实用户确认，完整人工 UI 清单仍开放；当前按项目决定暂停继续扩展测试，先进入源码审计。
 
 ## 7. 与 CI、发布和后续演进的关系
 
-CI 不是当前阻断项。现阶段优先把本机和远程真实路径变成可重复执行的验证步骤；在此之前建立 CI，只会重复已经较成熟的单元测试，不能证明真实链路可用。
+CI 不是当前阻断项。当前优先完成源码逐行审计和文档/实现对齐；现有本机脚本与自动化证据已经足够支持审计期间的回归。最小 CI 能固定格式化、单元测试和干净构建，但不能替代真实浏览器、Linux 内核路径或故障验证。
 
-两阶段验证稳定后再引入最小 CI，用它固定格式化、单元测试和干净构建，并逐步接入成本可控的冒烟场景。高成本的 Linux cBPF、netem 和 soak 应使用独立流水线或手工验证窗口，不进入每次提交。任何阶段都不自动发布版本。
+源码审计完成、下一阶段明确后再决定是否引入最小 CI，并逐步接入成本可控的冒烟场景。高成本的 Linux cBPF、netem 和 soak 应使用独立流水线或手工验证窗口，不进入每次提交。任何阶段都不自动发布版本。

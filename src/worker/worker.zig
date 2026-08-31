@@ -40,6 +40,9 @@ const ScopedRoute = backend.ScopedRoute;
 const connection = @import("connection.zig");
 const ConnectionManager = connection.ConnectionManager;
 const ConnectionContext = connection.ConnectionContext;
+const client_session = @import("../session/mod.zig");
+const SessionHandle = client_session.SessionHandle;
+const TransportSession = client_session.TransportSession;
 const inflight = @import("inflight.zig");
 const ingress = @import("ingress.zig");
 const egress = @import("egress.zig");
@@ -144,6 +147,9 @@ pub const GatewayWorker = struct {
 
     // 底层驱动器 (替代了 endpoint, io_loop, gso_buffer 等)
     server_driver: reactor.server.ServerDriver,
+    /// app 装配的外部客户端监听器生命周期端口；具体实现及所有权不进入 Worker。
+    /// 当前由 WSS 使用，与 Raw QUIC 共用下面同一份 conn_manager/inflight/auth/egress 状态。
+    session_acceptor: ?client_session.Acceptor = null,
     /// 集群监听器；null 表示未启用节点间应用层投递链路（见 PeerListener）。
     ///
     /// 它与 `server_driver` 共用同一条事件循环与同一份 `conn_manager`——连接以
@@ -173,9 +179,6 @@ pub const GatewayWorker = struct {
     // 业务组件
     conn_manager: ConnectionManager,
     transport_registry: TransportRegistry,
-    /// SNI -> RealmId 的解析表（设计文档 §12）。
-    ///
-    /// 启动期由配置建好、运行期只读；`entries` 由 RuntimeConfig 持有，本结构只借用。
     /// SNI -> RealmId 的解析表（设计文档 §12）。
     ///
     /// **借用一份进程级共享的表**，不是自己的副本：它可以在运行期被追加（新接入方上线，
@@ -465,6 +468,7 @@ pub const GatewayWorker = struct {
 
         // 2. 启动 Driver (非阻塞)
         self.server_driver.start();
+        if (self.session_acceptor) |acceptor| try acceptor.start();
         if (self.peer_driver) |*driver| {
             driver.start();
             std.log.info("[CLUSTER] peer listener started on worker {}", .{self.worker_id});
@@ -485,6 +489,7 @@ pub const GatewayWorker = struct {
     /// 也定义良好（当前生产路径只由本 Worker 线程调用）。
     pub fn stop(self: *Self) void {
         self.running.store(false, .release);
+        if (self.session_acceptor) |acceptor| acceptor.stopAccepting();
         self.server_driver.stop();
         if (self.peer_driver) |*driver| driver.stop();
     }
@@ -495,6 +500,17 @@ pub const GatewayWorker = struct {
     /// 与定时器，所以它只能在 Worker 之后诞生——init 参数会形成循环依赖。
     pub fn attachBackendPool(self: *Self, shared: *backend.BackendPool) void {
         self.backend_pool = shared;
+    }
+
+    /// 挂上与本 Worker 同线程的外部客户端监听器。所有权仍在 app；必须在 run 前调用。
+    pub fn attachSessionAcceptor(self: *Self, acceptor: client_session.Acceptor) void {
+        std.debug.assert(self.session_acceptor == null);
+        self.session_acceptor = acceptor;
+    }
+
+    /// 生成具体客户端 binding 所需的传输无关事件端口。
+    pub fn sessionHandler(self: *Self) client_session.Handler {
+        return .{ .ptr = self, .vtable = &session_handler_vtable };
     }
 
     /// 挂上直连路由目录与实例工厂。
@@ -531,10 +547,11 @@ pub const GatewayWorker = struct {
             return null;
         };
         const erased = BackendTransport.init(backend.DirectTransport, instance);
-        // 登记失败时实例留在工厂里（销毁期统一回收），只是这次查不到——下一次请求会
-        // 再试一遍建一个。不回滚是有意的：工厂的槽位不支持归还，而硬要归还就得引入
-        // 空洞管理，为一条只会在 OOM 时走到的路径不值得。
         self.registerTransport(.direct, scope, erased) catch |err| {
+            // create 与 register 在同一 Worker 线程内紧邻发生；此时实例一定还是工厂最后
+            // 一个槽位，可以安全回滚。否则一次临时登记失败会让每次重试都再泄漏一个
+            // 定容槽位，最终把与故障无关的所有热加载路由一起锁死。
+            factory.discardLast(instance);
             std.log.warn("[ROUTE] cannot register transport for realm={}: {s}", .{ scope.realm, @errorName(err) });
             return null;
         };
@@ -625,6 +642,70 @@ pub const GatewayWorker = struct {
     // 业务逻辑回调 (由 Driver 触发)
     // ========================================================================
 
+    const session_handler_vtable: client_session.Handler.VTable = .{
+        .accept = acceptTransportSession,
+        .stream_data = handleSessionData,
+        .control = handleSessionControl,
+        .ephemeral = handleSessionEphemeral,
+        .closed = handleSessionClose,
+        .now_us = sessionNow,
+    };
+
+    fn workerFromSessionHandler(ptr: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn acceptTransportSession(ptr: *anyopaque, transport_session: TransportSession, server_name: ?[]const u8) anyerror!SessionHandle {
+        return workerFromSessionHandler(ptr).acceptClientSession(transport_session, server_name);
+    }
+
+    fn handleSessionData(ptr: *anyopaque, handle: SessionHandle, stream_id: u64, bytes: []const u8, fin: bool) void {
+        ingress.handleSessionData(workerFromSessionHandler(ptr), handle, stream_id, bytes, fin);
+    }
+
+    fn handleSessionControl(ptr: *anyopaque, handle: SessionHandle, stream_id: u64, event: client_session.StreamControl) void {
+        ingress.handleSessionControl(workerFromSessionHandler(ptr), handle, stream_id, event);
+    }
+
+    fn handleSessionEphemeral(ptr: *anyopaque, handle: SessionHandle, bytes: []const u8) void {
+        ingress.handleEphemeral(workerFromSessionHandler(ptr), handle, bytes);
+    }
+
+    fn handleSessionClose(ptr: *anyopaque, handle: SessionHandle) void {
+        const self = workerFromSessionHandler(ptr);
+        self.closeClientSession(handle, .transport_closed);
+        std.log.info("[CONN] client session closed: worker={} slot={} generation={}", .{
+            self.worker_id,
+            handle.slot,
+            handle.generation,
+        });
+    }
+
+    fn sessionNow(_: *anyopaque) u64 {
+        return quic.c.currentTime();
+    }
+
+    pub const AcceptSessionError = ConnectionManager.Error || error{
+        NotAcceptingConnections,
+        UnregisteredRealm,
+    };
+
+    /// 注册一条客户端接入会话。Raw QUIC 与 WSS 都只能经这一处决定 drain 门禁、realm
+    /// 和 ConnectionManager 槽位，避免第二种传输复制出一套稍有差异的准入逻辑。
+    pub fn acceptClientSession(self: *Self, transport: TransportSession, server_name: ?[]const u8) AcceptSessionError!SessionHandle {
+        if (!self.coordinator.acceptsNewConnections()) return error.NotAcceptingConnections;
+        const realm = self.realms.resolve(server_name) orelse return error.UnregisteredRealm;
+        const ctx = try self.conn_manager.addSession(transport, realm, self);
+        std.log.info("[CONN] new {s} session: worker={} slot={} generation={} realm={}", .{
+            @tagName(ctx.transport.kind()),
+            self.worker_id,
+            ctx.session_handle.slot,
+            ctx.session_handle.generation,
+            realm,
+        });
+        return ctx.session_handle;
+    }
+
     /// 新连接建立（握手完成）。
     ///
     /// drain 期间直接关掉：让客户端立刻去重连别的节点，比把新连接挂在一个正在
@@ -639,27 +720,13 @@ pub const GatewayWorker = struct {
     /// 因为回调传进来的 conn 包装只在本次调用期内有效。
     fn handleNewConnection(ud: ?*anyopaque, conn: *QUICConnection) void {
         const self = castSelf(ud);
-        if (!self.coordinator.acceptsNewConnections()) {
-            conn.close();
-            return;
-        }
-
-        // 不把 SNI 原文写进日志：它是对端可控的字节串，直接落盘等于给日志注入留了口子。
-        const realm = self.realms.resolve(conn.getServerName()) orelse {
-            std.log.warn("[CONN] refusing connection: server name is not registered to any realm", .{});
-            conn.close();
-            return;
-        };
-
-        // 业务逻辑：注册到管理器
-        _ = self.conn_manager.add(conn, realm, self) catch |err| {
+        _ = self.acceptClientSession(quic.session.init(conn.inner), conn.getServerName()) catch |err| {
             // 没有上下文，这条连接的所有流数据都会被静默丢弃，不如立刻关掉：
             // 让客户端去连别的节点，而不是挂在这里等空闲超时。
             std.log.warn("[CONN] refusing connection: {s}", .{@errorName(err)});
             conn.close();
             return;
         };
-        std.log.info("[CONN] new: {x} realm={}", .{ conn.getConnectionIdBytes(), realm });
     }
 
     /// 集群监听器上的新连接：对端已经在 TLS 层证明了自己是网关节点。
@@ -685,30 +752,35 @@ pub const GatewayWorker = struct {
             conn.close();
             return;
         };
-        std.log.info("[CLUSTER] peer link established: {x}", .{conn.getConnectionIdBytes()});
+        const cid = conn.getLocalConnectionId();
+        std.log.info("[CLUSTER] peer link established: {x}", .{cid.id[0..cid.id_len]});
     }
 
     /// 连接关闭
     fn handleConnectionClose(ud: ?*anyopaque, conn: *QUICConnection, event: QUICCallbackEvent) void {
         const self = castSelf(ud);
+        const handle = self.conn_manager.handleForRawQuic(conn.inner) orelse return;
+        const ctx = self.conn_manager.getByHandle(handle).?;
+        const reason = ctx.offline_reason orelse switch (event) {
+            .application_close => protocol.body.SessionLifecycle.Reason.application_closed,
+            .stateless_reset => .stateless_reset,
+            else => .transport_closed,
+        };
+        // picoquic 按值返回 connection id；必须让结构体副本活到格式化结束，不能从
+        // 一个辅助函数返回指向其局部副本的切片（那会在关闭日志里打印栈垃圾）。
+        const cid = conn.getLocalConnectionId();
+        self.closeClientSession(handle, reason);
+        std.log.info("[CONN] closed: {x}, reason: {s}", .{ cid.id[0..cid.id_len], @tagName(event) });
+    }
 
-        // 客户端走了，但它开着的交换在后端还等着结束标记。不主动 fin 的话
-        // 这些流会一直挂到后端超时，高并发下持续占用后端的流配额。
-        if (self.conn_manager.get(conn)) |ctx| {
-            const reason = ctx.offline_reason orelse switch (event) {
-                .application_close => protocol.body.SessionLifecycle.Reason.application_closed,
-                .stateless_reset => .stateless_reset,
-                else => .transport_closed,
-            };
-            lifecycle.publishOffline(self, ctx, reason);
-            self.finishOpenExchanges(ctx);
-        }
-
-        // 必须先回收在途后端映射，再从管理器移除。picoquic 在本回调返回后
-        // 会释放连接对象，残留条目会让回程路径拿到野指针。
-        self.inflight.purge(.{ .connection = conn.inner });
-        self.conn_manager.remove(conn);
-        std.log.info("[CONN] closed: {x}, reason: {s}", .{ conn.getConnectionIdBytes(), @tagName(event) });
+    /// 收敛任意客户端传输会话。调用时底层 transport 对象必须仍然存活；本函数返回后
+    /// SessionHandle 已失效，WSS listener 才可以释放 SSL/socket/队列对象。
+    pub fn closeClientSession(self: *Self, handle: SessionHandle, reason: protocol.body.SessionLifecycle.Reason) void {
+        const ctx = self.conn_manager.getByHandle(handle) orelse return;
+        lifecycle.publishOffline(self, ctx, ctx.offline_reason orelse reason);
+        self.finishOpenExchanges(ctx);
+        self.inflight.purge(.{ .session = handle });
+        self.conn_manager.removeSession(handle);
     }
 
     /// 把一条连接上还没收尾的交换逐条结束掉。
@@ -767,7 +839,7 @@ pub const GatewayWorker = struct {
             if (count != 0) expired_any = true;
             for (routes[0..count]) |expired| {
                 switch (expired.route.target) {
-                    .client => |target| self.replyControl(target.cnx, target.stream_id, .gateway_error, "backend response timeout"),
+                    .client => |target| self.replyControl(target.session, target.stream_id, .gateway_error, "backend response timeout"),
                     .discard => {},
                 }
                 if (self.transport_registry.findById(expired.key.transport)) |transport| {
@@ -784,7 +856,7 @@ pub const GatewayWorker = struct {
             for (auths[0..count]) |expired| {
                 var pending = expired.pending;
                 if (!pending.response_suppressed) {
-                    self.replyControl(pending.client_cnx, pending.client_stream_id, .auth_failure, "authentication backend timeout");
+                    self.replyControl(pending.client_session, pending.client_stream_id, .auth_failure, "authentication backend timeout");
                 }
                 pending.buffer.deinit(self.allocator);
                 if (self.transport_registry.findById(expired.key.transport)) |transport| {
@@ -854,16 +926,15 @@ pub const GatewayWorker = struct {
             switch (route.target) {
                 .discard => {},
                 .client => |target| {
-                    // 客户端可能在后端响应到达前就断开。此时 picoquic 已释放该连接对象，
-                    // 必须确认它仍在管理器中，否则会把野指针交给 picoquic_add_to_stream。
-                    if (self.conn_manager.getByHandle(target.cnx) == null) {
+                    // 客户端可能在后端响应到达前就断开。此时传输实现已经释放会话，
+                    // 必须确认它仍在管理器中，否则在途表里的旧身份会命中失效资源。
+                    const client_ctx = self.conn_manager.getByHandle(target.session) orelse {
                         std.log.warn("[ROUTE] client gone before backend response: backend_stream={}", .{event.stream_id});
                         self.inflight.closeRoute(key);
                         continue;
-                    }
+                    };
 
-                    var client_conn = QUICConnection.fromRaw(target.cnx);
-                    client_conn.streamWrite(target.stream_id, event.data, event.is_fin) catch |err| {
+                    client_ctx.transport.write(target.stream_id, event.data, event.is_fin) catch |err| {
                         err_handler.reportError(.session, "Failed to write backend response to client", err);
                         self.inflight.closeRoute(key);
                         continue;
@@ -892,7 +963,7 @@ pub const GatewayWorker = struct {
         if (self.inflight.takeAuth(key)) |pending_value| {
             var pending = pending_value;
             if (!pending.response_suppressed) {
-                self.replyControl(pending.client_cnx, pending.client_stream_id, .auth_failure, reason);
+                self.replyControl(pending.client_session, pending.client_stream_id, .auth_failure, reason);
             }
             pending.buffer.deinit(self.allocator);
             return;
@@ -900,7 +971,7 @@ pub const GatewayWorker = struct {
 
         if (self.inflight.lookupRoute(key)) |route| {
             switch (route.target) {
-                .client => |target| self.replyControl(target.cnx, target.stream_id, .gateway_error, reason),
+                .client => |target| self.replyControl(target.session, target.stream_id, .gateway_error, reason),
                 .discard => {},
             }
             self.inflight.closeRoute(key);
@@ -925,7 +996,7 @@ pub const GatewayWorker = struct {
         while (true) {
             const count = self.inflight.takeFailedRoutes(transport.id(), selector, &routes);
             for (routes[0..count]) |route| switch (route.target) {
-                .client => |target| self.replyControl(target.cnx, target.stream_id, .gateway_error, "backend connection failed"),
+                .client => |target| self.replyControl(target.session, target.stream_id, .gateway_error, "backend connection failed"),
                 .discard => {},
             };
             if (count < routes.len) break;
@@ -937,7 +1008,7 @@ pub const GatewayWorker = struct {
             for (auths[0..count]) |pending_value| {
                 var pending = pending_value;
                 if (!pending.response_suppressed) {
-                    self.replyControl(pending.client_cnx, pending.client_stream_id, .auth_failure, "authentication backend failed");
+                    self.replyControl(pending.client_session, pending.client_stream_id, .auth_failure, "authentication backend failed");
                 }
                 pending.buffer.deinit(self.allocator);
             }
@@ -960,7 +1031,7 @@ pub const GatewayWorker = struct {
     /// pub 是给 ingress.zig 的逐帧分派用的。
     pub fn handleControlFrame(self: *Self, ctx: *ConnectionContext, client_stream_id: u64, parsed: codec.Frame) void {
         const ctrl = parsed.header.controlType() orelse {
-            self.replyControl(ctx.cnx_handle, client_stream_id, .gateway_error, "unknown control type");
+            self.replyControl(ctx.session_handle, client_stream_id, .gateway_error, "unknown control type");
             return;
         };
 
@@ -973,12 +1044,12 @@ pub const GatewayWorker = struct {
                 "control requires response_mode=none"
             else
                 "control requires response_mode=required";
-            self.replyControl(ctx.cnx_handle, client_stream_id, .gateway_error, message);
+            self.replyControl(ctx.session_handle, client_stream_id, .gateway_error, message);
             return;
         }
         switch (ctrl) {
-            .heartbeat => self.replyControl(ctx.cnx_handle, client_stream_id, .heartbeat_ack, &.{}),
-            .ping => self.replyControl(ctx.cnx_handle, client_stream_id, .pong, parsed.body),
+            .heartbeat => self.replyControl(ctx.session_handle, client_stream_id, .heartbeat_ack, &.{}),
+            .ping => self.replyControl(ctx.session_handle, client_stream_id, .pong, parsed.body),
             .disconnect => {
                 ctx.offline_reason = .client_disconnect;
                 ctx.close_requested = true;
@@ -988,7 +1059,7 @@ pub const GatewayWorker = struct {
             .auth_request => auth.delegateAuth(self, ctx, client_stream_id, parsed),
             else => {
                 std.log.warn("[CTRL] unhandled control type=0x{x}", .{@intFromEnum(ctrl)});
-                self.replyControl(ctx.cnx_handle, client_stream_id, .gateway_error, "unsupported control type");
+                self.replyControl(ctx.session_handle, client_stream_id, .gateway_error, "unsupported control type");
             },
         }
     }
@@ -996,8 +1067,8 @@ pub const GatewayWorker = struct {
     /// 向客户端流回写一个控制帧（fin 结束该流）。
     ///
     /// pub 是给 ingress.zig 用的：门禁拒绝与各类上行失败都要回一个 gateway_error。
-    pub fn replyControl(self: *Self, cnx: quic.c.QuicCnx, stream_id: u64, ctrl_type: protocol.frame.ControlType, body: []const u8) void {
-        if (self.conn_manager.getByHandle(cnx) == null) return;
+    pub fn replyControl(self: *Self, session: SessionHandle, stream_id: u64, ctrl_type: protocol.frame.ControlType, body: []const u8) void {
+        const ctx = self.conn_manager.getByHandle(session) orelse return;
 
         var buf: [1024]u8 = undefined;
         var encoder = protocol.codec.FrameEncoder.init(&buf);
@@ -1005,8 +1076,7 @@ pub const GatewayWorker = struct {
             err_handler.reportError(.session, "Failed to encode control frame", err);
             return;
         };
-        var conn = QUICConnection.fromRaw(cnx);
-        conn.streamWrite(stream_id, data, true) catch |err| {
+        ctx.transport.write(stream_id, data, true) catch |err| {
             err_handler.reportError(.session, "Failed to write control frame to client", err);
         };
     }
@@ -1015,10 +1085,9 @@ pub const GatewayWorker = struct {
     ///
     /// 空 FIN 是传输层收尾，不是业务确认：它只表示认证、路由、配额检查已经通过，
     /// 请求也已交给 BackendTransport。后端是否完成业务处理不会再回到客户端。
-    pub fn finishResponseWithoutPayload(self: *Self, cnx: quic.c.QuicCnx, stream_id: u64) void {
-        if (self.conn_manager.getByHandle(cnx) == null) return;
-        var conn = QUICConnection.fromRaw(cnx);
-        conn.streamWrite(stream_id, &.{}, true) catch |err| {
+    pub fn finishResponseWithoutPayload(self: *Self, session: SessionHandle, stream_id: u64) void {
+        const ctx = self.conn_manager.getByHandle(session) orelse return;
+        ctx.transport.write(stream_id, &.{}, true) catch |err| {
             err_handler.reportError(.session, "Failed to finish no-response exchange", err);
         };
     }
@@ -1057,6 +1126,7 @@ pub const GatewayWorker = struct {
         if (!self.running.load(.acquire)) return .disarm;
 
         const now = quic.c.currentTime();
+        if (self.session_acceptor) |acceptor| acceptor.poll(now);
         self.logMetrics(now);
         self.maintainBackendConnections(now);
         self.refreshPlacement(now);
@@ -1402,6 +1472,15 @@ const test_realm: foundation.realm.RealmId = foundation.realm.default_realm;
 /// 注册表键：客户端帧里只有 test_route，realm 由网关补上。
 const test_scope = ScopedRoute.scoped(test_realm, test_route);
 
+fn testDetachedContext(allocator: std.mem.Allocator, raw_handle: usize, realm: foundation.realm.RealmId) ConnectionContext {
+    return ConnectionContext.init(
+        allocator,
+        .{ .slot = 0, .generation = 1 },
+        quic.session.init(@ptrFromInt(raw_handle)),
+        realm,
+    );
+}
+
 // 一次交换的接线回归测试。
 //
 // 关键不变量是"客户端一条流 = 后端一条流"：OPEN 开流，DATA 沿同一句柄追加，
@@ -1423,7 +1502,7 @@ test "one exchange rides one backend stream and finishes on eof" {
     defer worker.deinit();
 
     // 伪造连接上下文：本用例只走上行转发，不会解引用这个句柄。
-    var ctx = ConnectionContext.init(allocator, @ptrFromInt(0x1000), test_realm);
+    var ctx = testDetachedContext(allocator, 0x1000, test_realm);
     defer ctx.deinit();
 
     const client_stream: u64 = 4;
@@ -1475,7 +1554,7 @@ test "a frame after eof closes the connection" {
     var worker = try testWorker(allocator, &coordinator, registry);
     defer worker.deinit();
 
-    var ctx = ConnectionContext.init(allocator, @ptrFromInt(0x1000), test_realm);
+    var ctx = testDetachedContext(allocator, 0x1000, test_realm);
     defer ctx.deinit();
 
     var buf: [128]u8 = undefined;
@@ -1510,7 +1589,7 @@ test "a second OPEN on a live stream closes the connection" {
     var worker = try testWorker(allocator, &coordinator, registry);
     defer worker.deinit();
 
-    var ctx = ConnectionContext.init(allocator, @ptrFromInt(0x1000), test_realm);
+    var ctx = testDetachedContext(allocator, 0x1000, test_realm);
     defer ctx.deinit();
 
     var buf: [128]u8 = undefined;
@@ -1546,7 +1625,7 @@ test "a client may not address peers or multicast groups" {
     var worker = try testWorker(allocator, &coordinator, registry);
     defer worker.deinit();
 
-    var ctx = ConnectionContext.init(allocator, @ptrFromInt(0x1000), test_realm);
+    var ctx = testDetachedContext(allocator, 0x1000, test_realm);
     defer ctx.deinit();
 
     var buf: [128]u8 = undefined;
@@ -1582,7 +1661,7 @@ test "a DATA frame with no live exchange is dropped, not escalated" {
     var worker = try testWorker(allocator, &coordinator, registry);
     defer worker.deinit();
 
-    var ctx = ConnectionContext.init(allocator, @ptrFromInt(0x1000), test_realm);
+    var ctx = testDetachedContext(allocator, 0x1000, test_realm);
     defer ctx.deinit();
 
     var buf: [128]u8 = undefined;
@@ -1617,7 +1696,7 @@ test "a control exchange is handled locally and still leaves a record" {
     var worker = try testWorker(allocator, &coordinator, registry);
     defer worker.deinit();
 
-    var ctx = ConnectionContext.init(allocator, @ptrFromInt(0x1000), test_realm);
+    var ctx = testDetachedContext(allocator, 0x1000, test_realm);
     defer ctx.deinit();
 
     var buf: [128]u8 = undefined;
@@ -1656,7 +1735,7 @@ test "an unknown route fails the exchange without touching the connection" {
     var worker = try testWorker(allocator, &coordinator, registry);
     defer worker.deinit();
 
-    var ctx = ConnectionContext.init(allocator, @ptrFromInt(0x1000), test_realm);
+    var ctx = testDetachedContext(allocator, 0x1000, test_realm);
     defer ctx.deinit();
 
     var buf: [128]u8 = undefined;
@@ -2022,9 +2101,9 @@ test "a kick from another realm is refused and leaves the target admitted" {
     var victim = QUICConnection{ .inner = @ptrFromInt(0x1000) };
     const ctx = try worker.conn_manager.add(&victim, victim_realm, &worker);
     ctx.authenticated = true;
-    worker.conn_manager.bindDest(victim.inner, 42);
+    worker.conn_manager.bindDest(ctx.session_handle, 42);
 
-    const token = worker.conn_manager.tokenFor(victim.inner).?;
+    const token = worker.conn_manager.tokenFor(ctx.session_handle).?;
 
     var frame_buf: [256]u8 = undefined;
     var body_buf: [128]u8 = undefined;
@@ -2128,8 +2207,8 @@ test "a backend can put a connection into a multicast group" {
     defer worker.deinit();
 
     var member = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    _ = try worker.conn_manager.add(&member, test_realm, &worker);
-    const token = worker.conn_manager.tokenFor(member.inner).?;
+    const member_ctx = try worker.conn_manager.add(&member, test_realm, &worker);
+    const token = worker.conn_manager.tokenFor(member_ctx.session_handle).?;
 
     var frame_buf: [256]u8 = undefined;
     var body_buf: [128]u8 = undefined;
@@ -2162,8 +2241,8 @@ test "a cross-realm group join is refused" {
 
     const victim_realm: foundation.realm.RealmId = 7;
     var victim = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    _ = try worker.conn_manager.add(&victim, victim_realm, &worker);
-    const token = worker.conn_manager.tokenFor(victim.inner).?;
+    const victim_ctx = try worker.conn_manager.add(&victim, victim_realm, &worker);
+    const token = worker.conn_manager.tokenFor(victim_ctx.session_handle).?;
 
     var frame_buf: [256]u8 = undefined;
     var body_buf: [128]u8 = undefined;
@@ -2305,6 +2384,53 @@ test "a push whose home is another worker is handed off, not reported unreachabl
     try std.testing.expectEqual(@as(u16, 0), missed.count);
 }
 
+// 节点级 HRW 不能作为节点内连接目录。尤其是 WSS：TCP reuseport 在认证前已经决定
+// 连接属于哪个 Worker，而认证后才知道 dest_id，也不能迁移已经建立的 TLS 状态。
+// 因此即使 HRW 恰好说目标 home 是发起 Worker，也必须让其他 Worker 查自己的索引。
+test "a peer push probes every local worker even when affinity home is this worker" {
+    const allocator = std.testing.allocator;
+
+    var coordinator = try testCoordinatorWithWorkers(allocator, 2);
+    defer coordinator.deinit();
+    try coordinator.start();
+    defer coordinator.stop();
+
+    var recorder = StreamRecorder{};
+    var registry = TransportRegistry.init(allocator);
+    try registry.register(.direct, test_scope, BackendTransport.init(StreamRecorder, &recorder));
+    const transport = BackendTransport.init(StreamRecorder, &recorder);
+
+    var worker = try testWorker(allocator, &coordinator, registry);
+    defer worker.deinit();
+
+    var local_home: u64 = 1;
+    while (!worker.placement.isHome(test_realm, local_home)) : (local_home += 1) {}
+
+    var frame_buf: [256]u8 = undefined;
+    var body_buf: [128]u8 = undefined;
+    const push = try testPushFrame(
+        &frame_buf,
+        &body_buf,
+        &[_]u64{local_home},
+        "hello",
+        .{ .eof = true, .report = true },
+    );
+
+    egress.handlePush(&worker, transport, test_realm, testPushEvent(0x52, push));
+
+    // 旧实现会因 `isHome == true` 只查 Worker 0，从而漏掉实际由 reuseport 放在
+    // Worker 1 的 WSS/QUIC 连接。现在每个其他 Worker 都恰好收到一次交接。
+    const handed = coordinator.messageRouter().pop(1);
+    try std.testing.expect(handed != null);
+    try std.testing.expectEqual(test_realm, handed.?.realm);
+    try std.testing.expectEqualSlices(u8, push, handed.?.bytes());
+    try std.testing.expect(coordinator.messageRouter().pop(1) == null);
+
+    const report = try codec.parseExactFrame(recorder.lastWrite());
+    const missed = try protocol.body.TargetList.decode(report.body);
+    try std.testing.expectEqual(@as(u16, 0), missed.count);
+}
+
 // 转投过来的消息必须只做本地投递，绝不再转投——这是防环的全部机制。
 test "a handed-off message is delivered locally and never re-routed" {
     const allocator = std.testing.allocator;
@@ -2343,7 +2469,7 @@ test "a handed-off message is delivered locally and never re-routed" {
 /// 生产路径上 `peer_node` 只由 `addPeerNode` 置位，而那只发生在集群监听器的新连接
 /// 回调里；这里直接置位是为了在不起两个真实监听端口的情况下测分派语义。
 fn testPeerContext(allocator: std.mem.Allocator, handle: usize) ConnectionContext {
-    var ctx = ConnectionContext.init(allocator, @ptrFromInt(handle), test_realm);
+    var ctx = testDetachedContext(allocator, handle, test_realm);
     ctx.peer_node = true;
     return ctx;
 }
@@ -2437,8 +2563,8 @@ test "a peer delivery is scoped by the realm in its frame header" {
     // 一条 realm 7 的连接绑定 dest_id 42。本用例不解引用这个句柄——投递会在
     // realm 不匹配时就查不到链，根本走不到 streamWrite。
     var victim = QUICConnection{ .inner = @ptrFromInt(0x2000) };
-    _ = try worker.conn_manager.add(&victim, 7, &worker);
-    worker.conn_manager.bindDest(victim.inner, 42);
+    const victim_ctx = try worker.conn_manager.add(&victim, 7, &worker);
+    worker.conn_manager.bindDest(victim_ctx.session_handle, 42);
     try std.testing.expectEqual(@as(usize, 1), worker.conn_manager.destCount(7, 42));
 
     var ctx = testPeerContext(allocator, 0x1000);
@@ -2595,7 +2721,7 @@ test "binding a datagram channel is refused unless the backend put you in that g
     try std.testing.expect(ctx.channelGroup(2) == null);
 
     // 后端把它放进 777（这是唯一能建立成员关系的路径），再绑就通了。
-    try worker.conn_manager.joinGroup(conn.inner, 777);
+    try worker.conn_manager.joinGroup(ctx.session_handle, 777);
     try std.testing.expectEqual(ingress.BindOutcome.bound, ingress.resolveBind(&worker, ctx, parsed));
     try std.testing.expectEqual(@as(u64, 777), ctx.channelGroup(2).?);
 
@@ -2673,7 +2799,7 @@ test "an uplink datagram fans out through the same routing as a reliable multica
     var conn = QUICConnection{ .inner = @ptrFromInt(0x3000) };
     const ctx = try worker.conn_manager.add(&conn, test_realm, &worker);
     ctx.authenticated = true;
-    try worker.conn_manager.joinGroup(conn.inner, 555);
+    try worker.conn_manager.joinGroup(ctx.session_handle, 555);
     ctx.bindChannel(1, 555);
 
     ingress.handleDatagram(&worker, &conn, &[_]u8{ 0x02, 0x01, 'x', 'y' });

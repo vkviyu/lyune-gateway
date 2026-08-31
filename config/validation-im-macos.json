@@ -7,6 +7,18 @@
     "listen_port": 8443,
     "certificate_file": "server.crt",
     "private_key_file": "server.key",
+    "wss": {
+      "enabled": true,
+      "listen_host": "127.0.0.1",
+      "listen_port": 8444,
+      "allowed_origins": ["http://127.0.0.1:5173", "http://localhost:5173"],
+      "allow_missing_origin": false,
+      "max_connections_per_worker": 64,
+      "max_queued_bytes": 262144,
+      "max_queued_records": 64,
+      "tls_bio_capacity": 65536,
+      "handshake_timeout_ms": 5000
+    },
     "quic": {
       "max_connections": 1024,
       "idle_timeout_ms": 120000,

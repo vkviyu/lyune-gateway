@@ -16,7 +16,9 @@
 ```
 app/          组合根：加载配置、装配组件、拉起进程
   │
-worker/       数据面 per-core：QUIC 连接、流分发、消息聚合
+worker/       数据面 per-core：会话、认证、Exchange、路由与消息聚合
+wss/          浏览器/TCP 客户端 binding：TLS、WebSocket、逻辑多流、有界队列
+session/      客户端 binding 与 Worker 共享的纯会话契约
 control/      控制面：节点/Worker 生命周期（网关集群自身，不含后端寻址）
 backend/      后端出口：BackendTransport 接口、直连实现、路由注册表
 reactor/      事件反应堆：组装 Endpoint + IoLoop，驱动收发循环
@@ -44,14 +46,30 @@ lyune-gateway/
 │   │   └── bootstrap.zig         # 进程/Worker 编排：Coordinator、socket 组、启动闸门
 │   │
 │   ├── worker/                   # 数据面 per-core 组件
-│   │   ├── mod.zig               # 暴露 GatewayWorker、connection、ingress、egress、inflight、auth
+│   │   ├── mod.zig               # 只暴露 Worker 数据面模块，不再反向导出具体 binding
 │   │   ├── worker.zig            # GatewayWorker：装配 + 生命周期 + 优雅停机 + 后端回程分派
 │   │   ├── ingress.zig           # 客户端上行：分帧、按 dest_kind 分派、交换状态与错误分级
 │   │   ├── egress.zig            # 后端下行：接纳后端主动流、.peer/.multicast 扇出、跨位置转投、后端控制交换
 │   │   ├── peer_link.zig         # 节点间应用层投递的出站链路（对等网关节点，mTLS）
 │   │   ├── inflight.zig          # 在途请求表：回程映射 + 认证等待表 + 上限与三条回收路径
 │   │   ├── auth.zig              # 接入认证：委托后端认证服务、判定结果、亲和重定向
+│   │   ├── lifecycle.zig         # 连接级 online/offline 与 presence 租约
+│   │   ├── push_session.zig      # 后端流式推送冻结后的目标会话状态
 │   │   └── connection.zig        # ConnectionContext + 定容会话槽位池 + dest/组播成员索引 + ConnToken
+│   │
+│   ├── session/                  # 客户端传输无关会话契约
+│   │   ├── mod.zig               # 统一导出契约
+│   │   ├── handle.zig            # Worker-local slot/generation SessionHandle
+│   │   ├── transport.zig         # type-erased TransportSession I/O vtable
+│   │   └── binding.zig           # Handler / Acceptor：binding 与 Worker 的双向端口
+│   │
+│   ├── wss/                      # TLS/TCP/WebSocket 客户端 binding
+│   │   ├── mod.zig
+│   │   ├── listener.zig          # accept、TLS/Upgrade、会话 lifecycle 与 I/O adapter
+│   │   ├── websocket.zig         # RFC 6455 Upgrade、frame 和分片重组
+│   │   ├── envelope.zig          # logical stream record
+│   │   ├── output_queue.zig      # 每会话有界可靠队列与 ephemeral 过载策略
+│   │   └── tls.zig               # BoringSSL memory-BIO 封装
 │   │
 │   ├── control/                  # 控制面组件
 │   │   ├── mod.zig               # 暴露 Coordinator 与 membership
@@ -65,7 +83,7 @@ lyune-gateway/
 │   │   ├── catalog.zig           # 路由声明目录：定容 + 原子长度，进程级共享，可运行期追加
 │   │   ├── factory.zig           # 每 Worker 的直连实例工厂与仓库（实例只能在自己线程上建）
 │   │   ├── pool.zig              # 每 Worker 一份的共享传输设施：一个 QUIC 客户端 + 一份接收槽位池
-│   │   └── direct.zig            # 直连实现：每个 ScopedRoute 一个实例，内部连接池管理副本
+│   │   └── direct.zig            # 直连实现：每 Worker/ScopedRoute 一个实例，内部管理副本
 │   │
 │   ├── protocol/                 # 帧协议组件
 │   │   ├── mod.zig
@@ -85,6 +103,7 @@ lyune-gateway/
 │   │   ├── c.zig                 # @cImport 绑定、类型别名、DCID 解析
 │   │   ├── endpoint.zig          # Endpoint：picoquic 上下文与 C 回调分发、CID 签发
 │   │   ├── connection.zig        # Connection：picoquic_cnx_t 封装
+│   │   ├── session.zig           # Raw QUIC → TransportSession adapter
 │   │   ├── stream.zig            # Stream 操作句柄
 │   │   ├── config.zig            # QUICConfig / 拥塞算法
 │   │   └── client.zig            # 基于内置循环的同步客户端
@@ -102,7 +121,7 @@ lyune-gateway/
 │       ├── config.zig            # GatewayConfig 定义、JSON 加载与校验
 │       ├── errors.zig            # 线程本地错误处理框架
 │       ├── net.zig               # 地址与 sockaddr 转换
-│       ├── placement.zig         # 选址：(realm, dest_id) 必须落在哪个 (节点, Worker)，HRW
+│       ├── placement.zig         # 选址：(realm, dest_id) 的 home 节点 + Raw QUIC Worker 提示
 │       ├── quota.zig             # 按 realm 的加权准入：共享定容池上的公平上限
 │       ├── realm.zig             # 隔离域：SNI → RealmId 解析表
 │       ├── time.zig              # 时间戳
@@ -110,7 +129,9 @@ lyune-gateway/
 │           ├── mod.zig           # Resolver 接口 + Cares 实现导出
 │           └── cares.zig         # c-ares 异步实现
 │
-├── config/gateway.json           # 唯一运行配置（runtime/server/backend/worker/cluster）
+├── config/
+│   ├── gateway.json              # 默认本地开发配置
+│   └── validation-*.json         # Mac IM、协议与压力验证配置
 ├── docs/                         # 架构、协议、目录文档
 └── libs/                         # picoquic / picotls（git submodule）
 ```
@@ -128,13 +149,28 @@ lyune-gateway/
 按关注点分成几个文件，切分依据是"谁拥有状态"而不是行数：
 
 - `ingress.zig` —— 上行半边：把字节切成完整帧，按 `frame_type` 与 `dest_kind` 分派（`.gateway` 本地处理、`.service` 开后端流并追加、`.peer` / `.multicast` 越权拒绝）。按流维护交换状态，并据此把错误分成"关连接"与"回错误帧"两级，见 `docs/protocol_design.md` §7.5。
-- `egress.zig` —— 下行半边：接纳后端主动发起的流（`.peer` / `.multicast` 推送与后端 → 网关控制交换的载体），重组成完整帧后按 `dest_kind` 分派。本位置的目标直接投递，其余按 `placement` 算出的位置转投给同机其他 Worker或远端节点；跨节点走 `peer_link.zig` 的 QUIC+mTLS 链路。转投过来的消息只做本地投递、绝不再次选址——这是防环的核心机制。
+- `egress.zig` —— 下行半边：接纳后端主动发起的流（`.peer` / `.multicast` 推送与后端 → 网关控制交换的载体），重组成完整帧后按 `dest_kind` 分派。`.peer` 跨节点按 `placement` 选择 home 节点，目标节点内让全部 Worker 查各自的线程私有连接索引；`.multicast` 广播到所有位置。跨节点走 `peer_link.zig` 的 QUIC+mTLS 链路。转投过来的消息只做本地投递、绝不再次选址——这是防环的核心机制。
 - `inflight.zig` —— 拥有后端流到客户端流的回程映射与认证等待表。这两张表是无界内存增长的防线，回收有三条路径（正常 fin、连接关闭、超时兜底），任何一条漏了都不会立刻报错，因此状态与回收逻辑必须放在一起并单独测试。
 - `auth.zig` —— 接入认证：原样转发 auth_request 给后端认证服务，网关不解析 token，只从响应的定长前缀里取两个自己的字段（可寻址的 `dest_id` 与准入有效期）。
 - `connection.zig` —— 会话上下文、定容槽位池，以及 `dest_id → [connection]` 索引。索引的链表节点就是槽位本身，因此不需要任何额外分配。
 - `worker.zig` —— 装配、生命周期、优雅停机，以及把后端回程事件按归属分给三条路径（认证响应 / 请求响应 / 后端推送）。
 
 回程的**分派**留在 `worker.zig` 而不是并进 `egress.zig`：它与上行共享 `inflight` 里的映射，"插入必须配平删除"这条不变量分到两个文件反而更难看清。`egress.zig` 只拥有推送这一条路径的状态。
+
+### session/ — 客户端会话契约
+
+`session/` 不导入 Worker、WSS 或 picoquic，是具体 binding 与业务状态之间的稳定边界：
+
+- `TransportSession` 是非拥有 `ptr + vtable`，统一 write/open/ephemeral/reset/stop/discard/close；
+- 主动 exchange id 的 1/5/9…分配集中在契约，binding 不各自复制；
+- `Handler` 把已建立会话事件送给 Worker，`Acceptor` 让 Worker 启停/维护 app 持有的 listener；
+- `SessionHandle` 只表示 Worker 槽位与 generation，不泄漏 fd、TLS 对象或 QUIC 指针。
+
+### wss/ — WSS/TCP 客户端 binding
+
+本目录只拥有 TCP、BoringSSL、HTTP Upgrade、RFC 6455、WSS envelope 与每会话输出队列。
+它依赖 `session.Handler`，但不 import Worker；Worker 反向只调用 `TransportSession` 和
+`Acceptor`，具体 listener 由 app 同时持有并装配。新增第三种 binding 应复用这个形态。
 
 ### control/ — 控制面
 
@@ -150,7 +186,7 @@ lyune-gateway/
 
 ### backend/ — 后端出口
 
-`BackendTransport` 是网关到后端的统一接口（resolve/send/receive/close），实现类型只表达传输方式语义；`TransportRegistry` 维护 RouteId → Transport 实例的一一映射（使用场景语义），是两层语义唯一的交汇点。`DirectTransport` 每个 RouteId 一个独立实例，实例内部用连接池按 host:port 管理本服务的副本连接。中继（NATS 等）实现后续新增文件即可。
+`BackendTransport` 是网关到后端的统一接口（resolve/send/receive/close），实现类型只表达传输方式语义；每个 Worker 的 `TransportRegistry` 维护 `ScopedRoute(realm, RouteId) → Transport` 的一一映射，是隔离域、使用场景与传输实例的唯一交汇点。`DirectTransport` 对每个 Worker-local `ScopedRoute` 建立独立实例，实例内部用连接池按 host:port 管理本服务的副本连接。中继（NATS 等）实现后续新增文件即可。
 
 ### protocol/ — 帧协议
 
@@ -166,7 +202,7 @@ lyune-gateway/
 
 ### quic/ — QUIC 引擎
 
-picoquic 的 Zig 封装。`Endpoint` 在 CID 回调中调用 `io/cid.zig` 签发同时编码 node_id 与 Worker 归属的 12 字节 CID v1。
+picoquic 的 Zig 封装。`Endpoint` 在 CID 回调中调用 `io/cid.zig` 签发同时编码 node_id 与 Worker 归属的 12 字节 CID v1；`session.zig` 是唯一把客户端 cnx 适配为 `TransportSession` 的位置。
 
 ### io/ — I/O 与内核态分流
 
@@ -178,38 +214,23 @@ picoquic 的 Zig 封装。`Endpoint` 在 CID 回调中调用 `io/cid.zig` 签发
 
 ## 5. 依赖关系
 
-```
-                    ┌──────────┐
-                    │  main    │
-                    └────┬─────┘
-                         ▼
-                    ┌──────────┐
-                    │   app    │  组合根
-                    └────┬─────┘
-        ┌───────────┬────┴──────┬───────────┐
-        ▼           ▼           ▼
-   ┌────────┐  ┌────────┐  ┌──────────┐
-   │ worker │  │control │  │ backend  │
-   └───┬────┘  └───┬────┘  └────┬─────┘
-       │           │            │
-       └─────┬─────┴────────────┤
-             ▼                  ▼
-        ┌──────────┐      ┌──────────┐
-        │ reactor  │      │ protocol │
-        └────┬─────┘      └────┬─────┘
-             ├─────────┬───────┘
-             ▼         ▼
-        ┌────────┐ ┌────────┐
-        │  quic  │ │   io   │
-        └───┬────┘ └───┬────┘
-            └────┬─────┘
-                 ▼
-          ┌────────────┐
-          │ foundation │
-          └────────────┘
+```text
+main -> app
+          +-> worker --------> session
+          +-> wss -----------> session
+          +-> control / backend / quic / io
+
+worker -> control / backend / reactor / protocol / quic / io / foundation
+wss    -> session / protocol / foundation
+quic   -> session / io / foundation
+backend -> reactor / protocol / quic / foundation
+reactor -> quic / io / foundation
 ```
 
-> 依赖始终自上而下。`io` 与 `quic` 之间存在少量互引用（`io/loop` 使用 quic 的时间工具，`quic/endpoint` 使用 `io/cid`），属同层协作，Zig 模块级导入允许。
+最关键的不变量是 `worker -> session <- wss`：两侧不互相导入，只有 app 组合根知道具体
+listener 和 Worker 并连接端口。`session/` 本身无项目内依赖。`io` 与 `quic` 之间仍有少量
+同层协作（`io/loop` 使用 QUIC 时间工具，`quic/endpoint` 使用 `io/cid`）；后续若要彻底
+消除这一同层环，应先提取独立的 packet/time contract，不能靠移动文件掩盖。
 
 ## 6. 实现状态
 

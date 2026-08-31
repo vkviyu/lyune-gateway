@@ -15,6 +15,7 @@ const quic = @import("../quic/mod.zig");
 pub const RuntimeConfig = struct {
     threads: u16,
     server_quic: quic.config.QUICConfig,
+    wss: ?WssConfig,
     /// 集群监听器的 QUIC 配置；null 表示不启用节点间应用层投递链路。
     ///
     /// 与 `server_quic` 分成两份而不是共用一份改端口：它必须开
@@ -64,6 +65,10 @@ pub const RuntimeConfig = struct {
     cluster: control.coordinator.Config,
 
     pub fn deinit(self: *RuntimeConfig, allocator: std.mem.Allocator) void {
+        if (self.wss) |wss_config| {
+            for (wss_config.allowed_origins) |origin| allocator.free(origin);
+            allocator.free(wss_config.allowed_origins);
+        }
         if (self.server_quic.cert_file) |path| allocator.free(path);
         if (self.server_quic.key_file) |path| allocator.free(path);
         allocator.free(self.server_quic.base.alpn);
@@ -86,6 +91,21 @@ pub const RuntimeConfig = struct {
     }
 };
 
+pub const WssConfig = struct {
+    bind_address: [4]u8,
+    bind_port: u16,
+    /// 与 Raw QUIC 监听器复用同一张服务端证书，只借用 RuntimeConfig 的副本。
+    cert_file: [:0]const u8,
+    key_file: [:0]const u8,
+    allowed_origins: []const []const u8,
+    allow_missing_origin: bool,
+    max_connections_per_worker: usize,
+    max_queued_bytes: usize,
+    max_queued_records: usize,
+    tls_bio_capacity: usize,
+    handshake_timeout_ms: u64,
+};
+
 /// 从原始配置组装 RuntimeConfig。任何一步分配失败都会通过 errdefer 回滚。
 pub fn prepare(allocator: std.mem.Allocator, config: foundation.config.GatewayConfig) !RuntimeConfig {
     const bind_address = std.Io.net.IpAddress.parseIp4(config.server.listen_host, config.server.listen_port) catch return error.InvalidListenAddress;
@@ -95,6 +115,25 @@ pub fn prepare(allocator: std.mem.Allocator, config: foundation.config.GatewayCo
     errdefer allocator.free(key_file);
     const server_alpn = try allocator.dupeSentinel(u8, config.server.quic.alpn, 0);
     errdefer allocator.free(server_alpn);
+    const wss_bind_address: [4]u8 = if (config.server.wss.enabled)
+        (std.Io.net.IpAddress.parseIp4(config.server.wss.listen_host, config.server.wss.listen_port) catch return error.InvalidWssListenAddress).ip4.bytes
+    else
+        .{ 0, 0, 0, 0 };
+    const wss_origins: [][]const u8 = if (config.server.wss.enabled)
+        try allocator.alloc([]const u8, config.server.wss.allowed_origins.len)
+    else
+        @constCast(&.{});
+    var wss_origins_built: usize = 0;
+    errdefer if (config.server.wss.enabled) {
+        for (wss_origins[0..wss_origins_built]) |origin| allocator.free(origin);
+        allocator.free(wss_origins);
+    };
+    if (config.server.wss.enabled) {
+        for (config.server.wss.allowed_origins, wss_origins) |raw, *origin| {
+            origin.* = try allocator.dupe(u8, raw);
+            wss_origins_built += 1;
+        }
+    }
     // 路由目录：槽位按 route_capacity 分配，只填前 routes.len 个——剩下的空位是运行期
     // 追加接入方用的（§12.5），装不下启动期条目在 validate 里就被拒了。
     const route_slots = try allocator.alloc(backend.RouteEntry, config.backend.direct.route_capacity);
@@ -180,6 +219,19 @@ pub fn prepare(allocator: std.mem.Allocator, config: foundation.config.GatewayCo
 
     return .{
         .threads = config.runtime.threads,
+        .wss = if (config.server.wss.enabled) .{
+            .bind_address = wss_bind_address,
+            .bind_port = config.server.wss.listen_port,
+            .cert_file = cert_file,
+            .key_file = key_file,
+            .allowed_origins = wss_origins,
+            .allow_missing_origin = config.server.wss.allow_missing_origin,
+            .max_connections_per_worker = config.server.wss.max_connections_per_worker,
+            .max_queued_bytes = config.server.wss.max_queued_bytes,
+            .max_queued_records = config.server.wss.max_queued_records,
+            .tls_bio_capacity = config.server.wss.tls_bio_capacity,
+            .handshake_timeout_ms = config.server.wss.handshake_timeout_ms,
+        } else null,
         .server_quic = .{
             .base = .{
                 .max_connections = config.server.quic.max_connections,

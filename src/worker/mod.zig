@@ -12,6 +12,9 @@
 //!   - lifecycle.zig  —— 连接级 online/offline 事件，不做多设备聚合
 //!   - connection.zig —— 会话上下文、定容槽位池、`dest_id` / 组播成员索引
 //!
+//! 客户端会话身份与 I/O 契约位于顶层 `session/`，Raw QUIC/WSS binding 与 Worker
+//! 共同依赖它；它们不属于 Worker 的业务状态。
+//!
 //! 上行在 ingress、下行在 egress，两边通过 inflight 里的映射对接；worker.zig 只负责
 //! 把回程事件按归属分给三条路径（认证响应 / 请求响应 / 后端推送）。
 

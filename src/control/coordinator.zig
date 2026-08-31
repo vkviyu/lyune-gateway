@@ -319,8 +319,8 @@ pub const Coordinator = struct {
     }
 
     /// 本节点的 Worker 数量；选址的 Worker 级取模要用它。
-    pub fn workerCount(self: *const Coordinator) u8 {
-        return @intCast(self.config.worker_count);
+    pub fn workerCount(self: *const Coordinator) u16 {
+        return self.config.worker_count;
     }
 
     /// 配置的选路策略。

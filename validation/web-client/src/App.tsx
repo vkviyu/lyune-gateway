@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { WssImSession, type WssPushEvent } from './wss_session'
 
 type User = { id: number; username: string }
 type Group = { id: number; name: string; invite_code: string; owner_id: number; joined_at?: string }
@@ -40,7 +41,10 @@ type PushEvent = {
   payload: CommandResponse
 }
 
+type TransportMode = 'wss' | 'raw-quic'
+
 const sessionKey = 'lyune-im-session-id'
+const sessionTransportKey = 'lyune-im-session-transport'
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -71,7 +75,9 @@ function App() {
   const [typingUsers, setTypingUsers] = useState<User[]>([])
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [transportMode, setTransportMode] = useState<TransportMode>('wss')
   const [address, setAddress] = useState('127.0.0.1:8443')
+  const [wssURL, setWssURL] = useState('wss://localhost:8444/lyune/v2')
   const [serverName, setServerName] = useState('localhost')
   const [authMode, setAuthMode] = useState<'login' | 'register'>('register')
   const [groupName, setGroupName] = useState('Lyune 实验群')
@@ -83,6 +89,7 @@ function App() {
   const lastEventSeq = useRef(0)
   const chatEnd = useRef<HTMLDivElement | null>(null)
   const lastTypingSentAt = useRef(0)
+  const wssSession = useRef<WssImSession | null>(null)
 
   const activeGroup = useMemo(
     () => groups.find((group) => group.id === activeGroupID) ?? null,
@@ -91,12 +98,17 @@ function App() {
 
   const command = useCallback(async (body: Omit<Record<string, unknown>, 'session_id'>) => {
     if (!session?.session_id) throw new Error('当前没有已认证会话')
+    if (transportMode === 'wss') {
+      const active = wssSession.current
+      if (!active) throw new Error('WSS 会话已经关闭')
+      return active.command(body) as Promise<CommandResponse>
+    }
     const result = await api<CommandResponse>('/api/im/command', {
       method: 'POST', body: JSON.stringify({ session_id: session.session_id, ...body }),
     })
     if (!result.ok) throw new Error(result.error ?? '后端拒绝了请求')
     return result
-  }, [session?.session_id])
+  }, [session?.session_id, transportMode])
 
   const refreshGroups = useCallback(async () => {
     const result = await command({ type: 'list_groups' })
@@ -125,13 +137,22 @@ function App() {
 
   useEffect(() => {
     const saved = sessionStorage.getItem(sessionKey)
-    if (!saved) return
+    if (!saved || sessionStorage.getItem(sessionTransportKey) !== 'raw-quic') return
+    setTransportMode('raw-quic')
     void api<SessionStatus>(`/api/im/status?session_id=${encodeURIComponent(saved)}`)
       .then((status) => {
         if (!status.connected || !status.authenticated) throw new Error('saved session is no longer active')
         setSession(status)
       })
-      .catch(() => sessionStorage.removeItem(sessionKey))
+      .catch(() => {
+        sessionStorage.removeItem(sessionKey)
+        sessionStorage.removeItem(sessionTransportKey)
+      })
+  }, [])
+
+  useEffect(() => () => {
+    wssSession.current?.close()
+    wssSession.current = null
   }, [])
 
   useEffect(() => {
@@ -139,8 +160,42 @@ function App() {
     void refreshGroups().catch((error) => setNotice({ tone: 'error', text: String(error) }))
   }, [session?.authenticated, refreshGroups])
 
+  const applyPush = useCallback((event: PushEvent) => {
+    lastEventSeq.current = Math.max(lastEventSeq.current, event.seq)
+    const message = event.payload.message
+    if (event.payload.type === 'message' && message) {
+      setMessages((current) => message.group_id === activeGroupID ? mergeMessages(current, [message]) : current)
+      if (message.sender.id !== session?.user?.id) {
+        setNotice({ tone: 'info', text: `${message.sender.username} 发来一条新消息` })
+      }
+    }
+    if (event.payload.type === 'typing' && event.payload.user && event.payload.group_id === activeGroupID && event.payload.user.id !== session?.user?.id) {
+      const typingUser = event.payload.user
+      setTypingUsers((current) => [...current.filter((user) => user.id !== typingUser.id), typingUser])
+      window.setTimeout(() => {
+        setTypingUsers((current) => current.filter((user) => user.id !== typingUser.id))
+      }, 2200)
+    }
+  }, [activeGroupID, session?.user?.id])
+
   useEffect(() => {
     if (!session?.session_id || !session.authenticated) return
+    if (transportMode === 'wss') {
+      const active = wssSession.current
+      if (!active) return
+      setPushState('listening')
+      active.onPush = (event: WssPushEvent) => applyPush(event as unknown as PushEvent)
+      active.onClose = (reason) => {
+        setPushState('retrying')
+        setNotice({ tone: 'error', text: reason })
+        setSession((current) => current ? { ...current, connected: false, connection_closed_by: reason } : current)
+      }
+      return () => {
+        active.onPush = null
+        active.onClose = null
+      }
+    }
+
     const controller = new AbortController()
     let stopped = false
     const listen = async () => {
@@ -152,23 +207,7 @@ function App() {
             { signal: controller.signal },
           )
           setPushState('listening')
-          for (const event of result.events) {
-            lastEventSeq.current = Math.max(lastEventSeq.current, event.seq)
-            const message = event.payload.message
-            if (event.payload.type === 'message' && message) {
-              setMessages((current) => message.group_id === activeGroupID ? mergeMessages(current, [message]) : current)
-              if (message.sender.id !== session.user?.id) {
-                setNotice({ tone: 'info', text: `${message.sender.username} 发来一条新消息` })
-              }
-            }
-            if (event.payload.type === 'typing' && event.payload.user && event.payload.group_id === activeGroupID && event.payload.user.id !== session.user?.id) {
-              const typingUser = event.payload.user
-              setTypingUsers((current) => [...current.filter((user) => user.id !== typingUser.id), typingUser])
-              window.setTimeout(() => {
-                setTypingUsers((current) => current.filter((user) => user.id !== typingUser.id))
-              }, 2200)
-            }
-          }
+          for (const event of result.events) applyPush(event)
         } catch {
           if (controller.signal.aborted) return
           setPushState('retrying')
@@ -181,7 +220,7 @@ function App() {
       stopped = true
       controller.abort()
     }
-  }, [session?.session_id, session?.authenticated, session?.user?.id, activeGroupID])
+  }, [session?.session_id, session?.authenticated, transportMode, applyPush])
 
   useEffect(() => {
     if (!activeGroupID || !session?.authenticated) return
@@ -219,14 +258,28 @@ function App() {
     setBusy('auth')
     setNotice(null)
     try {
-      const status = await api<SessionStatus>('/api/im/auth', {
-        method: 'POST',
-        body: JSON.stringify({
-          action: authMode, username, password, address, server_name: serverName,
-          insecure_skip_verify: true,
-        }),
-      })
+      let status: SessionStatus
+      if (transportMode === 'wss') {
+        wssSession.current?.close()
+        const direct = await WssImSession.connect(wssURL)
+        try {
+          status = await direct.authenticate(authMode, username, password) as SessionStatus
+          wssSession.current = direct
+        } catch (error) {
+          direct.close()
+          throw error
+        }
+      } else {
+        status = await api<SessionStatus>('/api/im/auth', {
+          method: 'POST',
+          body: JSON.stringify({
+            action: authMode, username, password, address, server_name: serverName,
+            insecure_skip_verify: true,
+          }),
+        })
+      }
       sessionStorage.setItem(sessionKey, status.session_id)
+      sessionStorage.setItem(sessionTransportKey, transportMode)
       lastEventSeq.current = 0
       setSession(status)
       setPassword('')
@@ -239,10 +292,14 @@ function App() {
   }
 
   const logout = async () => {
-    if (session?.session_id) {
+    if (transportMode === 'wss') {
+      wssSession.current?.close()
+      wssSession.current = null
+    } else if (session?.session_id) {
       await api('/api/im/logout', { method: 'POST', body: JSON.stringify({ session_id: session.session_id }) }).catch(() => undefined)
     }
     sessionStorage.removeItem(sessionKey)
+    sessionStorage.removeItem(sessionTransportKey)
     setSession(null)
     setGroups([])
     setMessages([])
@@ -309,9 +366,12 @@ function App() {
         <section className="auth-story">
           <p className="eyebrow">LYUNE / MAC STAGE · REAL IM</p>
           <h1>不是 echo。<br />是真实的身份与消息。</h1>
-          <p className="lead">用户名和密码经过 <code>Browser → client-agent → Gateway → Reactor</code>。Reactor 查询 SQLite 后决定准入，群消息再由网关主动推送给在线成员。</p>
+          <p className="lead">默认由浏览器直接建立 <code>WSS → TransportSession</code>；也可切换 Raw QUIC 对照。两条传输共用同一套认证、Exchange、路由和推送语义。</p>
           <div className="path-card">
-            {['Web :5173', 'Agent :8787', 'Gateway :8443', 'Reactor :9443', 'SQLite'].map((label, index) => (
+            {(transportMode === 'wss'
+              ? ['Web :5173', 'WSS :8444', 'Gateway Core', 'Reactor :9443', 'SQLite']
+              : ['Web :5173', 'Agent :8787', 'Raw QUIC :8443', 'Reactor :9443', 'SQLite']
+            ).map((label, index) => (
               <div className="path-node" key={label}><span>{String(index + 1).padStart(2, '0')}</span>{label}</div>
             ))}
           </div>
@@ -326,15 +386,28 @@ function App() {
             <div><h2>{authMode === 'register' ? '创建真实用户' : '验证已有用户'}</h2><p>密码不少于 8 位；用户名为 3–24 位字母、数字或下划线。</p></div>
           </div>
           <form onSubmit={authenticate}>
+            <div className="auth-tabs">
+              <button type="button" className={transportMode === 'wss' ? 'active' : ''} onClick={() => setTransportMode('wss')}>浏览器直连 WSS</button>
+              <button type="button" className={transportMode === 'raw-quic' ? 'active' : ''} onClick={() => setTransportMode('raw-quic')}>Raw QUIC 对照</button>
+            </div>
             <label>用户名<input autoFocus autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="alice_01" /></label>
             <label>密码<input type="password" autoComplete={authMode === 'register' ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="至少 8 位" /></label>
             <details>
               <summary>本地网关连接参数</summary>
-              <div className="two-fields">
-                <label>Gateway<input value={address} onChange={(event) => setAddress(event.target.value)} /></label>
-                <label>TLS SNI<input value={serverName} onChange={(event) => setServerName(event.target.value)} /></label>
-              </div>
-              <p className="dev-warning">本地验证使用开发证书并显式跳过证书链校验。</p>
+              {transportMode === 'wss' ? (
+                <>
+                  <label>WSS URL<input value={wssURL} onChange={(event) => setWssURL(event.target.value)} /></label>
+                  <p className="dev-warning">浏览器不能跳过 WSS 证书校验；首次运行需在 macOS/浏览器中信任项目的 server.crt。</p>
+                </>
+              ) : (
+                <>
+                  <div className="two-fields">
+                    <label>Gateway<input value={address} onChange={(event) => setAddress(event.target.value)} /></label>
+                    <label>TLS SNI<input value={serverName} onChange={(event) => setServerName(event.target.value)} /></label>
+                  </div>
+                  <p className="dev-warning">本地 Raw QUIC 对照通过 client-agent 显式跳过开发证书链校验。</p>
+                </>
+              )}
             </details>
             <button className="primary wide" disabled={busy === 'auth'}>{busy === 'auth' ? '正在走完整认证链路…' : authMode === 'register' ? '注册并进入 Lyune' : '登录 Lyune'}</button>
           </form>
@@ -373,7 +446,7 @@ function App() {
             <button disabled={busy !== null || !inviteCode}>加入</button>
           </form>
         </div>
-        <button className="logout" onClick={() => void logout()}>退出并关闭 QUIC 会话</button>
+        <button className="logout" onClick={() => void logout()}>退出并关闭 {transportMode === 'wss' ? 'WSS' : 'QUIC'} 会话</button>
       </aside>
 
       <section className="chat-pane">
@@ -384,7 +457,7 @@ function App() {
           </div>
           <div className="transport-status">
             <span className={pushState === 'listening' ? 'online-dot' : 'warn-dot'} />
-            <div><strong>{pushState === 'listening' ? '.peer 实时监听中' : '推送通道重试中'}</strong><small>{session.local_address} → {session.remote_address} · {session.alpn}</small></div>
+            <div><strong>{pushState === 'listening' ? '.peer 实时监听中' : '推送通道重试中'}</strong><small>{transportMode === 'wss' ? session.target : `${session.local_address} → ${session.remote_address}`} · {session.alpn}</small></div>
           </div>
         </header>
 
@@ -392,9 +465,9 @@ function App() {
 
         {!activeGroup ? (
           <div className="welcome-state">
-            <div className="orbit"><span>QUIC</span></div>
+            <div className="orbit"><span>{transportMode === 'wss' ? 'WSS' : 'QUIC'}</span></div>
             <h3>用两个真实用户开始</h3>
-            <p>当前标签页是 <strong>{session.user?.username}</strong>。创建群组后，在另一个标签页注册第二个用户并输入邀请码；双方随后会通过各自独立的 QUIC 连接收发消息。</p>
+            <p>当前标签页是 <strong>{session.user?.username}</strong>。创建群组后，在另一个标签页注册第二个用户并输入邀请码；双方随后会通过各自独立的 {transportMode === 'wss' ? 'WSS' : 'QUIC'} 会话收发消息。</p>
           </div>
         ) : (
           <>
@@ -425,7 +498,7 @@ function App() {
           </>
         )}
         <footer className="protocol-footer">
-          <span>AUTH TTL {session.admission_ttl_seconds}s</span><span>SESSION {session.session_id.slice(0, 8)}…</span><span>lyune/2 · required / none · lifecycle</span>
+          <span>AUTH TTL {session.admission_ttl_seconds}s</span><span>SESSION {session.session_id.slice(0, 8)}…</span><span>{transportMode === 'wss' ? 'lyune.v2/WSS' : 'lyune/2/QUIC'} · required / none · lifecycle</span>
         </footer>
       </section>
     </main>

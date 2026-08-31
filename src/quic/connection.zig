@@ -45,14 +45,6 @@ pub const Connection = struct {
         return quic_c.c.picoquic_get_remote_cnxid(self.inner);
     }
 
-    /// 获取连接 ID 的字节表示
-    ///
-    /// 直接调用 picoquic C 函数获取连接 ID
-    pub fn getConnectionIdBytes(self: *const Connection) []const u8 {
-        const cid = self.getLocalConnectionId();
-        return cid.id[0..cid.id_len];
-    }
-
     /// 向 stream 写入数据
     pub fn streamWrite(
         self: *Connection,

@@ -1,7 +1,9 @@
-//! 选址：`(realm, dest_id)` 应该落在哪个 (节点, Worker) 上
+//! 选址：`(realm, dest_id)` 的 home 节点与 Raw QUIC Worker 提示
 //!
-//! 这是设计文档 §8.5「第二层：选路策略」的实现。它回答的**不是**"连接在哪"，
-//! 而是"连接**必须**在哪"——一个所有节点都能独立算出同一答案的纯函数。
+//! 这是设计文档 §8.5「第二层：选路策略」的实现。节点级答案是所有节点都能独立
+//! 算出的硬约束；`worker_id` 只是 Raw QUIC 下次连接 Initial DCID 的放置提示，不能
+//! 充当节点内连接目录。WSS/TCP 在认证前已经由 reuseport 选定 Worker，认证后无法
+//! 迁移 TLS 状态，因此节点内 `.peer` 投递始终让每个 Worker 查自己的本地索引。
 //!
 //! ## 为什么需要它
 //!
@@ -10,18 +12,19 @@
 //! 跨重连稳定，因此必须与位置无关）。位置无关标识必然需要一张目录，而方案一的全部
 //! 优雅之处正是"不需要目录"。
 //!
-//! 本模块用**函数取代目录**：位置不是记下来供人查的，而是由一个纯函数定义的。
-//! 代价是必须**强制**连接搬到函数算出来的位置上去——这就是重定向存在的理由，
-//! 它是这条路线的必需零件，不是补丁。
+//! 本模块在**节点级**用函数取代目录：节点不是记下来供人查的，而是由一个纯函数
+//! 定义的。代价是必须强制连接重连到函数算出的节点——这就是 redirect 存在的理由。
+//! 节点内不用共享目录，改为一次 O(worker_count) 的有界交接；每条连接只存在于一个
+//! Worker 私有索引中，所以命中一次且不会重复投递。
 //!
 //! ## 两种策略共用一条投递通路
 //!
 //! `Strategy` 只决定"目标集合有多大"，不决定"怎么送"：
 //!
-//! - `.broadcast` —— 目标集合是全部节点 × 全部 Worker，各自查本地索引，查不到是
+//! - `.broadcast` —— 目标集合是全部节点；节点内所有 Worker 各自查本地索引，查不到是
 //!   正常情形。完全无状态，不需要重定向。
-//! - `.affinity` —— 目标集合恰好是 `{home}`，查不到就是 bug。需要强制重定向来维持
-//!   不变量。
+//! - `.affinity` —— 节点集合是 `{home node}`；到达节点后同样查所有 Worker。需要
+//!   强制节点级重定向来维持不变量。
 //!
 //! **刻意不做成两条代码路径。** 两者的正确性不变量不同（亲和要强制重定向、广播不要），
 //! 做成两套实现的话运维配错就是静默的消息丢失，而这类错误没有任何报错会提示。
@@ -50,11 +53,11 @@ const std = @import("std");
 pub const Strategy = enum {
     /// 投递指令发给集群里每个节点、节点内发给每个 Worker。
     broadcast,
-    /// 只发给 `home(realm, dest_id)` 算出的那一个位置。
+    /// 只发给 `home(realm, dest_id)` 算出的节点；节点内仍检查所有 Worker。
     affinity,
 };
 
-/// 一条连接应当所处的位置。
+/// 一条连接的 home 节点，以及 Raw QUIC Initial 可使用的首选 Worker。
 pub const Location = struct {
     node_id: u16,
     worker_id: u8,
@@ -89,7 +92,7 @@ pub fn key(realm: u16, dest_id: u64) u64 {
 /// Worker 数量是静态配置，节点内不会变，所以直接取模就够——不需要一致性哈希
 /// （那是为"成员会变"准备的）。取高 32 位是因为低位已经被 `key` 的乘法混淆吃掉了
 /// 一部分熵，而取模只用得到低位。
-pub fn homeWorker(hashed: u64, worker_count: u8) u8 {
+pub fn homeWorker(hashed: u64, worker_count: u16) u8 {
     if (worker_count <= 1) return 0;
     return @intCast((hashed >> 32) % worker_count);
 }
@@ -132,7 +135,7 @@ pub const View = struct {
     /// 本 Worker 自己的位置，用来判断 home 是不是自己。
     self: Location,
     /// 本节点的 Worker 数量。
-    worker_count: u8,
+    worker_count: u16,
     /// 集群里可作为投递目标的节点快照；单机部署恒为 `&.{self.node_id}`。
     nodes: []const u16 = &.{},
     /// 成员变更之前的那份节点快照；空表示双查窗口已过或从未发生变更。
@@ -141,7 +144,7 @@ pub const View = struct {
     /// 一个纯函数变得要靠"现在几点"才能测。
     prev_nodes: []const u16 = &.{},
 
-    /// 这个键的 home 位置；`.broadcast` 下没有单一 home，返回 null。
+    /// 这个键的 home 节点与 Raw QUIC 首选 Worker；`.broadcast` 下返回 null。
     ///
     /// 节点列表为空时退化到"就是本节点"：集群视图还没建立起来时，本地投递
     /// 比丢弃更接近正确——单机部署本来就是这个形态。
@@ -186,10 +189,10 @@ pub const View = struct {
         return result;
     }
 
-    /// 这个键的 home 是否就是本 Worker（双查窗口里新旧任一命中都算）。
+    /// 这个键的 Raw QUIC 首选位置是否就是本 Worker（双查窗口里新旧任一命中都算）。
     ///
-    /// `.broadcast` 下恒为 true：广播模式下每个 Worker 都该查一遍自己的索引，
-    /// "本地不该有它"这个概念不存在。
+    /// `.broadcast` 下恒为 true。此函数只用于放置提示与选址测试；`.peer` 投递不能用
+    /// 它跳过本地索引，因为 WSS/TCP 的实际 Worker 归属不受这个提示控制。
     ///
     /// 窗口里放宽到"任一"是必需的：连接可能还挂在漂移前的那个位置上，只认新 home
     /// 会让本地那条连接在窗口里完全收不到推送。
@@ -235,6 +238,9 @@ test "the same key resolves to the same location from every node" {
     const b = from_node_1.home(7, 123).?;
     try std.testing.expectEqual(a.node_id, b.node_id);
     try std.testing.expectEqual(a.worker_id, b.worker_id);
+
+    // 配置允许 256 个 Worker；count 必须能表示 256，而最终 ID 仍落在 u8 的 0..255。
+    try std.testing.expectEqual(@as(u8, 255), homeWorker(@as(u64, 255) << 32, 256));
 }
 
 test "realm participates in placement so identical dest_ids do not collide" {

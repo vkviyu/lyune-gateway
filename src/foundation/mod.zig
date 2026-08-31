@@ -7,7 +7,7 @@
 pub const config = @import("config.zig");
 pub const err = @import("errors.zig");
 pub const net = @import("net.zig");
-/// 选址：`(realm, dest_id)` 必须落在哪个 (节点, Worker) 上（见 protocol_design §8.5）。
+/// 选址：`(realm, dest_id)` 的 home 节点与 Raw QUIC 首包的 Worker 提示（见 protocol_design §8.5）。
 pub const placement = @import("placement.zig");
 /// 按 realm 的加权准入：共享定容池上的公平上限（见 protocol_design §12.4）。
 pub const quota = @import("quota.zig");

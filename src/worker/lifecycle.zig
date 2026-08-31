@@ -43,7 +43,7 @@ pub fn revokeAdmission(self: *GatewayWorker, ctx: *ConnectionContext, reason: Ev
     ctx.authenticated = false;
     ctx.auth_expires_at = 0;
     ctx.clearChannels();
-    self.conn_manager.bindDest(ctx.cnx_handle, 0);
+    self.conn_manager.bindDest(ctx.session_handle, 0);
 }
 
 fn publish(self: *GatewayWorker, ctx: *ConnectionContext, kind: EventKind, reason: Event.Reason) void {
@@ -52,7 +52,7 @@ fn publish(self: *GatewayWorker, ctx: *ConnectionContext, kind: EventKind, reaso
     if (kind == .online) ctx.lifecycle_refreshed_at = now;
     ctx.lifecycle_sequence +%= 1;
     if (ctx.lifecycle_sequence == 0) ctx.lifecycle_sequence = 1;
-    const token = self.conn_manager.tokenFor(ctx.cnx_handle) orelse {
+    const token = self.conn_manager.tokenFor(ctx.session_handle) orelse {
         std.log.warn("[LIFECYCLE] connection has no token", .{});
         return;
     };

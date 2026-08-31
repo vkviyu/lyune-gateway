@@ -45,12 +45,12 @@ const framing = protocol.framing;
 const body = protocol.body;
 const frame = protocol.frame;
 const quic = @import("../quic/mod.zig");
-const QUICConnection = quic.connection.Connection;
 const backend = @import("../backend/mod.zig");
 const BackendTransport = backend.BackendTransport;
 const TransportRecv = backend.transport.TransportRecv;
 const connection = @import("connection.zig");
 const ConnectionContext = connection.ConnectionContext;
+const SessionHandle = @import("../session/mod.zig").SessionHandle;
 const inflight = @import("inflight.zig");
 const peer_link = @import("peer_link.zig");
 const push_session = @import("push_session.zig");
@@ -165,17 +165,32 @@ const RouteSet = struct {
         for (worker.placement.candidates(realm, dest_id).slice()) |home| self.mark(worker, home);
     }
 
-    /// 记下本节点所有其他 Worker，以及（非 local_only 时）所有其他节点。
-    fn markAll(self: *RouteSet, worker: *GatewayWorker) void {
-        var worker_id: u8 = 0;
+    /// 记下本节点所有其他 Worker。
+    ///
+    /// 节点级亲和不能推出节点内连接归属：WSS 的 TCP 连接由 reuseport 选中后无法在
+    /// 认证完成时搬运 TLS 状态，macOS 上也没有 Linux cBPF 能保证 Raw QUIC 首包落在
+    /// hint 指定的 Worker。因此 `.peer` 到达目标节点后同样必须问过所有 Worker；每条
+    /// 连接只存在于一个本地索引里，所以不会重复投递。
+    fn markAllWorkers(self: *RouteSet, worker: *GatewayWorker) void {
+        var worker_id: u16 = 0;
         while (worker_id < worker.placement.worker_count) : (worker_id += 1) {
-            if (worker_id != worker.placement.self.worker_id) self.worker_pending[worker_id] = true;
+            if (worker_id != @as(u16, worker.placement.self.worker_id)) self.worker_pending[worker_id] = true;
         }
+    }
+
+    /// 记下所有其他节点；`local_only` 的入站交接绝不再次跨节点。
+    fn markAllNodes(self: *RouteSet, worker: *GatewayWorker) void {
         if (self.local_only) return;
         for (worker.placement.nodes) |node_id| {
             if (node_id == worker.placement.self.node_id) continue;
             if (node_id < max_routable_nodes) self.node_pending[node_id] = true;
         }
+    }
+
+    /// 记下本节点所有其他 Worker，以及（非 local_only 时）所有其他节点。
+    fn markAll(self: *RouteSet, worker: *GatewayWorker) void {
+        self.markAllWorkers(worker);
+        self.markAllNodes(worker);
     }
 
     /// 把这一帧发给集合里的每个位置，每个位置只发一次。
@@ -195,8 +210,8 @@ const RouteSet = struct {
         for (self.node_pending, 0..) |pending, node_id| {
             if (!pending) continue;
             // 跨节点走对等网关节点的 QUIC 链路（设计文档 §8.5）。链路不可用时
-            // `send` 返回 false，这个节点上的目标随后会被回报为不可达——**不静默丢弃**，
-            // 后端因此会把消息转去离线存储。
+            // `send` 返回 false，这个节点上的目标随后会被回报为不可达——不把一次明确的
+            // 路由失败伪装成成功。持久消息仍必须由后端先落库，不能只依赖这份受理回报。
             const links = if (worker.peer_links) |*value| value else {
                 std.log.warn("[ROUTE] cross-node delivery needs cluster.peer_* certificates; node {} unreachable", .{node_id});
                 continue;
@@ -254,7 +269,7 @@ const RouteSet = struct {
     ///
     /// 回报语义是**「本位置是否受理」而不是「是否已投递」**：给跨位置这一跳单独加 ack
     /// 并不能让端到端可靠（客户端那一跳照样会丢），只是把不可靠往后推一格。真正要
-    /// "消息必达"必须靠后端离线存储 + 客户端拉取。
+    /// "消息必达"必须靠后端预先持久化 + 客户端游标拉取。
     fn accepted(self: *const RouteSet, worker: *GatewayWorker, home: ?foundation.placement.Location) bool {
         const location = home orelse return false;
         if (location.node_id != worker.placement.self.node_id) {
@@ -267,13 +282,28 @@ const RouteSet = struct {
     /// 这个目标的候选位置里有任何一个受理了这一次转投。
     ///
     /// 必须与 `markHome` 用同一份候选枚举：双查窗口里连接可能还在旧 home 上，
-    /// 结算时只看新 home 会把"已经送到旧 home"误报成不可达，后端于是又写一份离线，
-    /// 用户拿到两条一样的消息——这比漏投更难解释。
+    /// 结算时只看新 home 会把“已经被旧 home 受理”误报成不可达，破坏回报的一致性。
     fn acceptedHome(self: *const RouteSet, worker: *GatewayWorker, realm: RealmId, dest_id: u64) bool {
         for (worker.placement.candidates(realm, dest_id).slice()) |home| {
             if (self.accepted(worker, home)) return true;
         }
         return false;
+    }
+
+    /// 本节点是否有另一个 Worker 受理了交接。
+    ///
+    /// 这是队列受理，不是终端确认；与 `acceptedHome` 原有语义相同。端到端必达仍由
+    /// 后端离线存储 + 客户端游标补偿提供。
+    fn acceptedByAnyWorker(self: *const RouteSet) bool {
+        for (self.worker_accepted) |was_accepted| {
+            if (was_accepted) return true;
+        }
+        return false;
+    }
+
+    /// `.peer` 的受理判据：目标节点内任一 Worker，或 HRW 选中的远端候选节点。
+    fn acceptedPeer(self: *const RouteSet, worker: *GatewayWorker, realm: RealmId, dest_id: u64) bool {
+        return self.acceptedByAnyWorker() or self.acceptedHome(worker, realm, dest_id);
     }
 };
 
@@ -333,12 +363,13 @@ fn isLocal(self: *GatewayWorker, token: connection.ConnToken) bool {
 /// 之后调用。与 `deliverHandoff` 的唯一区别是**允许一次节点内转投**：
 ///
 /// ```
-/// 节点 A ──跨节点一跳──> 节点 B 的任意 Worker ──节点内一跳──> home Worker ──> 连接
+/// 节点 A ──跨节点一跳──> 节点 B 的任意 Worker ──节点内一跳──> 每个 Worker 查本地索引
 /// ```
 ///
-/// 中间那一跳跑不掉：A 的 QUIC 连接落在 B 的哪个 Worker 由 B 的内核 reuseport 决定，
-/// 与目标的 home 无关。而节点内转投过去的帧走 `deliverHandoff`，那条路**不再转投**
-/// ——所以总跳数被结构性地限死在 2，不需要跳数字段。
+/// 中间那一跳跑不掉：连接实际落在哪个 Worker 由节点内的 UDP/TCP reuseport 决定，
+/// 与节点级 HRW 无关。WSS 认证后也不能把一条已建好的 TLS 连接迁到另一个 Worker。
+/// 节点内转投过去的帧走 `deliverHandoff`，那条路**不再转投**——所以总跳数仍被结构性
+/// 地限死在 2，不需要跳数字段。
 ///
 /// 一律不回报：后端那条双向流在**节点 A** 上，本节点没有它的句柄。
 pub fn deliverFromPeer(self: *GatewayWorker, realm: RealmId, bytes: []const u8) void {
@@ -354,18 +385,11 @@ pub fn deliverFromPeer(self: *GatewayWorker, realm: RealmId, bytes: []const u8) 
     var routes = RouteSet{ .local_only = true };
     switch (parsed.header.dest_kind) {
         .peer => {
-            // 选址是纯函数，所以本节点能独立算出目标该在哪个 Worker，
-            // 不需要 A 把它算出来的位置塞进线格式（这正是 §8.5 那条前提的价值）。
-            if (self.placement.strategy == .broadcast) {
-                routes.markAll(self);
-            } else {
-                for (0..list.count) |i| routes.markHome(self, realm, list.get(i));
-            }
+            // 跨节点已经抵达目标节点；节点内连接归属不能由 HRW 推导，必须问过每个
+            // Worker。布尔集合保证这一帧对每个 Worker 最多交接一次。
+            if (list.count > 0) routes.markAllWorkers(self);
             routes.flush(self, realm, bytes);
-            for (0..list.count) |i| {
-                const dest_id = list.get(i);
-                if (self.placement.isHome(realm, dest_id)) _ = deliverLocalPeer(self, realm, dest_id, bytes);
-            }
+            for (0..list.count) |i| _ = deliverLocalPeer(self, realm, list.get(i), bytes);
         },
         .multicast => {
             // 组成员的落点与 group_id 无关，所以本节点内必须问过每个 Worker。
@@ -699,12 +723,12 @@ fn applyGroupChange(
     }
 
     if (ctrl == .join_group) {
-        self.conn_manager.joinGroup(ctx.cnx_handle, group_id) catch |err| {
+        self.conn_manager.joinGroup(ctx.session_handle, group_id) catch |err| {
             std.log.warn("[GROUP] join refused: group={} err={}", .{ group_id, err });
             return false;
         };
     } else {
-        self.conn_manager.leaveGroup(ctx.cnx_handle, group_id);
+        self.conn_manager.leaveGroup(ctx.session_handle, group_id);
     }
     return true;
 }
@@ -811,8 +835,7 @@ fn kickOne(self: *GatewayWorker, realm: RealmId, token: connection.ConnToken) bo
     var buf: [128]u8 = undefined;
     var encoder = codec.FrameEncoder.init(&buf);
     if (encoder.encodeKickOff("kicked")) |notice| {
-        var conn = QUICConnection.fromRaw(ctx.cnx_handle);
-        conn.streamWrite(ctx.nextPushStream(), notice, true) catch |err| {
+        _ = ctx.transport.open(notice, true) catch |err| {
             err_handler.reportError(.session, "Failed to notify a kicked client", err);
         };
     } else |err| {
@@ -821,8 +844,7 @@ fn kickOne(self: *GatewayWorker, realm: RealmId, token: connection.ConnToken) bo
 
     // 带错误码关闭：上面那个通知帧可能在关闭竞态里送不到，而错误码一定随
     // CONNECTION_CLOSE 到达，客户端靠它区分"该重新认证"和"网关下线了"。
-    var closing = QUICConnection.fromRaw(ctx.cnx_handle);
-    closing.closeWithError(@intFromEnum(frame.AppError.kicked));
+    ctx.transport.close(@intFromEnum(frame.AppError.kicked));
     return true;
 }
 
@@ -859,10 +881,12 @@ fn fanOut(
     var routes = RouteSet{};
     var delivered: usize = 0;
 
-    // 第一段：算出目标集合并转投。广播策略下没有单一 home，一次加满。
+    // 第一段：跨节点仍按策略选址；本节点内必须问过每个 Worker，因为 reuseport
+    // 实际连接归属不能由 HRW 推导。集合按位置去重，所以目标数不会放大本机交接次数。
     if (self.placement.strategy == .broadcast) {
         routes.markAll(self);
     } else {
+        if (list.count > 0) routes.markAllWorkers(self);
         for (0..list.count) |i| routes.markHome(self, realm, list.get(i));
     }
     routes.flush(self, realm, bytes);
@@ -871,14 +895,12 @@ fn fanOut(
     for (0..list.count) |i| {
         const dest_id = list.get(i);
         var reached = false;
-        if (self.placement.isHome(realm, dest_id)) {
-            const count = deliverLocalPeer(self, realm, dest_id, bytes);
-            delivered += count;
-            reached = count > 0;
-        }
-        if (!reached) reached = routes.acceptedHome(self, realm, dest_id);
-        // "不可达"= 一条都没投出去、也没有被任何位置受理。有一条成功就不算——后端要的
-        // 信号是"该不该转离线存储"，而不是"多端里有几端收到了"，后者属于业务层的已读游标。
+        const count = deliverLocalPeer(self, realm, dest_id, bytes);
+        delivered += count;
+        reached = count > 0;
+        if (!reached) reached = routes.acceptedPeer(self, realm, dest_id);
+        // “不可达”= 本地没有写入且没有任何下游位置受理。跨 Worker/节点的受理并不等于
+        // 终端确认；持久消息必须先落库，实际送达与多端已读属于业务层游标。
         if (!reached and want_report) report.add(dest_id);
     }
 
@@ -946,7 +968,7 @@ fn deliverLocalGroupDatagram(
     realm: RealmId,
     group_id: u64,
     payload: []const u8,
-    skip: ?quic.c.QuicCnx,
+    skip: ?SessionHandle,
 ) usize {
     if (payload.len + protocol.datagram.header_size > self.datagram_out_buf.len) {
         // 负载超过本端通告的上限。只可能来自"后端推了一个超大 unreliable 组播"或
@@ -964,15 +986,14 @@ fn deliverLocalGroupDatagram(
     var count: usize = 0;
     while (it.next()) |target| {
         if (skip) |sender| {
-            if (target.cnx_handle == sender) continue;
+            if (target.session_handle.eql(sender)) continue;
         }
         // 只投给绑过通道的成员：绑定既是授权，也是"我要不可靠投递"这个意愿的表达。
         // 没绑的跳过，而**不是**降级成可靠推送——降级会让 60Hz 的状态流在那条连接上
         // 堆成队头阻塞，正是这条通路存在理由的反面。
         const channel = target.channelFor(group_id) orelse continue;
         out[1] = channel;
-        var conn = QUICConnection.fromRaw(target.cnx_handle);
-        conn.sendDatagram(out) catch {
+        target.transport.sendEphemeral(out) catch {
             // 逐包路径上不记日志（会把磁盘写满），也不算错误：不可靠通路上发不出去
             // 与路上丢了对接收方是同一件事。
             self.datagrams_dropped +%= 1;
@@ -1010,7 +1031,7 @@ pub fn fanOutUnreliable(
 
     // 先投本位置：负载借用的是 picoquic 的接收缓冲，而下面重编帧用的是另一块缓冲，
     // 两者不冲突。
-    _ = deliverLocalGroupDatagram(self, realm, group_id, payload, sender.cnx_handle);
+    _ = deliverLocalGroupDatagram(self, realm, group_id, payload, sender.session_handle);
 
     const bytes = encodeUnreliableGroupFrame(self, group_id, payload) orelse {
         self.datagrams_dropped +%= 1;
@@ -1199,13 +1220,9 @@ pub fn beginPeerSession(self: *GatewayWorker, realm: RealmId, parsed: codec.Fram
     };
 
     var routes = RouteSet{ .local_only = true };
-    if (parsed.header.dest_kind == .multicast or self.placement.strategy == .broadcast) {
-        // 组成员的落点与 group_id 无关，所以本节点内必须问过每个 Worker。
-        routes.markAll(self);
-    } else {
-        // 选址是纯函数，所以本节点能独立算出目标该在哪个 Worker。
-        for (0..list.count) |i| routes.markHome(self, realm, list.get(i));
-    }
+    // 对等节点已经完成节点级选址；无论 `.peer` 还是 `.multicast`，本节点内都必须
+    // 问过每个 Worker。流式会话会把实际受理过 OPEN 的 Worker 集合冻结下来。
+    if (list.count > 0) routes.markAllWorkers(self);
     routes.flushSession(self, session, parsed.bytes);
 
     var reached: [push_session.max_list_targets]bool = @splat(false);
@@ -1290,10 +1307,12 @@ fn openStreamingPush(
     };
 
     // 位置集合与一次性推送用同一套判据（§8.5），只是结果被冻结进会话而不是用完就扔。
+    // 节点内仍需广播 OPEN：后续 DATA 没有目标列表，实际受理的 Worker 集合必须在这里冻结。
     var routes = RouteSet{};
     if (parsed.header.dest_kind == .multicast or self.placement.strategy == .broadcast) {
         routes.markAll(self);
     } else {
+        if (list.count > 0) routes.markAllWorkers(self);
         for (0..list.count) |i| routes.markHome(self, realm, list.get(i));
     }
     routes.flushSession(self, session, parsed.bytes);
@@ -1322,7 +1341,7 @@ fn openStreamingPush(
         const target = list.get(i);
         // `.peer` 的回报要算上"被别的位置受理"；`.multicast` 不能——组成员在别的位置
         // 有没有人，发起方无从得知（这正是组播省下 O(成员数) 的代价）。
-        if (parsed.header.dest_kind == .peer and routes.acceptedHome(self, realm, target)) continue;
+        if (parsed.header.dest_kind == .peer and routes.acceptedPeer(self, realm, target)) continue;
         report.add(target);
     }
 
@@ -1360,8 +1379,7 @@ fn writeSessionFrame(self: *GatewayWorker, session: *push_session.Session, parse
         // token 带 generation：连接中途断开、槽位被复用时这里必定失配，
         // 那个目标就自然掉出会话——而不是把这一帧写进另一个用户的连接。
         const ctx = self.conn_manager.byToken(target.token) orelse continue;
-        var conn = QUICConnection.fromRaw(ctx.cnx_handle);
-        conn.streamWrite(target.stream_id, bytes, is_last) catch |err| {
+        ctx.transport.write(target.stream_id, bytes, is_last) catch |err| {
             err_handler.reportError(.session, "Failed to continue a streaming push", err);
             continue;
         };
@@ -1468,11 +1486,9 @@ fn attachOne(
         return .full;
     }
 
-    const token = self.conn_manager.tokenFor(target.cnx_handle) orelse return .skipped;
-    const stream_id = target.nextPushStream();
-    var conn = QUICConnection.fromRaw(target.cnx_handle);
+    const token = self.conn_manager.tokenFor(target.session_handle) orelse return .skipped;
     // 不带 fin：这条流后面还有 DATA。
-    conn.streamWrite(stream_id, bytes, false) catch |err| {
+    const stream_id = target.transport.open(bytes, false) catch |err| {
         err_handler.reportError(.session, "Failed to open a streaming push stream", err);
         return .skipped;
     };
@@ -1489,8 +1505,7 @@ fn attachOne(
 fn abortSession(self: *GatewayWorker, session: *push_session.Session) void {
     for (session.localTargets()) |target| {
         const ctx = self.conn_manager.byToken(target.token) orelse continue;
-        var conn = QUICConnection.fromRaw(ctx.cnx_handle);
-        conn.closeStream(target.stream_id);
+        ctx.transport.resetSend(target.stream_id, 0);
     }
 
     for (session.workers, 0..) |accepted, worker_id| {
@@ -1515,9 +1530,7 @@ fn abortSession(self: *GatewayWorker, session: *push_session.Session) void {
 ///
 /// 返回是否写成功，用来判定投递回报里的"不可达"。
 fn pushToClient(target: *ConnectionContext, bytes: []const u8) bool {
-    const stream_id = target.nextPushStream();
-    var conn = QUICConnection.fromRaw(target.cnx_handle);
-    conn.streamWrite(stream_id, bytes, true) catch |err| {
+    _ = target.transport.open(bytes, true) catch |err| {
         err_handler.reportError(.session, "Failed to push to client", err);
         return false;
     };

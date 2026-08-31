@@ -9,6 +9,7 @@ pub const ConfigError = error{
     InvalidThreadCount,
     InvalidPollInterval,
     InvalidQuicConfig,
+    InvalidWssConfig,
     InvalidBackendConfig,
     InvalidClusterConfig,
     InvalidAuthConfig,
@@ -59,6 +60,26 @@ pub const GatewayConfig = struct {
         certificate_file: []const u8,
         private_key_file: []const u8,
         quic: Quic,
+        /// 浏览器与 QUIC 不可用网络的 TLS/TCP 回退。默认关闭，不改变 Raw QUIC 基线。
+        wss: Wss = .{},
+    };
+
+    pub const Wss = struct {
+        enabled: bool = false,
+        listen_host: []const u8 = "0.0.0.0",
+        listen_port: u16 = 8444,
+        /// 浏览器 Origin 精确白名单。不支持通配符，避免把凭据可用范围无意放大。
+        allowed_origins: []const []const u8 = &.{},
+        /// 原生 WSS 客户端可能不带 Origin；只能通过这一项显式允许。
+        allow_missing_origin: bool = false,
+        /// 每 Worker 独立上限；总上限还受共享 ConnectionManager 容量约束。
+        max_connections_per_worker: usize = 64,
+        /// 单会话待发送明文字节和 record 数上限。可靠消息溢出会只关闭该慢会话。
+        max_queued_bytes: usize = 256 * 1024,
+        max_queued_records: usize = 64,
+        /// TLS BIO pair 每个方向的定容缓冲。
+        tls_bio_capacity: usize = 64 * 1024,
+        handshake_timeout_ms: u64 = 5_000,
     };
 
     /// 可从 JSON 表达的通用 QUIC 参数。
@@ -273,6 +294,30 @@ pub const GatewayConfig = struct {
             (self.server.quic.max_datagram_frame_size < 16 or self.server.quic.max_datagram_frame_size > 1452))
         {
             return error.InvalidQuicConfig;
+        }
+        if (self.server.wss.enabled) {
+            // 65535 body + 8 Lyune header + 20 envelope + 最长 10-byte WS header。
+            const largest_wire_record: usize = 65_573;
+            if (self.server.wss.listen_host.len == 0 or self.server.wss.listen_port == 0 or
+                self.server.wss.max_connections_per_worker == 0 or
+                self.server.wss.max_queued_bytes < largest_wire_record or
+                self.server.wss.max_queued_records < 2 or
+                self.server.wss.tls_bio_capacity < 16 * 1024 or
+                self.server.wss.handshake_timeout_ms == 0)
+            {
+                return error.InvalidWssConfig;
+            }
+            // 浏览器一定带 Origin。若既没有白名单又不显式允许缺失，监听器会拒绝所有
+            // 客户端，这通常是误配置，直接在启动期指出。
+            if (self.server.wss.allowed_origins.len == 0 and !self.server.wss.allow_missing_origin) {
+                return error.InvalidWssConfig;
+            }
+            for (self.server.wss.allowed_origins, 0..) |origin, index| {
+                if (origin.len == 0) return error.InvalidWssConfig;
+                for (self.server.wss.allowed_origins[0..index]) |previous| {
+                    if (std.mem.eql(u8, previous, origin)) return error.InvalidWssConfig;
+                }
+            }
         }
         if (self.backend.direct.routes.len == 0 or self.backend.direct.max_receive_queue == 0 or self.backend.direct.idle_timeout_ms == 0 or self.backend.direct.alpn.len == 0 or self.backend.direct.alpn.len > 255) return error.InvalidBackendConfig;
         // 目录容量装不下启动期路由：与 realm_capacity 同理，不能在 prepare 里悄悄放大。
@@ -576,6 +621,23 @@ test "backend mTLS must be configured as a complete pair" {
     // 空路径同样是配错——它会让 picoquic 拿到一个空文件名。
     config.backend.direct.client_certificate_file = "";
     try std.testing.expectError(error.InvalidBackendConfig, config.validate());
+}
+
+test "WSS is opt-in and rejects unsafe or ineffective limits" {
+    var config = testConfig();
+    // 默认关闭，旧配置不需要新增字段。
+    try config.validate();
+
+    config.server.wss.enabled = true;
+    try std.testing.expectError(error.InvalidWssConfig, config.validate());
+    config.server.wss.allowed_origins = &.{"https://chat.example.com"};
+    try config.validate();
+
+    config.server.wss.max_queued_bytes = 64 * 1024;
+    try std.testing.expectError(error.InvalidWssConfig, config.validate());
+    config.server.wss.max_queued_bytes = 256 * 1024;
+    config.server.wss.tls_bio_capacity = 1024;
+    try std.testing.expectError(error.InvalidWssConfig, config.validate());
 }
 
 test "deployment mode capabilities stay in sync with their semantics" {

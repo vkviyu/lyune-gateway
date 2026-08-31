@@ -13,6 +13,7 @@ const foundation = @import("../foundation/mod.zig");
 const io = @import("../io/mod.zig");
 const quic = @import("../quic/mod.zig");
 const worker_rt = @import("../worker/mod.zig");
+const wss = @import("../wss/mod.zig");
 const reload = @import("reload.zig");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
 
@@ -50,6 +51,8 @@ const WorkerStartContext = struct {
     socket_fd: std.posix.socket_t,
     /// 本 Worker 独占的集群监听 socket；null 表示未启用集群链路。
     peer_socket_fd: ?std.posix.socket_t,
+    /// 本 Worker 独占的 WSS TCP reuseport socket；null 表示关闭 WSS 或单 Worker 自建。
+    wss_socket_fd: ?std.posix.socket_t,
     gate: *WorkerStartGate,
     coordinator: *control.Coordinator,
 };
@@ -119,7 +122,7 @@ pub fn run(io_iface: std.Io, allocator: std.mem.Allocator, config: *RuntimeConfi
     });
 
     if (config.threads <= 1) {
-        return runSingleWorker(allocator, 0, config, null, null, &coordinator);
+        return runSingleWorker(allocator, 0, config, null, null, null, &coordinator);
     }
 
     const sockets = try createReusePortSockets(allocator, config.server_quic, config.threads);
@@ -140,6 +143,17 @@ pub fn run(io_iface: std.Io, allocator: std.mem.Allocator, config: *RuntimeConfi
         allocator.free(group);
     };
 
+    // TCP 不需要 QUIC CID 分类器：accept 完成后，一条连接终身留在接住它的 Worker。
+    // 仍然为每个 Worker 建一个 SO_REUSEPORT listener，避免所有浏览器流量先挤到单线程。
+    const wss_sockets: ?[]std.posix.socket_t = if (config.wss) |wss_config|
+        try createReusePortTcpSockets(allocator, wss_config.bind_address, wss_config.bind_port, config.threads)
+    else
+        null;
+    defer if (wss_sockets) |group| {
+        if (sockets_owned) closeSockets(group);
+        allocator.free(group);
+    };
+
     const threads = try allocator.alloc(std.Thread, config.threads);
     defer allocator.free(threads);
     const contexts = try allocator.alloc(WorkerStartContext, config.threads);
@@ -154,6 +168,7 @@ pub fn run(io_iface: std.Io, allocator: std.mem.Allocator, config: *RuntimeConfi
             .config = config,
             .socket_fd = sockets[i],
             .peer_socket_fd = if (peer_sockets) |group| group[i] else null,
+            .wss_socket_fd = if (wss_sockets) |group| group[i] else null,
             .gate = &gate,
             .coordinator = &coordinator,
         };
@@ -199,12 +214,65 @@ fn createReusePortSockets(allocator: std.mem.Allocator, config: quic.config.QUIC
     return sockets;
 }
 
+/// 创建一组已绑定但尚未 listen 的 TCP SO_REUSEPORT socket。
+///
+/// 每个 Worker 启动自己的 accept completion。TCP 建连由内核按四元组分配，之后 fd 已
+/// 属于那个 Worker，不存在 QUIC 无连接 UDP 包需要的 CID/BPF 二次分类。
+fn createReusePortTcpSockets(
+    allocator: std.mem.Allocator,
+    bind_address: [4]u8,
+    bind_port: u16,
+    count: usize,
+) ![]std.posix.socket_t {
+    const sockets = try allocator.alloc(std.posix.socket_t, count);
+    var initialized: usize = 0;
+    errdefer {
+        closeSockets(sockets[0..initialized]);
+        allocator.free(sockets);
+    }
+
+    const local_addr = foundation.net.initIp4(bind_address, bind_port);
+    var storage = foundation.net.toSockAddrStorage(local_addr);
+    const enabled: c_int = 1;
+    for (sockets) |*fd| {
+        const socket_fd = try createStreamSocket();
+        fd.* = socket_fd;
+        initialized += 1;
+        try std.posix.setsockopt(socket_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&enabled));
+        try std.posix.setsockopt(socket_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&enabled));
+        if (std.c.bind(socket_fd, @ptrCast(&storage), foundation.net.sockAddrLen(local_addr)) != 0) return error.BindFailed;
+    }
+    return sockets;
+}
+
 /// 创建一个非阻塞、CLOEXEC 的 UDP socket。
 /// Linux 支持 SOCK_NONBLOCK|SOCK_CLOEXEC 直接创建；macOS/Darwin 不支持这些 flag，
 /// 需要事后用 fcntl 分两步设置，因此这里做平台分流。
 fn createDatagramSocket() !std.posix.socket_t {
     const socket_type = std.posix.SOCK.DGRAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC;
     const native_type = if (builtin.os.tag.isDarwin()) std.posix.SOCK.DGRAM else socket_type;
+    const socket_fd = std.c.socket(std.posix.AF.INET, native_type, 0);
+    if (socket_fd < 0) return error.SocketCreateFailed;
+    errdefer _ = std.c.close(socket_fd);
+
+    if (builtin.os.tag.isDarwin()) {
+        if (std.c.fcntl(socket_fd, std.posix.F.SETFD, @as(usize, std.posix.FD_CLOEXEC)) < 0) {
+            return error.SetCloseOnExecFailed;
+        }
+        const flags = std.c.fcntl(socket_fd, std.posix.F.GETFL, @as(usize, 0));
+        if (flags < 0) return error.GetSocketFlagsFailed;
+        const nonblocking: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+        if (std.c.fcntl(socket_fd, std.posix.F.SETFL, flags | nonblocking) < 0) {
+            return error.SetNonblockingFailed;
+        }
+    }
+    return socket_fd;
+}
+
+/// 创建非阻塞、CLOEXEC TCP socket；Darwin 与 Linux 的 flag 差异同 UDP 版本。
+fn createStreamSocket() !std.posix.socket_t {
+    const socket_type = std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC;
+    const native_type = if (builtin.os.tag.isDarwin()) std.posix.SOCK.STREAM else socket_type;
     const socket_fd = std.c.socket(std.posix.AF.INET, native_type, 0);
     if (socket_fd < 0) return error.SocketCreateFailed;
     errdefer _ = std.c.close(socket_fd);
@@ -238,6 +306,7 @@ fn runGatedWorker(context: *const WorkerStartContext) void {
         context.config,
         context.socket_fd,
         context.peer_socket_fd,
+        context.wss_socket_fd,
         context.coordinator,
     ) catch |err| {
         std.log.err("Gateway worker {} stopped: {}; terminating to preserve reuseport socket indexes", .{ context.thread_id, err });
@@ -252,8 +321,18 @@ fn runSingleWorker(
     config: *const RuntimeConfig,
     socket_fd: ?std.posix.socket_t,
     peer_socket_fd: ?std.posix.socket_t,
+    wss_socket_fd: ?std.posix.socket_t,
     coordinator: *control.Coordinator,
 ) !void {
+    // WSS socket 在 listener 真正构造前仍由本函数持有。Worker/后端任一步初始化失败都
+    // 必须归还它；Listener.init 成功后才转移所有权。
+    var wss_socket_owned = wss_socket_fd != null;
+    defer {
+        if (wss_socket_owned) {
+            if (wss_socket_fd) |fd| _ = std.c.close(fd);
+        }
+    }
+
     const registry = backend.TransportRegistry.init(allocator);
     var worker = try worker_rt.GatewayWorker.init(
         allocator,
@@ -313,5 +392,35 @@ fn runSingleWorker(
         const instance = try direct_factory.create(entry);
         try worker.registerTransport(.direct, entry.route, backend.BackendTransport.init(backend.DirectTransport, instance));
     }
+
+    // 放在所有后端设施之后构造，使下面的 defer 最先执行：WSS 会话下线可能发布
+    // session_offline，届时 DirectTransport 与 BackendPool 必须仍然存活。
+    var wss_listener: wss.listener.Listener = undefined;
+    var wss_listener_initialized = false;
+    if (config.wss) |wss_config| {
+        wss_listener = try wss.listener.Listener.init(
+            allocator,
+            worker.event_loop,
+            .{
+                .bind_address = wss_config.bind_address,
+                .bind_port = wss_config.bind_port,
+                .cert_file = wss_config.cert_file,
+                .key_file = wss_config.key_file,
+                .allowed_origins = wss_config.allowed_origins,
+                .allow_missing_origin = wss_config.allow_missing_origin,
+                .max_connections = wss_config.max_connections_per_worker,
+                .max_queued_bytes = wss_config.max_queued_bytes,
+                .max_queued_records = wss_config.max_queued_records,
+                .tls_bio_capacity = wss_config.tls_bio_capacity,
+                .handshake_timeout_ms = wss_config.handshake_timeout_ms,
+            },
+            worker.sessionHandler(),
+            wss_socket_fd,
+        );
+        wss_socket_owned = false;
+        wss_listener_initialized = true;
+        worker.attachSessionAcceptor(wss_listener.asAcceptor());
+    }
+    defer if (wss_listener_initialized) wss_listener.deinitAfterLoopStopped();
     try worker.run();
 }

@@ -3,6 +3,7 @@ pub const client = @import("client.zig");
 pub const config = @import("config.zig");
 pub const connection = @import("connection.zig");
 pub const endpoint = @import("endpoint.zig");
+pub const session = @import("session.zig");
 pub const stream = @import("stream.zig");
 
 test {

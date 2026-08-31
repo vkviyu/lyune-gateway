@@ -27,8 +27,8 @@
 const std = @import("std");
 
 const foundation = @import("../foundation/mod.zig");
-const quic = @import("../quic/mod.zig");
-const backend = @import("../backend/transport.zig");
+const backend = @import("../backend/mod.zig").transport;
+const SessionHandle = @import("../session/mod.zig").SessionHandle;
 
 const RealmId = foundation.realm.RealmId;
 
@@ -66,7 +66,7 @@ const purge_batch: usize = 64;
 
 /// 需要把后端响应写回的客户端流。
 pub const ClientResponse = struct {
-    cnx: quic.c.QuicCnx,
+    session: SessionHandle,
     stream_id: u64,
 };
 
@@ -99,7 +99,7 @@ pub const ExpiredRoute = struct {
 
 /// 已转发给认证服务、等待回包的认证请求。
 pub const PendingAuth = struct {
-    client_cnx: quic.c.QuicCnx,
+    client_session: SessionHandle,
     client_stream_id: u64,
     /// 发起这次认证的连接所属 realm；配额归还时从这里取。
     realm: RealmId,
@@ -126,21 +126,21 @@ pub const Admit = enum { ok, table_full, realm_over_share };
 /// 在途条目的回收条件。
 pub const Filter = union(enum) {
     /// 回收属于某个客户端连接的全部条目。
-    connection: quic.c.QuicCnx,
+    session: SessionHandle,
     /// 回收活动/创建时刻早于该 deadline 的条目。
     older_than: u64,
 
-    fn matchesAuth(self: Filter, cnx: quic.c.QuicCnx, timestamp: u64) bool {
+    fn matchesAuth(self: Filter, session: SessionHandle, timestamp: u64) bool {
         return switch (self) {
-            .connection => |target| cnx == target,
+            .session => |target| session.eql(target),
             .older_than => |deadline| timestamp < deadline,
         };
     }
 
     fn matchesRoute(self: Filter, route: Route) bool {
         return switch (self) {
-            .connection => |target| switch (route.target) {
-                .client => |client| client.cnx == target,
+            .session => |target| switch (route.target) {
+                .client => |client| client.session.eql(target),
                 .discard => false,
             },
             .older_than => |deadline| route.last_active_at < deadline,
@@ -256,11 +256,11 @@ pub const Tables = struct {
     ///
     /// 不删除映射：后端请求仍可能已经完整提交，后续 FIN/失败仍需有正常回收路径。
     /// 这是低频控制事件，O(n) 扫描换取热路径不维护第二张反向索引。
-    pub fn suppressClientResponse(self: *Tables, cnx: quic.c.QuicCnx, stream_id: u64) bool {
+    pub fn suppressClientResponse(self: *Tables, session: SessionHandle, stream_id: u64) bool {
         var it = self.routes.valueIterator();
         while (it.next()) |route| switch (route.target) {
             .client => |client| {
-                if (client.cnx != cnx or client.stream_id != stream_id) continue;
+                if (!client.session.eql(session) or client.stream_id != stream_id) continue;
                 route.target = .discard;
                 return true;
             },
@@ -319,10 +319,10 @@ pub const Tables = struct {
 
     /// 认证请求已经交给后端时，STOP_SENDING 只取消返回方向，不撤销请求副作用。
     /// 后端结果仍会更新连接准入状态；completeAuth 根据该位跳过流写入。
-    pub fn suppressAuthResponse(self: *Tables, cnx: quic.c.QuicCnx, stream_id: u64) bool {
+    pub fn suppressAuthResponse(self: *Tables, session: SessionHandle, stream_id: u64) bool {
         var it = self.auths.valueIterator();
         while (it.next()) |pending| {
-            if (pending.client_cnx != cnx or pending.client_stream_id != stream_id) continue;
+            if (!pending.client_session.eql(session) or pending.client_stream_id != stream_id) continue;
             pending.response_suppressed = true;
             return true;
         }
@@ -494,7 +494,7 @@ pub const Tables = struct {
             var count: usize = 0;
             var it = self.auths.iterator();
             while (it.next()) |entry| {
-                if (!filter.matchesAuth(entry.value_ptr.client_cnx, entry.value_ptr.created_at)) continue;
+                if (!filter.matchesAuth(entry.value_ptr.client_session, entry.value_ptr.created_at)) continue;
                 keys[count] = entry.key_ptr.*;
                 count += 1;
                 if (count == keys.len) break;
@@ -514,8 +514,8 @@ pub const Tables = struct {
 // 测试
 // ============================================================================
 
-fn fakeCnx(addr: usize) quic.c.QuicCnx {
-    return @ptrFromInt(addr);
+fn fakeSession(slot: u32) SessionHandle {
+    return .{ .slot = slot, .generation = 1 };
 }
 
 /// 测试里的默认 transport 身份；只有跨 transport 隔离的用例才换成别的。
@@ -525,9 +525,9 @@ fn streamKey(stream: u64) StreamKey {
     return .{ .transport = test_transport, .stream = stream };
 }
 
-fn clientRoute(cnx: quic.c.QuicCnx, stream_id: u64, realm: RealmId, last_active_at: u64) Route {
+fn clientRoute(session: SessionHandle, stream_id: u64, realm: RealmId, last_active_at: u64) Route {
     return .{
-        .target = .{ .client = .{ .cnx = cnx, .stream_id = stream_id } },
+        .target = .{ .client = .{ .session = session, .stream_id = stream_id } },
         .realm = realm,
         .last_active_at = last_active_at,
     };
@@ -544,8 +544,8 @@ test "route lifecycle: open, lookup, close" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
-    try tables.openRoute(streamKey(7), clientRoute(cnx, 4, 1, 100));
+    const session = fakeSession(1);
+    try tables.openRoute(streamKey(7), clientRoute(session, 4, 1, 100));
 
     const found = tables.lookupRoute(streamKey(7)).?;
     try std.testing.expectEqual(@as(u64, 4), routeClient(found).stream_id);
@@ -562,8 +562,8 @@ test "the same handle from two transports is two different entries" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const client_a = fakeCnx(0x1000);
-    const client_b = fakeCnx(0x2000);
+    const client_a = fakeSession(1);
+    const client_b = fakeSession(2);
     const from_a = StreamKey{ .transport = 0xA000, .stream = 4 };
     const from_b = StreamKey{ .transport = 0xB000, .stream = 4 };
 
@@ -571,8 +571,8 @@ test "the same handle from two transports is two different entries" {
     try tables.openRoute(from_b, clientRoute(client_b, 2, 2, 10));
 
     try std.testing.expectEqual(@as(u32, 2), tables.routeCount());
-    try std.testing.expectEqual(client_a, routeClient(tables.lookupRoute(from_a).?).cnx);
-    try std.testing.expectEqual(client_b, routeClient(tables.lookupRoute(from_b).?).cnx);
+    try std.testing.expect(client_a.eql(routeClient(tables.lookupRoute(from_a).?).session));
+    try std.testing.expect(client_b.eql(routeClient(tables.lookupRoute(from_b).?).session));
 
     // 关掉一个不影响另一个。
     tables.closeRoute(from_a);
@@ -588,13 +588,13 @@ test "backend failure takes only streams in its transport and selector" {
     const transport_b: usize = 0xB000;
     const conn_1 = @as(u64, 1) << 48;
     const conn_2 = @as(u64, 2) << 48;
-    const client = fakeCnx(0x1000);
+    const client = fakeSession(1);
 
     try tables.openRoute(.{ .transport = transport_a, .stream = conn_1 | 4 }, clientRoute(client, 4, 1, 10));
     try tables.openRoute(.{ .transport = transport_a, .stream = conn_2 | 8 }, clientRoute(client, 8, 1, 10));
     try tables.openRoute(.{ .transport = transport_b, .stream = conn_1 | 4 }, clientRoute(client, 12, 2, 10));
     try tables.trackAuth(.{ .transport = transport_a, .stream = conn_1 | 12 }, .{
-        .client_cnx = client,
+        .client_session = client,
         .client_stream_id = 16,
         .realm = 1,
         .buffer = .{ .items = &.{}, .capacity = 0 },
@@ -624,33 +624,33 @@ test "backend failure takes only streams in its transport and selector" {
 // 连接关闭必须清空属于它的全部条目。
 //
 // 漏掉一条就意味着后端响应到达时 lookupRoute 返回一个已被 picoquic 释放的
-// cnx 指针，随后被交给 picoquic_add_to_stream——生产上表现为随机崩溃。
+// 会话身份，随后被交给传输写入——生产上表现为命中已释放资源甚至随机崩溃。
 test "purge by connection removes only that connection's entries" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const doomed = fakeCnx(0x1000);
-    const survivor = fakeCnx(0x2000);
+    const doomed = fakeSession(1);
+    const survivor = fakeSession(2);
 
     try tables.openRoute(streamKey(1), clientRoute(doomed, 0, 1, 10));
     try tables.openRoute(streamKey(2), clientRoute(survivor, 0, 1, 10));
     try tables.openRoute(streamKey(3), clientRoute(doomed, 4, 1, 10));
     try tables.trackAuth(streamKey(11), .{
-        .client_cnx = doomed,
+        .client_session = doomed,
         .client_stream_id = 8,
         .realm = 1,
         .buffer = .{ .items = &.{}, .capacity = 0 },
         .created_at = 10,
     });
     try tables.trackAuth(streamKey(12), .{
-        .client_cnx = survivor,
+        .client_session = survivor,
         .client_stream_id = 8,
         .realm = 1,
         .buffer = .{ .items = &.{}, .capacity = 0 },
         .created_at = 10,
     });
 
-    tables.purge(.{ .connection = doomed });
+    tables.purge(.{ .session = doomed });
 
     try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
     try std.testing.expect(tables.lookupRoute(streamKey(2)) != null);
@@ -663,7 +663,7 @@ test "purge sweeps more entries than one batch" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     const total = purge_batch * 2 + 5;
     var i: u64 = 0;
     while (i < total) : (i += 1) {
@@ -671,7 +671,7 @@ test "purge sweeps more entries than one batch" {
     }
     try std.testing.expectEqual(@as(u32, @intCast(total)), tables.routeCount());
 
-    tables.purge(.{ .connection = cnx });
+    tables.purge(.{ .session = cnx });
     try std.testing.expectEqual(@as(u32, 0), tables.routeCount());
 }
 
@@ -679,7 +679,7 @@ test "purge by age keeps fresh entries" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     try tables.openRoute(streamKey(1), clientRoute(cnx, 0, 1, 100));
     try tables.openRoute(streamKey(2), clientRoute(cnx, 1, 1, 900));
 
@@ -693,7 +693,7 @@ test "no-response routes outlive the client but still expire" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     try tables.openRoute(streamKey(1), .{
         .target = .discard,
         .realm = 1,
@@ -703,7 +703,7 @@ test "no-response routes outlive the client but still expire" {
 
     // 连接关闭只能回收仍然引用该连接的响应路由。no-response 已经没有客户端句柄，
     // 必须留到后端 FIN/失败/超时，否则它的合法收尾会被误报成孤儿响应。
-    tables.purge(.{ .connection = cnx });
+    tables.purge(.{ .session = cnx });
     try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
     const retained = tables.lookupRoute(streamKey(1)).?;
     try std.testing.expect(retained.target == .discard);
@@ -735,10 +735,10 @@ test "STOP_SENDING suppresses response without losing cleanup state" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     try tables.openRoute(streamKey(3), clientRoute(cnx, 8, 1, 100));
     try tables.trackAuth(streamKey(4), .{
-        .client_cnx = cnx,
+        .client_session = cnx,
         .client_stream_id = 12,
         .realm = 1,
         .buffer = .{ .items = &.{}, .capacity = 0 },
@@ -757,7 +757,7 @@ test "STOP_SENDING suppresses response without losing cleanup state" {
     try std.testing.expect(tables.authPtr(streamKey(4)).?.response_suppressed);
 
     // 客户端连接清理不再删除已降级的普通路由，但认证仍属于连接并正常释放。
-    tables.purge(.{ .connection = cnx });
+    tables.purge(.{ .session = cnx });
     try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
     try std.testing.expectEqual(@as(u32, 0), tables.authCount());
 }
@@ -766,10 +766,10 @@ test "route activity refreshes idle deadline without extending auth lifetime" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     try tables.openRoute(streamKey(1), clientRoute(cnx, 0, 1, 100));
     try tables.trackAuth(streamKey(2), .{
-        .client_cnx = cnx,
+        .client_session = cnx,
         .client_stream_id = 4,
         .realm = 1,
         .buffer = .{ .items = &.{}, .capacity = 0 },
@@ -793,10 +793,10 @@ test "expiration follows the earliest real deadline and returns owned entries" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     try tables.openRoute(streamKey(1), clientRoute(cnx, 0, 1, 100));
     try tables.trackAuth(streamKey(2), .{
-        .client_cnx = cnx,
+        .client_session = cnx,
         .client_stream_id = 4,
         .realm = 1,
         .buffer = .{ .items = &.{}, .capacity = 0 },
@@ -827,7 +827,7 @@ test "route activity can move a stale earliest deadline later" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     try tables.openRoute(streamKey(1), clientRoute(cnx, 0, 1, 100));
     try std.testing.expect(tables.touchRoute(streamKey(1), 900));
 
@@ -842,12 +842,12 @@ test "route activity can move a stale earliest deadline later" {
 
 test "auth buffers are freed by take, purge and deinit" {
     var tables = try Tables.init(std.testing.allocator);
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
 
     // 1) takeAuth 转移所有权，由调用方释放。
     var owned: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
     try owned.appendSlice(std.testing.allocator, "taken");
-    try tables.trackAuth(streamKey(1), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .buffer = owned, .created_at = 10 });
+    try tables.trackAuth(streamKey(1), .{ .client_session = cnx, .client_stream_id = 0, .realm = 1, .buffer = owned, .created_at = 10 });
     var taken = tables.takeAuth(streamKey(1)).?;
     try std.testing.expectEqualStrings("taken", taken.buffer.items);
     taken.buffer.deinit(std.testing.allocator);
@@ -855,14 +855,14 @@ test "auth buffers are freed by take, purge and deinit" {
     // 2) purge 自己释放。
     var purged: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
     try purged.appendSlice(std.testing.allocator, "purged");
-    try tables.trackAuth(streamKey(2), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .buffer = purged, .created_at = 10 });
-    tables.purge(.{ .connection = cnx });
+    try tables.trackAuth(streamKey(2), .{ .client_session = cnx, .client_stream_id = 0, .realm = 1, .buffer = purged, .created_at = 10 });
+    tables.purge(.{ .session = cnx });
     try std.testing.expectEqual(@as(u32, 0), tables.authCount());
 
     // 3) deinit 兜底释放剩下的。testing.allocator 会在泄漏时让本用例失败。
     var leftover: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
     try leftover.appendSlice(std.testing.allocator, "leftover");
-    try tables.trackAuth(streamKey(3), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .buffer = leftover, .created_at = 10 });
+    try tables.trackAuth(streamKey(3), .{ .client_session = cnx, .client_stream_id = 0, .realm = 1, .buffer = leftover, .created_at = 10 });
     tables.deinit();
 }
 
@@ -870,7 +870,7 @@ test "a realm over its fair share is refused while others still get in" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     // 水位线以下不讲公平：先把 realm 1 灌到水位线之上，它此刻仍是唯一活跃 realm，
     // 份额 = 全池，所以还放行。
     const above_watermark = max_requests * foundation.quota.default_watermark_percent / 100 + 1;
@@ -894,7 +894,7 @@ test "quota counters return to zero through all three reclaim paths" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     var round: usize = 0;
     while (round < 3) : (round += 1) {
         var realm: RealmId = 1;
@@ -904,14 +904,14 @@ test "quota counters return to zero through all three reclaim paths" {
             try tables.openRoute(streamKey(base + 1), clientRoute(cnx, 1, realm, 0));
             try tables.openRoute(streamKey(base + 2), clientRoute(cnx, 2, realm, 0));
             try tables.trackAuth(streamKey(base + 3), .{
-                .client_cnx = cnx,
+                .client_session = cnx,
                 .client_stream_id = 3,
                 .realm = realm,
                 .buffer = .{ .items = &.{}, .capacity = 0 },
                 .created_at = 0,
             });
             try tables.trackAuth(streamKey(base + 4), .{
-                .client_cnx = cnx,
+                .client_session = cnx,
                 .client_stream_id = 4,
                 .realm = realm,
                 .buffer = .{ .items = &.{}, .capacity = 0 },
@@ -934,7 +934,7 @@ test "quota counters return to zero through all three reclaim paths" {
         try std.testing.expectEqual(@as(u32, 0), tables.authCount());
 
         // 路径 2：连接关闭。表已空，这一趟只验证空表回收不会把计数减穿。
-        tables.purge(.{ .connection = cnx });
+        tables.purge(.{ .session = cnx });
     }
 
     try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
@@ -949,7 +949,7 @@ test "reusing a stream key does not leak a quota slot" {
     var tables = try Tables.init(std.testing.allocator);
     defer tables.deinit();
 
-    const cnx = fakeCnx(0x1000);
+    const cnx = fakeSession(1);
     try tables.openRoute(streamKey(4), clientRoute(cnx, 0, 1, 0));
     try tables.openRoute(streamKey(4), clientRoute(cnx, 1, 2, 0));
     try std.testing.expectEqual(@as(usize, 1), tables.route_quota.total);
@@ -959,10 +959,10 @@ test "reusing a stream key does not leak a quota slot" {
     // 认证表同理，而且覆盖时还得把旧 buffer 释放掉，否则 testing.allocator 会报泄漏。
     var first: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
     try first.appendSlice(std.testing.allocator, "first");
-    try tables.trackAuth(streamKey(9), .{ .client_cnx = cnx, .client_stream_id = 0, .realm = 1, .buffer = first, .created_at = 0 });
+    try tables.trackAuth(streamKey(9), .{ .client_session = cnx, .client_stream_id = 0, .realm = 1, .buffer = first, .created_at = 0 });
     var second: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
     try second.appendSlice(std.testing.allocator, "second");
-    try tables.trackAuth(streamKey(9), .{ .client_cnx = cnx, .client_stream_id = 1, .realm = 2, .buffer = second, .created_at = 0 });
+    try tables.trackAuth(streamKey(9), .{ .client_session = cnx, .client_stream_id = 1, .realm = 2, .buffer = second, .created_at = 0 });
     try std.testing.expectEqual(@as(usize, 1), tables.auth_quota.total);
     try std.testing.expectEqual(@as(u32, 0), tables.auth_quota.count(1));
 }

@@ -51,6 +51,8 @@ const connection = @import("connection.zig");
 const ConnectionContext = connection.ConnectionContext;
 const InboundExchange = connection.InboundExchange;
 const BackendStream = connection.BackendStream;
+const client_session = @import("../session/mod.zig");
+const SessionHandle = client_session.SessionHandle;
 const egress = @import("egress.zig");
 const GatewayWorker = @import("worker.zig").GatewayWorker;
 
@@ -108,7 +110,14 @@ const FrameDispatcher = struct {
 /// 常态下全程零拷贝、零分配，也不碰那张表——这是热路径的性能前提。
 pub fn handleStreamData(ud: ?*anyopaque, conn: *QUICConnection, stream_id: u64, data: []const u8, is_fin: bool) void {
     const self = GatewayWorker.castSelf(ud);
-    const ctx = self.conn_manager.get(conn) orelse return;
+    const handle = self.conn_manager.handleForRawQuic(conn.inner) orelse return;
+    handleSessionData(self, handle, stream_id, data, is_fin);
+}
+
+/// 传输无关的 logical stream 入口。Raw QUIC callback 与 WSS envelope 最终都落到这里。
+/// `SessionHandle` 先做 generation 校验，迟到的 TCP/QUIC 事件不会命中复用后的槽位。
+pub fn handleSessionData(self: *GatewayWorker, session: SessionHandle, stream_id: u64, data: []const u8, is_fin: bool) void {
+    const ctx = self.conn_manager.getByHandle(session) orelse return;
 
     // 本监听器是 QUIC 服务端。客户端请求只能出现在 client-initiated bidi stream；
     // server-initiated bidi stream 是网关主动推送留下的反向半边，当前协议只允许对端
@@ -182,10 +191,7 @@ pub fn handleStreamData(ud: ?*anyopaque, conn: *QUICConnection, stream_id: u64, 
 
     // 关闭连接推迟到分帧循环之外：循环里分派的帧指向 spill 缓冲，
     // 连接一旦销毁，后续迭代就会读到已释放内存。
-    if (ctx.close_requested) {
-        var closing = QUICConnection.fromRaw(ctx.cnx_handle);
-        closing.close();
-    }
+    if (ctx.close_requested) ctx.transport.close(0);
 }
 
 /// 对端显式取消某个 QUIC 方向。
@@ -200,20 +206,29 @@ pub fn handleStreamControl(
     event: quic.c.CallbackEvent,
 ) void {
     const self = GatewayWorker.castSelf(ud);
-    const ctx = self.conn_manager.get(conn) orelse return;
+    const handle = self.conn_manager.handleForRawQuic(conn.inner) orelse return;
 
     switch (event) {
-        .stream_reset => resetClientInput(self, ctx, stream_id),
-        .stop_sending => {
-            _ = self.inflight.suppressClientResponse(ctx.cnx_handle, stream_id);
-            _ = self.inflight.suppressAuthResponse(ctx.cnx_handle, stream_id);
+        .stream_reset => handleSessionControl(self, handle, stream_id, .reset),
+        .stop_sending => handleSessionControl(self, handle, stream_id, .stop),
+        else => unreachable,
+    }
+}
+
+/// 传输无关的方向取消入口。WSS RESET/STOP record 与 QUIC 对应事件共享同一处状态收敛。
+pub fn handleSessionControl(self: *GatewayWorker, session: SessionHandle, stream_id: u64, event: client_session.StreamControl) void {
+    const ctx = self.conn_manager.getByHandle(session) orelse return;
+    switch (event) {
+        .reset => resetClientInput(self, ctx, stream_id),
+        .stop => {
+            _ = self.inflight.suppressClientResponse(ctx.session_handle, stream_id);
+            _ = self.inflight.suppressAuthResponse(ctx.session_handle, stream_id);
 
             // RFC 9000 的 STOP_SENDING 要求发送方用 RESET_STREAM 收敛自己的发送状态。
             // 不复用 replyControl：任何应用字节都可能被 reset 丢掉，而且对端已经明确
             // 表示不再接收这一方向。
-            conn.closeStream(stream_id);
+            ctx.transport.resetSend(stream_id, 0);
         },
-        else => unreachable,
     }
 }
 
@@ -224,8 +239,7 @@ fn resetClientInput(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u6
     const active = ctx.inboundExchange(stream_id) orelse {
         // RESET 可能先于同一流已排队的应用字节到达，picoquic 会按最终大小丢弃那些
         // 字节。此时还没有 InboundExchange，但返回方向仍必须明确异常结束。
-        var client_conn = QUICConnection.fromRaw(ctx.cnx_handle);
-        client_conn.closeStream(stream_id);
+        ctx.transport.resetSend(stream_id, 0);
         return;
     };
     if (!active.input_complete) {
@@ -239,8 +253,7 @@ fn resetClientInput(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u6
 
         // 输入缺少应用 eof，这次交换不可能再成功。RESET 返回方向让客户端立即得到
         // 异常结束；若只清内部状态，客户端会一直读到自己的 deadline。
-        var client_conn = QUICConnection.fromRaw(ctx.cnx_handle);
-        client_conn.closeStream(stream_id);
+        ctx.transport.resetSend(stream_id, 0);
     }
     // 已经完整提交的请求只释放输入解析状态，回程映射继续存活；RESET_STREAM 本身
     // 不等同于 STOP_SENDING，客户端仍可能等待另一方向的响应。
@@ -290,6 +303,14 @@ fn openInboundExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     // 对等网关节点走完全不同的一套白名单：它只能投递，不能请求。
     if (ctx.peer_node) return openPeerNodeExchange(self, ctx, stream_id, parsed);
 
+    // QUIC 本身不允许复用 stream id；WSS 的 logical stream 必须在 binding 中显式
+    // 提供同一保证。必须先 claim 再做认证/配额/路由判断：即使 OPEN 被业务拒绝，
+    // 这个 id 也已经被对端使用，不能稍后伪装成一条全新的 exchange。
+    if (!ctx.transport.claimInboundExchange(stream_id)) {
+        std.log.warn("[STREAM] client reused or reordered logical stream {}", .{stream_id});
+        return .close_connection;
+    }
+
     switch (parsed.header.dest_kind) {
         // 客户端无权直接寻址其他客户端（设计文档 §5.4）。可靠广播必须走
         // "客户端 → 后端 → 网关 → N 个客户端"两跳，否则落库、反垃圾、定序
@@ -305,7 +326,7 @@ fn openInboundExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     // 否则客户端只要在新流上发心跳而从不关流，就能让这张表无界增长。
     if (ctx.inboundExchangeCount() >= max_inbound_exchanges_per_connection) {
         std.log.warn("[STREAM] too many concurrent exchanges on one connection, rejecting stream={}", .{stream_id});
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "too many concurrent exchanges");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "too many concurrent exchanges");
         return .continue_stream;
     }
 
@@ -407,7 +428,7 @@ fn openGatewayExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     // 客户端以为上报成功了。
     if (!parsed.header.isLast()) {
         std.log.warn("[CTRL] streaming control exchange is not supported yet: stream={}", .{stream_id});
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "streaming control exchange not supported");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "streaming control exchange not supported");
         return .continue_stream;
     }
 
@@ -415,7 +436,7 @@ fn openGatewayExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     // 往这条连接的表里写东西。
     ctx.registerInboundExchange(stream_id, .{ .response_mode = parsed.header.response_mode, .input_complete = true }) catch |err| {
         err_handler.reportError(.session, "Failed to track control exchange", err);
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "gateway busy");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "gateway busy");
         return .continue_stream;
     };
 
@@ -438,7 +459,7 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     // 都无法反映到已经建立的连接上（设计文档 §10.2）。
     if (self.auth_policy.required and !ctx.isAdmitted(now)) {
         std.log.warn("[AUTH] rejecting exchange, admission not valid: stream={}", .{stream_id});
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "authentication required");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "authentication required");
         return .continue_stream;
     }
 
@@ -448,7 +469,7 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     const scope = ScopedRoute.scoped(ctx.realm, header.routeId().?);
     const transport = self.findTransport(scope) orelse {
         std.log.warn("[ROUTE] route not found: realm={} group=0x{x} route=0x{x}", .{ ctx.realm, header.group, header.route_key });
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "route not found");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "route not found");
         return .continue_stream;
     };
 
@@ -458,12 +479,12 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
         .ok => {},
         .table_full => {
             std.log.warn("[ROUTE] in-flight request table full, rejecting stream={}", .{stream_id});
-            self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "too many in-flight requests");
+            self.replyControl(ctx.session_handle, stream_id, .gateway_error, "too many in-flight requests");
             return .continue_stream;
         },
         .realm_over_share => {
             std.log.warn("[ROUTE] realm over in-flight share: realm={} stream={}", .{ ctx.realm, stream_id });
-            self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "realm in-flight quota exceeded");
+            self.replyControl(ctx.session_handle, stream_id, .gateway_error, "realm in-flight quota exceeded");
             return .continue_stream;
         },
     }
@@ -471,7 +492,7 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     const is_last = header.isLast();
     const handle = transport.sendStream(scope.route, null, parsed.bytes, is_last) catch |err| {
         err_handler.reportError(.session, "Failed to open backend stream", err);
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "backend unavailable");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "backend unavailable");
         return .continue_stream;
     };
 
@@ -482,7 +503,7 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
 
     self.inflight.openRoute(backend.key, .{
         .target = switch (header.response_mode) {
-            .required => .{ .client = .{ .cnx = ctx.cnx_handle, .stream_id = stream_id } },
+            .required => .{ .client = .{ .session = ctx.session_handle, .stream_id = stream_id } },
             .none => .discard,
         },
         .realm = ctx.realm,
@@ -492,7 +513,7 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
         // 否则它会一直等一个永远不来的 eof。
         self.finishBackendStream(backend);
         err_handler.reportError(.session, "Failed to track in-flight request", err);
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "gateway busy");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "gateway busy");
         return .continue_stream;
     };
 
@@ -505,12 +526,12 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
         self.finishBackendStream(backend);
         self.inflight.closeRoute(backend.key);
         err_handler.reportError(.session, "Failed to track exchange", err);
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "gateway busy");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "gateway busy");
         return .continue_stream;
     };
 
     if (is_last and header.response_mode == .none) {
-        self.finishResponseWithoutPayload(ctx.cnx_handle, stream_id);
+        self.finishResponseWithoutPayload(ctx.session_handle, stream_id);
     }
 
     std.log.info("[ROUTE] client_stream={} -> backend_stream={} realm={} group=0x{x} route=0x{x} single={}", .{ stream_id, handle, ctx.realm, header.group, header.route_key, is_last });
@@ -533,7 +554,7 @@ fn appendToExchange(
         // （`.gateway` 交换在 OPEN 时就已经结束）。留一条日志而不是 unreachable
         // ——将来放开流式控制交换时，这里会明确报出来而不是崩在生产环境。
         std.log.warn("[STREAM] live exchange without a backend stream: stream={}", .{stream_id});
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "unsupported exchange continuation");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "unsupported exchange continuation");
         ctx.removeInboundExchange(stream_id);
         return .continue_stream;
     };
@@ -544,7 +565,7 @@ fn appendToExchange(
         std.log.warn("[STREAM] transport disappeared mid-exchange: stream={}", .{stream_id});
         self.inflight.closeRoute(backend.key);
         ctx.removeInboundExchange(stream_id);
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "backend unavailable");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "backend unavailable");
         return .continue_stream;
     };
 
@@ -552,9 +573,11 @@ fn appendToExchange(
     // 发现响应无处可回。完整 DATA 被接纳即算上行活动，发送失败路径会立即删映射。
     if (!self.inflight.touchRoute(backend.key, quic.c.currentTime())) {
         std.log.warn("[STREAM] in-flight route expired mid-exchange: stream={}", .{stream_id});
-        self.finishBackendStream(backend);
+        // 周期回收已经对这条后端流执行过 invalidateStream（RESET + STOP）。这里收到
+        // 的是客户端越过 deadline 后仍在路上的迟到 DATA，绝不能再给已 discard 的流
+        // 补 FIN：picoquic 会把它作为单流写失败返回，错误处理若放大就会误伤共享连接
+        // 上仍然活跃的兄弟 exchange。只收掉本地解析状态；客户端此前已经收到 timeout。
         ctx.removeInboundExchange(stream_id);
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "request expired");
         return .continue_stream;
     }
 
@@ -564,7 +587,7 @@ fn appendToExchange(
         self.finishBackendStream(backend);
         self.inflight.closeRoute(backend.key);
         ctx.removeInboundExchange(stream_id);
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "backend unavailable");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "backend unavailable");
         return .continue_stream;
     };
 
@@ -574,7 +597,7 @@ fn appendToExchange(
         active.backend = null;
         active.input_complete = true;
         if (active.response_mode == .none) {
-            self.finishResponseWithoutPayload(ctx.cnx_handle, stream_id);
+            self.finishResponseWithoutPayload(ctx.session_handle, stream_id);
         }
     }
     return .continue_stream;
@@ -594,7 +617,7 @@ pub fn finishClientStream(self: *GatewayWorker, ctx: *ConnectionContext, stream_
     if (ctx.inboundExchange(stream_id)) |active| {
         if (active.backend) |backend| self.finishBackendStream(backend);
         if (!active.input_complete and active.response_mode == .none) {
-            self.finishResponseWithoutPayload(ctx.cnx_handle, stream_id);
+            self.finishResponseWithoutPayload(ctx.session_handle, stream_id);
         }
         // 会话流被 FIN 掉却没发过 eof：尾巴永远不会来，就地作废，
         // 否则下游客户端会一直等下去。
@@ -630,9 +653,19 @@ pub fn finishClientStream(self: *GatewayWorker, ctx: *ConnectionContext, stream_
 /// 可观测性靠计数器而不是日志。
 pub fn handleDatagram(ud: ?*anyopaque, conn: *QUICConnection, data: []const u8) void {
     const self = GatewayWorker.castSelf(ud);
+    const handle = self.conn_manager.handleForRawQuic(conn.inner) orelse {
+        self.datagrams_in +%= 1;
+        self.datagrams_dropped +%= 1;
+        return;
+    };
+    handleEphemeral(self, handle, data);
+}
+
+/// 传输无关的临时消息入口。payload 仍是现有 Lyune datagram frame（channel + bytes）。
+pub fn handleEphemeral(self: *GatewayWorker, session: SessionHandle, data: []const u8) void {
     self.datagrams_in +%= 1;
 
-    const ctx = self.conn_manager.get(conn) orelse {
+    const ctx = self.conn_manager.getByHandle(session) orelse {
         self.datagrams_dropped +%= 1;
         return;
     };
@@ -685,15 +718,15 @@ pub const BindOutcome = enum {
 /// "按你说的办了"，而失败走 `gateway_error`。多一个类型就多一处两边都要实现的分支。
 pub fn bindChannel(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, parsed: codec.Frame) void {
     switch (resolveBind(self, ctx, parsed)) {
-        .bound => self.replyControl(ctx.cnx_handle, stream_id, .bind_channel, parsed.body),
+        .bound => self.replyControl(ctx.session_handle, stream_id, .bind_channel, parsed.body),
         .malformed => {
             std.log.warn("[CHAN] malformed channel binding on stream {}", .{stream_id});
-            self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "malformed channel binding");
+            self.replyControl(ctx.session_handle, stream_id, .gateway_error, "malformed channel binding");
         },
-        .not_admitted => self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "authentication required"),
+        .not_admitted => self.replyControl(ctx.session_handle, stream_id, .gateway_error, "authentication required"),
         .not_a_member => {
             std.log.warn("[CHAN] bind refused, not a member: realm={} stream={}", .{ ctx.realm, stream_id });
-            self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "not a member of that group");
+            self.replyControl(ctx.session_handle, stream_id, .gateway_error, "not a member of that group");
         },
     }
 }
@@ -704,7 +737,7 @@ pub fn resolveBind(self: *GatewayWorker, ctx: *ConnectionContext, parsed: codec.
     if (self.auth_policy.required and !ctx.isAdmitted(quic.c.currentTime())) return .not_admitted;
 
     const binding = protocol.body.ChannelBinding.decode(parsed.body) catch return .malformed;
-    if (!self.conn_manager.isGroupMember(ctx.cnx_handle, binding.group_id)) return .not_a_member;
+    if (!self.conn_manager.isGroupMember(ctx.session_handle, binding.group_id)) return .not_a_member;
 
     ctx.bindChannel(binding.channel, binding.group_id);
     return .bound;
@@ -716,11 +749,11 @@ pub fn resolveBind(self: *GatewayWorker, ctx: *ConnectionContext, parsed: codec.
 pub fn unbindChannel(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, parsed: codec.Frame) void {
     const channel = protocol.body.decodeChannel(parsed.body) catch |err| {
         std.log.warn("[CHAN] malformed unbind on stream {}: {}", .{ stream_id, err });
-        self.replyControl(ctx.cnx_handle, stream_id, .gateway_error, "malformed channel number");
+        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "malformed channel number");
         return;
     };
     ctx.unbindChannel(channel);
-    self.replyControl(ctx.cnx_handle, stream_id, .unbind_channel, parsed.body);
+    self.replyControl(ctx.session_handle, stream_id, .unbind_channel, parsed.body);
 }
 
 /// 关闭整条连接（协议违规）。
@@ -728,6 +761,5 @@ pub fn unbindChannel(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u
 /// 带上应用层错误码，客户端才能区分"网关正常下线"和"我发出的字节被判违规"
 /// ——后者需要修客户端，前者只需要重连。
 fn closeConnection(ctx: *ConnectionContext, code: AppError) void {
-    var conn = QUICConnection.fromRaw(ctx.cnx_handle);
-    conn.closeWithError(@intFromEnum(code));
+    ctx.transport.close(@intFromEnum(code));
 }

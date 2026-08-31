@@ -104,6 +104,18 @@ pub const DirectFactory = struct {
         self.live += 1;
         return slot;
     }
+
+    /// 回滚刚刚创建、但没能登记进路由注册表的实例。
+    ///
+    /// 只允许回滚最后一个槽位：更早的实例地址可能已经存进注册表，移动或销毁它都会
+    /// 留下悬空指针。`GatewayWorker.findTransport` 在 create 后立即 register，失败时正好
+    /// 满足这个约束；回滚后同一路由下一次请求仍可重试，不会慢慢吃光工厂容量。
+    pub fn discardLast(self: *DirectFactory, instance: *DirectTransport) void {
+        std.debug.assert(self.live > 0);
+        std.debug.assert(instance == &self.slots[self.live - 1]);
+        instance.deinit();
+        self.live -= 1;
+    }
 };
 
 // ============================================================================
@@ -170,4 +182,8 @@ test "the factory hands out stable addresses and refuses to grow past capacity" 
         Error.TooManyRoutes,
         factory.create(.{ .route = registry.ScopedRoute.init(3, 0, 0), .endpoints = &endpoints }),
     );
+
+    factory.discardLast(second);
+    const replacement = try factory.create(.{ .route = registry.ScopedRoute.init(3, 0, 0), .endpoints = &endpoints });
+    try std.testing.expectEqual(second, replacement);
 }

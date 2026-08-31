@@ -367,6 +367,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(c_ares_dep.path("include"));
     exe.root_module.addIncludePath(c_ares_dep.path("src/lib"));
     exe.root_module.addIncludePath(c_ares_dep.path("src/lib/include"));
+    exe.root_module.addIncludePath(boringssl_dep.path("include"));
     exe.root_module.addCSourceFiles(.{
         .root = c_ares_dep.path("src/lib"),
         .files = &c_ares_sources,
@@ -376,6 +377,11 @@ pub fn build(b: *std.Build) void {
         .file = b.path("src/io/reuseport.c"),
         .flags = &.{"-std=c11"},
     });
+    exe.root_module.addCSourceFile(.{
+        .file = b.path("src/wss/tls_shim.c"),
+        .flags = &.{"-std=c11"},
+    });
+    exe.root_module.addIncludePath(b.path("src"));
     exe.root_module.linkLibrary(picoquic_lib);
     exe.root_module.linkLibrary(boringssl);
 

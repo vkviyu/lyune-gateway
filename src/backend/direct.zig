@@ -745,8 +745,13 @@ pub const DirectTransport = struct {
             const conn = self.connById(handleConnId(value)) orelse return TransportError.Closed;
             if (!conn.isReady()) return TransportError.ConnectionFailed;
             return conn.sendOn(value, data, is_fin) catch |err| {
-                self.signalFailure(conn.connectionKey());
-                conn.markFailed(err);
+                // 已存在流上的 SendFailed/Closed 可以只表示该流已被 RESET、STOP 或
+                // deadline discard；共享 QUIC 连接仍然健康。只有 sendOn 明确观察到
+                // 连接状态失效时才放大到连接故障，真正的异步关闭仍由 hookClose 兜底。
+                if (existingStreamFailureBreaksConnection(err)) {
+                    self.signalFailure(conn.connectionKey());
+                    conn.markFailed(err);
+                }
                 return err;
             };
         }
@@ -771,6 +776,15 @@ pub const DirectTransport = struct {
         const now = quic.c.currentTime();
         for (self.conns.items) |conn| conn.ensureConnecting(now);
         return last_error;
+    }
+
+    /// 已有流的发送错误是否足以判定整条共享连接失效。
+    ///
+    /// `SendFailed` 是 picoquic 对已 reset/discard 流的正常拒绝；`Closed` 也可能只是
+    /// 上层拿着旧代际句柄。两者都不能影响同连接的其他流。`ConnectionFailed` 来自
+    /// sendOn 写前的真实连接状态检查，才需要触发副本退避与精确故障传播。
+    fn existingStreamFailureBreaksConnection(err: TransportError) bool {
+        return err == TransportError.ConnectionFailed;
     }
 
     /// 接收后端返回的 stream-aware 事件（轮询池中所有连接）。
@@ -1107,6 +1121,12 @@ test "DirectTransport closed state logic" {
 
     try std.testing.expectError(TransportError.Closed, transport.sendStreamImpl(RouteId.init(1, 0), null, "test", true));
     try std.testing.expectError(TransportError.Closed, transport.receiveImpl());
+}
+
+test "existing stream-local send failures do not poison a shared connection" {
+    try std.testing.expect(!DirectTransport.existingStreamFailureBreaksConnection(TransportError.SendFailed));
+    try std.testing.expect(!DirectTransport.existingStreamFailureBreaksConnection(TransportError.Closed));
+    try std.testing.expect(DirectTransport.existingStreamFailureBreaksConnection(TransportError.ConnectionFailed));
 }
 
 test "DirectTransport integration test (Real Server)" {

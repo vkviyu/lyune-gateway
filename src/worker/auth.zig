@@ -27,7 +27,6 @@ const err_handler = foundation.err;
 const io = @import("../io/mod.zig");
 const protocol = @import("../protocol/mod.zig");
 const quic = @import("../quic/mod.zig");
-const QUICConnection = quic.connection.Connection;
 const backend = @import("../backend/mod.zig");
 const RouteId = backend.RouteId;
 const connection = @import("connection.zig");
@@ -91,18 +90,18 @@ fn buildAuthRequest(
 /// 不解析 token"：网关只写自己的定长前缀，客户端那段字节一个都不看。
 pub fn delegateAuth(self: *GatewayWorker, ctx: *ConnectionContext, client_stream_id: u64, parsed: protocol.codec.Frame) void {
     const route = self.auth_policy.route orelse {
-        self.replyControl(ctx.cnx_handle, client_stream_id, .auth_failure, "authentication not configured");
+        self.replyControl(ctx.session_handle, client_stream_id, .auth_failure, "authentication not configured");
         return;
     };
     const scope = backend.ScopedRoute.scoped(ctx.realm, route);
     const transport = self.findTransport(scope) orelse {
-        self.replyControl(ctx.cnx_handle, client_stream_id, .auth_failure, "authentication service unavailable");
+        self.replyControl(ctx.session_handle, client_stream_id, .auth_failure, "authentication service unavailable");
         return;
     };
     // 走不到 null：ctx 就是从管理器里取出来的。用 orelse 而不是 .? 是因为一旦真的
     // 发生（将来有人改了调用路径），回一个认证失败远比崩掉整个 Worker 好。
-    const token = self.conn_manager.tokenFor(ctx.cnx_handle) orelse {
-        self.replyControl(ctx.cnx_handle, client_stream_id, .auth_failure, "connection not registered");
+    const token = self.conn_manager.tokenFor(ctx.session_handle) orelse {
+        self.replyControl(ctx.session_handle, client_stream_id, .auth_failure, "connection not registered");
         return;
     };
     const forwarded = buildAuthRequest(
@@ -112,7 +111,7 @@ pub fn delegateAuth(self: *GatewayWorker, ctx: *ConnectionContext, client_stream
     ) catch |err| {
         // 唯一现实原因是客户端的认证 body 已经贴着 64KB 上限，插不进 18 字节前缀。
         std.log.warn("[AUTH] cannot frame auth request: {}", .{err});
-        self.replyControl(ctx.cnx_handle, client_stream_id, .auth_failure, "authentication payload too large");
+        self.replyControl(ctx.session_handle, client_stream_id, .auth_failure, "authentication payload too large");
         return;
     };
     const now = quic.c.currentTime();
@@ -122,22 +121,22 @@ pub fn delegateAuth(self: *GatewayWorker, ctx: *ConnectionContext, client_stream
         .ok => {},
         .table_full => {
             std.log.warn("[AUTH] pending auth table full, rejecting stream={}", .{client_stream_id});
-            self.replyControl(ctx.cnx_handle, client_stream_id, .auth_failure, "authentication service busy");
+            self.replyControl(ctx.session_handle, client_stream_id, .auth_failure, "authentication service busy");
             return;
         },
         .realm_over_share => {
             std.log.warn("[AUTH] realm over pending-auth share: realm={} stream={}", .{ ctx.realm, client_stream_id });
-            self.replyControl(ctx.cnx_handle, client_stream_id, .auth_failure, "realm authentication quota exceeded");
+            self.replyControl(ctx.session_handle, client_stream_id, .auth_failure, "realm authentication quota exceeded");
             return;
         },
     }
     const backend_stream_id = transport.send(scope.route, forwarded) catch |err| {
         err_handler.reportError(.session, "Failed to forward auth request", err);
-        self.replyControl(ctx.cnx_handle, client_stream_id, .auth_failure, "authentication service unavailable");
+        self.replyControl(ctx.session_handle, client_stream_id, .auth_failure, "authentication service unavailable");
         return;
     };
     self.inflight.trackAuth(.{ .transport = transport.id(), .stream = backend_stream_id }, .{
-        .client_cnx = ctx.cnx_handle,
+        .client_session = ctx.session_handle,
         .client_stream_id = client_stream_id,
         .realm = ctx.realm,
         .buffer = .{ .items = &.{}, .capacity = 0 },
@@ -171,7 +170,7 @@ pub fn collectAuthResponse(self: *GatewayWorker, key: inflight.StreamKey, data: 
 /// 根据认证服务返回的帧标记连接状态，并把响应原样回给客户端。
 fn completeAuth(self: *GatewayWorker, auth: *const inflight.PendingAuth) void {
     // 等待认证结果期间连接可能已经关闭
-    const ctx = self.conn_manager.getByHandle(auth.client_cnx) orelse {
+    const ctx = self.conn_manager.getByHandle(auth.client_session) orelse {
         std.log.warn("[AUTH] connection closed before auth completed", .{});
         return;
     };
@@ -195,7 +194,7 @@ fn completeAuth(self: *GatewayWorker, auth: *const inflight.PendingAuth) void {
             // 绑定寻址标识：这一步之后 .peer 投递才能找到这条连接。
             // dest_id 只来自认证服务，客户端声明的任何字段都不参与；它只在本连接的
             // realm 内唯一，realm 由 ConnectionManager 从连接上下文自己取。
-            self.conn_manager.bindDest(auth.client_cnx, verdict.grant.dest_id);
+            self.conn_manager.bindDest(auth.client_session, verdict.grant.dest_id);
             if (announce_online) @import("lifecycle.zig").publishOnline(self, ctx);
             std.log.info("[AUTH] success: stream={} realm={} dest_id={} ttl={}s", .{
                 auth.client_stream_id,
@@ -208,15 +207,14 @@ fn completeAuth(self: *GatewayWorker, auth: *const inflight.PendingAuth) void {
         .invalid => {
             std.log.warn("[AUTH] invalid response from auth service", .{});
             if (!auth.response_suppressed) {
-                self.replyControl(auth.client_cnx, auth.client_stream_id, .auth_failure, "invalid auth service response");
+                self.replyControl(auth.client_session, auth.client_stream_id, .auth_failure, "invalid auth service response");
             }
             return;
         },
     }
 
     if (auth.response_suppressed) return;
-    var conn = QUICConnection.fromRaw(auth.client_cnx);
-    conn.streamWrite(auth.client_stream_id, response, true) catch |err| {
+    ctx.transport.write(auth.client_stream_id, response, true) catch |err| {
         err_handler.reportError(.session, "Failed to write auth response to client", err);
     };
 }
@@ -286,8 +284,7 @@ pub fn redirectToHome(
     };
 
     if (pre) |first| {
-        var conn = QUICConnection.fromRaw(ctx.cnx_handle);
-        conn.streamWrite(first.stream_id, first.bytes, true) catch |err| {
+        ctx.transport.write(first.stream_id, first.bytes, true) catch |err| {
             err_handler.reportError(.session, "Failed to write auth response before redirect", err);
         };
     }
@@ -307,8 +304,7 @@ pub fn redirectToHome(
         };
     };
     if (redirect) |data| {
-        var pushing = QUICConnection.fromRaw(ctx.cnx_handle);
-        pushing.streamWrite(ctx.nextPushStream(), data, true) catch |err| {
+        _ = ctx.transport.open(data, true) catch |err| {
             err_handler.reportError(.session, "Failed to send redirect", err);
         };
     }
@@ -323,8 +319,7 @@ pub fn redirectToHome(
 
     // 带错误码关闭：重定向帧可能在关闭竞态里送不到，而错误码一定随 CONNECTION_CLOSE
     // 到达。客户端靠它区分"换地址重连，凭据还有效"和"该重新认证"。
-    var closing = QUICConnection.fromRaw(ctx.cnx_handle);
-    closing.closeWithError(@intFromEnum(protocol.frame.AppError.redirected));
+    ctx.transport.close(@intFromEnum(protocol.frame.AppError.redirected));
     return true;
 }
 
