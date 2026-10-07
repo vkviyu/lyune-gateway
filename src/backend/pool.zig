@@ -144,7 +144,6 @@ const SlotArena = struct {
         errdefer allocator.free(buffers);
         var quota = try foundation.quota.Quota.init(
             allocator,
-            foundation.quota.max_tracked_realms,
             effective,
             foundation.quota.default_watermark_percent,
         );
@@ -771,22 +770,32 @@ test "one realm cannot eat the shared pool by opening more connections" {
     var arena = try testArena(100, 10);
     defer arena.deinit(std.testing.allocator);
 
-    // realm 1 开 8 条连接，每条都老老实实待在 max_per_conn 以内，合计 80 格。
-    var greedy: [8]SlotList = @splat(.{ .realm = 1 });
+    const high: RealmId = std.math.maxInt(RealmId);
+    // 高编号 realm 开 8 条连接，每条都待在 max_per_conn 以内，合计 80 格。
+    var greedy: [8]SlotList = @splat(.{ .realm = high });
     for (&greedy) |*list| {
         var i: usize = 0;
         while (i < 10) : (i += 1) try std.testing.expect(arena.enqueue(list, 0, "x", false));
     }
-    try std.testing.expectEqual(@as(u32, 80), arena.quota.count(1));
+    try std.testing.expectEqual(@as(u32, 80), arena.quota.count(high));
 
     // realm 2 第一次进来：活跃 realm 还是 1，份额 = 全池，放行。
     var newcomer: SlotList = .{ .realm = 2 };
     try std.testing.expect(arena.enqueue(&newcomer, 0, "y", false));
 
-    // 此刻活跃变 2，份额腰斩到 50，realm 1 已占 80 → 被拒，尽管池里还有 19 个空槽。
-    try std.testing.expect(!arena.enqueue(&greedy[0], 0, "z", false));
+    // 使用一条空队列，让拒绝只能来自 realm 配额，不能被单连接的 10 格上限掩盖。
+    var extra: SlotList = .{ .realm = high };
+    try std.testing.expect(!arena.enqueue(&extra, 0, "z", false));
+    try std.testing.expectEqual(@as(usize, 19), arena.free_count);
     // 而 realm 2 照常放行——只拒超额的那个。
     try std.testing.expect(arena.enqueue(&newcomer, 0, "y2", false));
+
+    for (&greedy) |*list| arena.drop(list);
+    while (arena.pop(&newcomer)) |index| arena.release(index);
+    try std.testing.expectEqual(@as(usize, 100), arena.free_count);
+    try std.testing.expectEqual(@as(usize, 0), arena.quota.total);
+    try std.testing.expectEqual(@as(usize, 0), arena.quota.active_realms);
+    try std.testing.expectEqual(@as(u32, 0), arena.quota.count(high));
 }
 
 test "realm slot counters return to zero after a full churn cycle" {

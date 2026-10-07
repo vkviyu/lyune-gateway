@@ -364,6 +364,73 @@ test "only additions are accepted" {
     try std.testing.expectError(Error.RouteRemoved, reloader.checkRoutes(config));
 }
 
+test "a hot-added high realm immediately participates in existing quotas" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config_json =
+        \\{
+        \\  "runtime": {"threads": 1},
+        \\  "server": {
+        \\    "listen_host": "127.0.0.1", "listen_port": 8443,
+        \\    "certificate_file": "c", "private_key_file": "k",
+        \\    "quic": {"max_connections": 10, "idle_timeout_ms": 1000, "alpn": "lyune/2", "congestion_control": "bbr"}
+        \\  },
+        \\  "backend": {"direct": {
+        \\    "routes": [{"realm": 65535, "group": 1, "endpoints": [{"host": "127.0.0.1", "port": 9000}]}],
+        \\    "verify_certificate": false, "root_certificate_file": null,
+        \\    "max_receive_queue": 10, "idle_timeout_ms": 1000, "alpn": "lyune/2", "congestion_control": "bbr"
+        \\  }},
+        \\  "worker": {"backend_poll_interval_ms": 10},
+        \\  "cluster": {"node_id": 1, "advertise_host": "127.0.0.1", "advertise_port": 7946, "handoff_queue_capacity": 16},
+        \\  "realm_capacity": 2,
+        \\  "realms": [{"server_name": "old.gw.example.com", "id": 1024}, {"server_name": "new.gw.example.com", "id": 65535}]
+        \\}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gateway.json", .data = config_json });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "gateway.json", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var realm_slots: [2]foundation.realm.Table.Entry = @splat(.{});
+    realm_slots[0] = .{ .sni = "old.gw.example.com", .realm = 1024 };
+    var realms = foundation.realm.Table{ .slots = &realm_slots, .len = .init(1), .fallback = null };
+    var route_slots: [2]backend.RouteEntry = @splat(.{});
+    var routes = backend.RouteCatalog{ .slots = &route_slots, .len = .init(0) };
+    var reloader = Reloader.init(std.testing.io, std.testing.allocator, path, &realms, &routes);
+    defer reloader.deinit();
+
+    // 配额在新增 realm 之前已经存在；热加载不能依赖重建计数表才能生效。
+    var quota = try foundation.quota.Quota.init(std.testing.allocator, 10, 70);
+    defer quota.deinit(std.testing.allocator);
+    quota.acquire(realms.resolve("old.gw.example.com").?);
+    try std.testing.expect(realms.resolve("new.gw.example.com") == null);
+
+    const summary = try reloader.apply();
+    try std.testing.expectEqual(@as(usize, 1), summary.realms_added);
+    try std.testing.expectEqual(@as(usize, 1), summary.routes_added);
+    const added = realms.resolve("new.gw.example.com").?;
+    try std.testing.expectEqual(std.math.maxInt(foundation.realm.RealmId), added);
+    try std.testing.expect(routes.find(backend.ScopedRoute.init(added, 1, 0)) != null);
+
+    for (0..6) |_| {
+        try std.testing.expect(quota.allows(added));
+        quota.acquire(added);
+    }
+    try std.testing.expectEqual(@as(usize, 7), quota.total);
+    try std.testing.expectEqual(@as(usize, 2), quota.active_realms);
+    try std.testing.expect(!quota.allows(added));
+    try std.testing.expect(quota.allows(1024));
+
+    // 重复加载不重复登记，也不丢失既有占用。
+    const unchanged = try reloader.apply();
+    try std.testing.expectEqual(@as(usize, 0), unchanged.realms_added);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.routes_added);
+    try std.testing.expectEqual(@as(u32, 6), quota.count(added));
+    for (0..6) |_| quota.release(added);
+    quota.release(1024);
+    try std.testing.expectEqual(@as(usize, 0), quota.total);
+    try std.testing.expectEqual(@as(usize, 0), quota.active_realms);
+}
+
 test "owned memory is released even for a partially built route" {
     // testing.allocator 会在泄漏时让本用例失败：这条钉住的是"表只借用、Reloader 持有"
     // 这个约定——漏一条就是进程生命周期的泄漏，而它只在长期运行后才显形。

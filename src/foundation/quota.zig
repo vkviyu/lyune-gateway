@@ -23,9 +23,8 @@
 //!
 //! ## 公平份额 = 容量 / 活跃 realm 数
 //!
-//! 活跃 = 当前占用大于 0。每次 acquire 都数一遍活跃 realm 是 O(max_realms)，在热路径上
-//! 太贵，因此只在某个 realm 的占用发生 0↔1 跃变时重算——那是低频事件，而且结果精确，
-//! 不是估算。
+//! 活跃 = 当前占用大于 0。只在某个 realm 的占用发生 0↔1 跃变时增减活跃数，
+//! 不扫描计数数组；准入与记账都是 O(1)。
 //!
 //! ## 一条必须在设计时就防住的风险
 //!
@@ -35,17 +34,16 @@
 //! 一轮建立-销毁之后计数归零。
 
 const std = @import("std");
+const RealmId = @import("realm.zig").RealmId;
 
 pub const Error = error{OutOfMemory};
 
-/// 配额计数覆盖的 realm id 上限，全部池共用同一个值。
+/// 覆盖 RealmId 的完整取值空间，长度不能由调用方缩小。
 ///
-/// 计数数组按 realm id 直接索引（realm id 是配置里任选的 u16，不是紧凑下标），
-/// 所以这个数字决定数组长度：1024 × 4 字节 × 每 Worker 的池数量，量级是几十 KB。
-///
-/// id 超出范围的 realm **不受配额约束**（见 `allows`）：那说明 realm 表本身配得离谱，
-/// 而配额不是发现配置错误的地方——在这里拒绝会把一个配置问题变成一次难解释的容量故障。
-pub const max_tracked_realms: usize = 1024;
+/// RealmId 是可稀疏配置的 u16；每个合法编号都有计数器，热加载新增 realm 时无需扩容。
+/// 每份表占 65536 × 4 = 256 KiB，只在初始化时堆分配；不为 realm 预留实际资源。
+const realm_count: usize = @as(usize, std.math.maxInt(RealmId)) + 1;
+const Counts = [realm_count]u32;
 
 /// 开始讲公平的默认水位线（占容量的百分比）。
 ///
@@ -54,8 +52,8 @@ pub const max_tracked_realms: usize = 1024;
 pub const default_watermark_percent: u8 = 70;
 
 pub const Quota = struct {
-    /// 每 realm 的当前占用；下标即 RealmId。
-    counts: []u32,
+    /// 自有堆内存；下标即 RealmId，数组类型保证每个合法编号都可直接索引。
+    counts: *Counts,
     /// 池容量。
     capacity: usize,
     /// 当前总占用。
@@ -65,10 +63,9 @@ pub const Quota = struct {
     /// 开始讲公平的水位线（占容量的百分比）。
     watermark_percent: u8,
 
-    /// `max_realms` 决定计数数组长度；realm id 超出范围的请求一律放行，
-    /// 因为那说明 realm 表本身配错了，配额不是发现它的地方。
-    pub fn init(allocator: std.mem.Allocator, max_realms: usize, capacity: usize, watermark_percent: u8) Error!Quota {
-        const counts = try allocator.alloc(u32, @max(max_realms, 1));
+    /// 初始化资源池配额；编号覆盖范围由 RealmId 决定，与池容量、已登记 realm 数无关。
+    pub fn init(allocator: std.mem.Allocator, capacity: usize, watermark_percent: u8) Error!Quota {
+        const counts = try allocator.create(Counts);
         @memset(counts, 0);
         return .{
             .counts = counts,
@@ -80,15 +77,14 @@ pub const Quota = struct {
     }
 
     pub fn deinit(self: *Quota, allocator: std.mem.Allocator) void {
-        allocator.free(self.counts);
+        allocator.destroy(self.counts);
     }
 
     /// 这个 realm 现在能否再占一格。
     ///
     /// 只判断，不记账——调用方确认要占时再调 `acquire`。分开是为了让"池本身也满了"
     /// 这种情形由调用方按自己的语义处理（有的池要报错，有的池要丢最旧的）。
-    pub fn allows(self: *const Quota, realm: u16) bool {
-        if (realm >= self.counts.len) return true;
+    pub fn allows(self: *const Quota, realm: RealmId) bool {
         // 水位线以下不讲公平：小 realm 可以自由突发。
         if (self.total * 100 < self.capacity * self.watermark_percent) return true;
 
@@ -97,8 +93,7 @@ pub const Quota = struct {
     }
 
     /// 占一格。
-    pub fn acquire(self: *Quota, realm: u16) void {
-        if (realm >= self.counts.len) return;
+    pub fn acquire(self: *Quota, realm: RealmId) void {
         if (self.counts[realm] == 0) self.active_realms += 1;
         self.counts[realm] += 1;
         self.total += 1;
@@ -108,8 +103,7 @@ pub const Quota = struct {
     ///
     /// 对未占用的 realm 调用是安全的空操作——但它意味着调用方的配对出了问题，
     /// 因此断言在调试构建里会先炸出来。
-    pub fn release(self: *Quota, realm: u16) void {
-        if (realm >= self.counts.len) return;
+    pub fn release(self: *Quota, realm: RealmId) void {
         std.debug.assert(self.counts[realm] > 0);
         if (self.counts[realm] == 0) return;
         self.counts[realm] -= 1;
@@ -117,8 +111,7 @@ pub const Quota = struct {
         if (self.counts[realm] == 0) self.active_realms -= 1;
     }
 
-    pub fn count(self: *const Quota, realm: u16) u32 {
-        if (realm >= self.counts.len) return 0;
+    pub fn count(self: *const Quota, realm: RealmId) u32 {
         return self.counts[realm];
     }
 };
@@ -128,7 +121,7 @@ pub const Quota = struct {
 // ============================================================================
 
 test "below the watermark nobody is limited" {
-    var quota = try Quota.init(std.testing.allocator, 8, 100, 70);
+    var quota = try Quota.init(std.testing.allocator, 100, 70);
     defer quota.deinit(std.testing.allocator);
 
     // 一个 realm 独占到水位线之前都放行——空闲机器上的突发不该被拒。
@@ -141,7 +134,7 @@ test "below the watermark nobody is limited" {
 }
 
 test "above the watermark the over-share realm is refused and others are not" {
-    var quota = try Quota.init(std.testing.allocator, 8, 100, 70);
+    var quota = try Quota.init(std.testing.allocator, 100, 70);
     defer quota.deinit(std.testing.allocator);
 
     // realm 1 先占到水位线。此刻只有它活跃，份额 = 100/1，所以仍然放行。
@@ -157,7 +150,7 @@ test "above the watermark the over-share realm is refused and others are not" {
 }
 
 test "the fair share follows the active realm count" {
-    var quota = try Quota.init(std.testing.allocator, 8, 100, 0);
+    var quota = try Quota.init(std.testing.allocator, 100, 0);
     defer quota.deinit(std.testing.allocator);
 
     // 水位线设 0：全程讲公平，便于观察份额本身。
@@ -179,7 +172,7 @@ test "the fair share follows the active realm count" {
 }
 
 test "a realm dropping to zero gives its share back" {
-    var quota = try Quota.init(std.testing.allocator, 8, 100, 0);
+    var quota = try Quota.init(std.testing.allocator, 100, 0);
     defer quota.deinit(std.testing.allocator);
 
     quota.acquire(1);
@@ -200,7 +193,7 @@ test "a realm dropping to zero gives its share back" {
 test "counters return to zero after a full churn cycle" {
     // 这条是防"配额被永久蚕食"的那道回归：漏掉一条归还路径的症状是
     // "这家接入方的用户过几天就连不上了"，极难定位，所以必须有用例钉住。
-    var quota = try Quota.init(std.testing.allocator, 8, 32, 70);
+    var quota = try Quota.init(std.testing.allocator, 32, 70);
     defer quota.deinit(std.testing.allocator);
 
     var round: usize = 0;
@@ -223,14 +216,56 @@ test "counters return to zero after a full churn cycle" {
     while (realm < 8) : (realm += 1) try std.testing.expectEqual(@as(u32, 0), quota.count(realm));
 }
 
-test "an out-of-range realm is always allowed" {
-    // realm id 越界说明 realm 表本身配错了。配额不是发现它的地方——在这里拒绝会把
-    // 一个配置错误变成一次难解释的容量故障。
-    var quota = try Quota.init(std.testing.allocator, 4, 8, 0);
+test "sparse realm ids are counted, limited and fully released" {
+    var quota = try Quota.init(std.testing.allocator, 10, 70);
     defer quota.deinit(std.testing.allocator);
 
-    try std.testing.expect(quota.allows(99));
-    quota.acquire(99);
-    quota.release(99);
-    try std.testing.expectEqual(@as(usize, 0), quota.total);
+    // 默认域、旧数组末端、旧越界起点和 u16 最大值都必须遵守同一套规则。
+    for ([_]RealmId{ 0, 1023, 1024, std.math.maxInt(RealmId) }) |realm| {
+        for (0..7) |_| {
+            try std.testing.expect(quota.allows(realm));
+            quota.acquire(realm);
+        }
+        try std.testing.expectEqual(@as(u32, 7), quota.count(realm));
+        try std.testing.expectEqual(@as(usize, 7), quota.total);
+        try std.testing.expectEqual(@as(usize, 1), quota.active_realms);
+
+        try std.testing.expect(quota.allows(1));
+        quota.acquire(1);
+        try std.testing.expectEqual(@as(usize, 8), quota.total);
+        try std.testing.expectEqual(@as(usize, 2), quota.active_realms);
+        try std.testing.expect(!quota.allows(realm));
+        try std.testing.expect(quota.allows(1));
+
+        for (0..7) |_| quota.release(realm);
+        try std.testing.expectEqual(@as(u32, 0), quota.count(realm));
+        try std.testing.expectEqual(@as(usize, 1), quota.total);
+        try std.testing.expectEqual(@as(usize, 1), quota.active_realms);
+        quota.release(1);
+        try std.testing.expectEqual(@as(usize, 0), quota.total);
+        try std.testing.expectEqual(@as(usize, 0), quota.active_realms);
+    }
+}
+
+test "high realm usage activates the watermark for low realms too" {
+    var quota = try Quota.init(std.testing.allocator, 100, 70);
+    defer quota.deinit(std.testing.allocator);
+
+    for (0..60) |_| quota.acquire(1);
+    try std.testing.expect(quota.allows(1));
+
+    // 高编号占用使实际水位从 60% 到 70%；若漏记账，低编号仍会被错误地放行。
+    const high: RealmId = std.math.maxInt(RealmId);
+    for (0..10) |_| {
+        try std.testing.expect(quota.allows(high));
+        quota.acquire(high);
+    }
+    try std.testing.expectEqual(@as(usize, 70), quota.total);
+    try std.testing.expect(!quota.allows(1));
+    try std.testing.expect(quota.allows(high));
+
+    for (0..10) |_| quota.release(high);
+    try std.testing.expectEqual(@as(usize, 60), quota.total);
+    try std.testing.expectEqual(@as(usize, 1), quota.active_realms);
+    try std.testing.expect(quota.allows(1));
 }

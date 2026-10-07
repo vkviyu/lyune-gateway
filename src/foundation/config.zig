@@ -608,6 +608,21 @@ test "realm registration and route scoping are validated at startup" {
     try config.validate();
 }
 
+test "sparse realm ids remain valid independently of registration capacity" {
+    for ([_]u16{ 1023, 1024, std.math.maxInt(u16) }) |id| {
+        var config = testConfig();
+        config.realm_capacity = 1;
+        config.realms = &.{.{ .server_name = "sparse.gw.example.com", .id = id }};
+        config.backend.direct.routes = &.{.{
+            .realm = id,
+            .group = 1,
+            .endpoints = &.{.{ .host = "127.0.0.1", .port = 8443 }},
+        }};
+        // 登记容量约束条目数量，不能用来限制编号数值。
+        try config.validate();
+    }
+}
+
 test "backend mTLS must be configured as a complete pair" {
     // 半配是静默的安全降级：运维以为双向认证开了，而 picoquic 拿不到完整的一对，
     // 握手仍然是单向的，任何能连上后端端口的东西照旧能冒充网关（§10.1）。

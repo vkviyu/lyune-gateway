@@ -173,7 +173,6 @@ pub const Tables = struct {
     pub fn init(allocator: std.mem.Allocator) foundation.quota.Error!Tables {
         var route_quota = try foundation.quota.Quota.init(
             allocator,
-            foundation.quota.max_tracked_realms,
             max_requests,
             foundation.quota.default_watermark_percent,
         );
@@ -181,7 +180,6 @@ pub const Tables = struct {
 
         var auth_quota = try foundation.quota.Quota.init(
             allocator,
-            foundation.quota.max_tracked_realms,
             max_requests,
             foundation.quota.default_watermark_percent,
         );
@@ -871,21 +869,50 @@ test "a realm over its fair share is refused while others still get in" {
     defer tables.deinit();
 
     const cnx = fakeSession(1);
-    // 水位线以下不讲公平：先把 realm 1 灌到水位线之上，它此刻仍是唯一活跃 realm，
-    // 份额 = 全池，所以还放行。
+    const high: RealmId = std.math.maxInt(RealmId);
+    // 回程与认证配额都必须统计高编号：唯一活跃 realm 可以超过水位线。
     const above_watermark = max_requests * foundation.quota.default_watermark_percent / 100 + 1;
     var i: u64 = 0;
     while (i < above_watermark) : (i += 1) {
-        try std.testing.expectEqual(Admit.ok, tables.reserveRoute(1, 0));
-        try tables.openRoute(streamKey(i), clientRoute(cnx, i, 1, 0));
+        try std.testing.expectEqual(Admit.ok, tables.reserveRoute(high, 0));
+        try tables.openRoute(streamKey(i), clientRoute(cnx, i, high, 0));
+        try std.testing.expectEqual(Admit.ok, tables.reserveAuth(high, 0));
+        try tables.trackAuth(streamKey(i), .{
+            .client_session = cnx,
+            .client_stream_id = i,
+            .realm = high,
+            .buffer = .{ .items = &.{}, .capacity = 0 },
+            .created_at = 0,
+        });
     }
 
-    // realm 2 进来，活跃变 2，份额腰斩。realm 1 已经超了，realm 2 照常放行
+    // realm 2 进来，活跃变 2，份额腰斩。高编号已经超了，realm 2 照常放行
     // ——这就是"只拒超额的那个"。
     try std.testing.expectEqual(Admit.ok, tables.reserveRoute(2, 0));
     try tables.openRoute(streamKey(above_watermark), clientRoute(cnx, 0, 2, 0));
-    try std.testing.expectEqual(Admit.realm_over_share, tables.reserveRoute(1, 0));
+    try std.testing.expectEqual(Admit.realm_over_share, tables.reserveRoute(high, 0));
     try std.testing.expectEqual(Admit.ok, tables.reserveRoute(2, 0));
+
+    try std.testing.expectEqual(Admit.ok, tables.reserveAuth(2, 0));
+    try tables.trackAuth(streamKey(above_watermark), .{
+        .client_session = cnx,
+        .client_stream_id = 0,
+        .realm = 2,
+        .buffer = .{ .items = &.{}, .capacity = 0 },
+        .created_at = 0,
+    });
+    try std.testing.expectEqual(Admit.realm_over_share, tables.reserveAuth(high, 0));
+    try std.testing.expectEqual(Admit.ok, tables.reserveAuth(2, 0));
+    try std.testing.expectEqual(above_watermark, tables.route_quota.count(high));
+    try std.testing.expectEqual(above_watermark, tables.auth_quota.count(high));
+
+    tables.purge(.{ .session = cnx });
+    try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
+    try std.testing.expectEqual(@as(usize, 0), tables.auth_quota.total);
+    try std.testing.expectEqual(@as(usize, 0), tables.route_quota.active_realms);
+    try std.testing.expectEqual(@as(usize, 0), tables.auth_quota.active_realms);
+    try std.testing.expectEqual(@as(u32, 0), tables.route_quota.count(high));
+    try std.testing.expectEqual(@as(u32, 0), tables.auth_quota.count(high));
 }
 
 test "quota counters return to zero through all three reclaim paths" {

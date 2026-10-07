@@ -695,7 +695,7 @@ pub const GatewayWorker = struct {
     pub fn acceptClientSession(self: *Self, transport: TransportSession, server_name: ?[]const u8) AcceptSessionError!SessionHandle {
         if (!self.coordinator.acceptsNewConnections()) return error.NotAcceptingConnections;
         const realm = self.realms.resolve(server_name) orelse return error.UnregisteredRealm;
-        const ctx = try self.conn_manager.addSession(transport, realm, self);
+        const ctx = try self.conn_manager.addSession(transport, realm);
         std.log.info("[CONN] new {s} session: worker={} slot={} generation={} realm={}", .{
             @tagName(ctx.transport.kind()),
             self.worker_id,
@@ -747,7 +747,7 @@ pub const GatewayWorker = struct {
             return;
         }
 
-        _ = self.conn_manager.addPeerNode(conn, self) catch |err| {
+        _ = self.conn_manager.addPeerNode(conn) catch |err| {
             std.log.warn("[CLUSTER] refusing peer link: {s}", .{@errorName(err)});
             conn.close();
             return;
@@ -2099,7 +2099,7 @@ test "a kick from another realm is refused and leaves the target admitted" {
     // 目标连接属于 realm 7；本用例不会解引用这个句柄——kick 在 realm 校验处就返回了。
     const victim_realm: foundation.realm.RealmId = 7;
     var victim = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    const ctx = try worker.conn_manager.add(&victim, victim_realm, &worker);
+    const ctx = try worker.conn_manager.add(&victim, victim_realm);
     ctx.authenticated = true;
     worker.conn_manager.bindDest(ctx.session_handle, 42);
 
@@ -2207,7 +2207,7 @@ test "a backend can put a connection into a multicast group" {
     defer worker.deinit();
 
     var member = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    const member_ctx = try worker.conn_manager.add(&member, test_realm, &worker);
+    const member_ctx = try worker.conn_manager.add(&member, test_realm);
     const token = worker.conn_manager.tokenFor(member_ctx.session_handle).?;
 
     var frame_buf: [256]u8 = undefined;
@@ -2241,7 +2241,7 @@ test "a cross-realm group join is refused" {
 
     const victim_realm: foundation.realm.RealmId = 7;
     var victim = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    const victim_ctx = try worker.conn_manager.add(&victim, victim_realm, &worker);
+    const victim_ctx = try worker.conn_manager.add(&victim, victim_realm);
     const token = worker.conn_manager.tokenFor(victim_ctx.session_handle).?;
 
     var frame_buf: [256]u8 = undefined;
@@ -2563,7 +2563,7 @@ test "a peer delivery is scoped by the realm in its frame header" {
     // 一条 realm 7 的连接绑定 dest_id 42。本用例不解引用这个句柄——投递会在
     // realm 不匹配时就查不到链，根本走不到 streamWrite。
     var victim = QUICConnection{ .inner = @ptrFromInt(0x2000) };
-    const victim_ctx = try worker.conn_manager.add(&victim, 7, &worker);
+    const victim_ctx = try worker.conn_manager.add(&victim, 7);
     worker.conn_manager.bindDest(victim_ctx.session_handle, 42);
     try std.testing.expectEqual(@as(usize, 1), worker.conn_manager.destCount(7, 42));
 
@@ -2706,7 +2706,7 @@ test "binding a datagram channel is refused unless the backend put you in that g
     _ = &registry;
 
     var conn = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    const ctx = try worker.conn_manager.add(&conn, test_realm, &worker);
+    const ctx = try worker.conn_manager.add(&conn, test_realm);
     ctx.authenticated = true;
 
     var frame_buf: [128]u8 = undefined;
@@ -2761,7 +2761,7 @@ test "every rejected datagram is counted instead of vanishing" {
     try std.testing.expectEqual(@as(u64, 1), worker.datagrams_in);
     try std.testing.expectEqual(@as(u64, 1), worker.datagrams_dropped);
 
-    const ctx = try worker.conn_manager.add(&conn, test_realm, &worker);
+    const ctx = try worker.conn_manager.add(&conn, test_realm);
     ctx.authenticated = true;
 
     // 2. 通道没绑：客户端抢跑，或者绑定已被吊销。
@@ -2797,7 +2797,7 @@ test "an uplink datagram fans out through the same routing as a reliable multica
     _ = &registry;
 
     var conn = QUICConnection{ .inner = @ptrFromInt(0x3000) };
-    const ctx = try worker.conn_manager.add(&conn, test_realm, &worker);
+    const ctx = try worker.conn_manager.add(&conn, test_realm);
     ctx.authenticated = true;
     try worker.conn_manager.joinGroup(ctx.session_handle, 555);
     ctx.bindChannel(1, 555);

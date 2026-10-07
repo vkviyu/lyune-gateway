@@ -1475,10 +1475,22 @@ realm 写进 `ConnectionContext` 后不可变，`bindDest` / `joinGroup` 都不�
 永久浪费的 RSS。
 
 形态：**水位线（默认 70%）以下无条件放行**，以上才按公平份额（容量 / 活跃 realm 数）
-只拒超额的那个 realm。等于"只在争用时才讲公平"。份额的分母只在某个 realm 占用发生
-0↔1 跃变时重算——每次 acquire 都数一遍是 O(max_realms)，在热路径上太贵。
+只拒超额的那个 realm。等于"只在争用时才讲公平"。活跃 realm 数只在占用发生
+0↔1 跃变时增减，不扫描计数数组；准入与记账都是 O(1)。这里控制的是新增占用，
+不会回收已经超过份额的存量资源，也不保证一个后来进入的 realm 能立即获得平均份额。
 
-**五个池全部已接**，各自的记账点与拒绝语义：
+计数表完整覆盖 `RealmId = u16` 的 **0–65535**，长度由类型推导，调用方不能缩小范围。
+realm 编号可以稀疏配置；`realm_capacity` 约束 SNI 登记条目数，不约束编号大小。
+启动或热加载登记的任何合法 realm 都参与 `counts`、`total` 和 `active_realms` 统计，
+没有“编号超出计数范围就放行或跳过记账”的分支。
+
+每份计数表在初始化时堆分配 `65536 × sizeof(u32) = 256 KiB`，运行期直接按编号索引，
+新增 realm 无需扩容。当前五类资源共六份配额（普通在途与认证等待分别计数），每 Worker
+对应的计数表合计 **1.5 MiB**，16 个 Worker 为 24 MiB；这只是记账内存，不是按 realm
+预留连接或消息缓冲。`Quota.init(allocator, capacity, watermark_percent)` 只接收资源池容量
+与水位线，编号覆盖范围始终由 `RealmId` 决定。
+
+**五类资源全部已接，共六份配额**，各自的记账点与拒绝语义：
 
 - **会话槽位池**：`ConnectionManager.add` / `remove`。超额返回 `RealmQuotaExceeded` 而不是
   `TooManyConnections`——池里还有空位时，运维必须能区分"整机满了"（要扩容）和"你这家

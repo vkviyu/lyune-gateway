@@ -2,6 +2,10 @@
 
 > 基线日期：2026-09-01
 >
+> 源码审计更新：2026-09-06（realm 配额完整编号覆盖）
+>
+> 工具链决定：2026-10-08（固定 Zig 0.16.0，0.17 迁移已撤回，详见 [评估记录](zig_0_17_migration.md)）
+>
 > 状态：开发中；没有正式 release，没有生产环境使用者。
 >
 > 本文描述当前源码事实，不构成兼容性或发布时间承诺。
@@ -47,20 +51,29 @@
 - TLS SNI → realm，未登记 SNI 在多 realm 模式下失败关闭；
 - `(realm, dest_id)`、`ScopedRoute(realm, group, route_key)`、`(realm, group_id)` 隔离；
 - 会话、组播成员边、inflight、后端接收槽位、应用消息队列的 realm 公平准入；
+- 配额计数完整覆盖 `RealmId` 的 0–65535，稀疏高编号与热加载新增 realm 同样参与统计；每份计数表 256 KiB，当前六份配额合计每 Worker 1.5 MiB；
 - 后端和 peer link 客户端证书能力；
 - SIGHUP 重读配置，只接受新增 realm 和路由；
 - 新路由的 Worker-local DirectTransport 惰性创建。
 
 ## 2. 已验证范围
 
-当前基线验证结果：
+当前审计基线代码回归结果（Zig 0.16.0，2026-10-08）：
 
-- `zig fmt --check build.zig src`：通过；
-- `zig build test --summary all`：284 pass、1 skip，共 285 个测试；
+- `zig fmt --check build.zig build.zig.zon build/boringssl src`：通过；
+- `zig build test --summary all`：287 pass、1 skip，共 288 个测试；
+- `zig build test -Doptimize=ReleaseSafe --summary all`：同样为 287 pass、1 skip；
 - `zig build -Doptimize=ReleaseSafe --summary all`：9/9 构建步骤通过。
-- Reactor、client-agent Go 测试与 React 生产构建：通过。
+
+此前 Mac 验证中的 Reactor、client-agent Go 测试与 React 生产构建均通过；命令和真实进程证据见 [两阶段真实环境验证](validation.md)。0.17 迁移尝试的回归及交叉编译结果不计入当前基线，也不代表已进行远程 Linux 测试。
 
 测试覆盖帧 codec/framing、连接与路由表、realm 配额、DirectTransport、CID、交接队列、SWIM 状态机、分区愈合、Lifeguard、HMAC、真实 loopback gossip、forward tunnel、peer 权限和主要 Worker 分派路径。
+
+2026-09-06 源码审计修复复核：`zig build test --summary all` 为 **287 pass、1 skip，共 288 个测试**。
+`zig fmt --check build.zig src` 与 `git diff --check` 通过，ReleaseSafe 构建 9/9 步骤通过。
+新增/强化回归覆盖编号 1023、1024、65535 的准入、总水位线、释放归零，六份资源配额，以及
+真实 JSON 重读后的高编号 realm/路由追加与重复加载。后端配额用例使用尚未占用槽位的连接队列，
+确保拒绝来自 realm 配额而非单连接上限。该结果是本地代码回归，真实 IM 与跨平台验证范围仍以下文记录为准。
 
 真实环境验证状态与仍未完成项：
 

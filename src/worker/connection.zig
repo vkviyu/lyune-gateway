@@ -162,9 +162,6 @@ pub const ConnectionContext = struct {
     /// Gateway 周期刷新；进程崩溃来不及发 offline 时，租约也会自行失效。
     lifecycle_refreshed_at: u64 = 0,
 
-    // owning GatewayWorker pointer, kept opaque to avoid an import cycle.
-    gateway_ctx: ?*anyopaque = null,
-
     /// 跨回调的上行残帧，按客户端 stream_id 存放。
     ///
     /// 只有一次回调没带来整帧时才会有条目；帧边界对齐的常态下这张表是空的，
@@ -672,10 +669,10 @@ pub const ConnectionManager = struct {
 
         // 水位线取全局默认：池用量到七成才开始讲公平。理由见 foundation/quota.zig ——
         // 空闲机器上的突发不该被拒。
-        var conn_quota = try foundation.quota.Quota.init(allocator, foundation.quota.max_tracked_realms, effective, foundation.quota.default_watermark_percent);
+        var conn_quota = try foundation.quota.Quota.init(allocator, effective, foundation.quota.default_watermark_percent);
         errdefer conn_quota.deinit(allocator);
 
-        var group_quota = try foundation.quota.Quota.init(allocator, foundation.quota.max_tracked_realms, groups.edges.len, foundation.quota.default_watermark_percent);
+        var group_quota = try foundation.quota.Quota.init(allocator, groups.edges.len, foundation.quota.default_watermark_percent);
         errdefer group_quota.deinit(allocator);
 
         var incarnation_bytes: [8]u8 = undefined;
@@ -715,12 +712,12 @@ pub const ConnectionManager = struct {
     ///
     /// `realm` 在这一刻定死：它由握手时的 SNI 解析而来，之后连接上的任何字节
     /// 都不能改变它。
-    pub fn add(self: *ConnectionManager, conn: *QUICConnection, realm: RealmId, gateway_ctx: ?*anyopaque) !*ConnectionContext {
-        return self.addRawQuic(conn, realm, gateway_ctx);
+    pub fn add(self: *ConnectionManager, conn: *QUICConnection, realm: RealmId) !*ConnectionContext {
+        return self.addRawQuic(conn, realm);
     }
 
-    pub fn addRawQuic(self: *ConnectionManager, conn: *QUICConnection, realm: RealmId, gateway_ctx: ?*anyopaque) !*ConnectionContext {
-        return self.addSession(quic.session.init(conn.inner), realm, gateway_ctx);
+    pub fn addRawQuic(self: *ConnectionManager, conn: *QUICConnection, realm: RealmId) !*ConnectionContext {
+        return self.addSession(quic.session.init(conn.inner), realm);
     }
 
     /// 注册任意客户端传输。只有 ConnectionManager 可以签发 SessionHandle；传输实现
@@ -729,7 +726,6 @@ pub const ConnectionManager = struct {
         self: *ConnectionManager,
         transport: TransportSession,
         realm: RealmId,
-        gateway_ctx: ?*anyopaque,
     ) !*ConnectionContext {
         const slot_index = self.free_head orelse return Error.TooManyConnections;
         // 池还有位置，但这个 realm 可能已经超过它在争用时的公平份额。
@@ -747,7 +743,6 @@ pub const ConnectionManager = struct {
         slot.in_use = true;
         const handle = SessionHandle{ .slot = slot_index, .generation = slot.generation };
         slot.ctx = ConnectionContext.init(self.allocator, handle, transport, realm);
-        slot.ctx.gateway_ctx = gateway_ctx;
 
         // Raw QUIC 只有在接入槽位成功后才发布 callback 索引；失败路径不会留下一个
         // 指向空闲槽位的裸指针。WSS 没有这层索引，它的 listener 直接持 SessionHandle。
@@ -761,13 +756,13 @@ pub const ConnectionManager = struct {
     /// 注册一条对等网关节点的连接。
     ///
     /// 与 `add` 分成两个入口而不是加一个 `peer_node: bool` 参数：布尔参数在调用点
-    /// 是 `add(conn, realm, ctx, true)` 这种读不出含义的形状，而"把客户端连接误标成
+    /// 是 `add(conn, realm, true)` 这种读不出含义的形状，而"把客户端连接误标成
     /// 对等节点"是一次完整的权限逃逸。分成两个名字之后，误用需要写错函数名。
     ///
     /// `realm` 取默认值且**没有意义**：对等节点的每一帧自带 realm（`realmHint()`），
     /// 连接级 realm 从不参与它的寻址。
-    pub fn addPeerNode(self: *ConnectionManager, conn: *QUICConnection, gateway_ctx: ?*anyopaque) !*ConnectionContext {
-        const ctx = try self.add(conn, foundation.realm.default_realm, gateway_ctx);
+    pub fn addPeerNode(self: *ConnectionManager, conn: *QUICConnection) !*ConnectionContext {
+        const ctx = try self.add(conn, foundation.realm.default_realm);
         ctx.peer_node = true;
         return ctx;
     }
@@ -1219,17 +1214,17 @@ test "connection pool reuses slots and refuses overflow" {
     var second = QUICConnection{ .inner = @ptrFromInt(0x2000) };
     var third = QUICConnection{ .inner = @ptrFromInt(0x3000) };
 
-    const ctx_first = try manager.add(&first, test_realm, null);
-    _ = try manager.add(&second, test_realm, null);
+    const ctx_first = try manager.add(&first, test_realm);
+    _ = try manager.add(&second, test_realm);
     try std.testing.expectEqual(@as(usize, 2), manager.count());
 
     // 超过配置上限必须明确拒绝，而不是继续增长。
-    try std.testing.expectError(ConnectionManager.Error.TooManyConnections, manager.add(&third, test_realm, null));
+    try std.testing.expectError(ConnectionManager.Error.TooManyConnections, manager.add(&third, test_realm));
 
     // 关闭一条后槽位应当被回收复用。
     manager.remove(&first);
     try std.testing.expectEqual(@as(usize, 1), manager.count());
-    const ctx_third = try manager.add(&third, test_realm, null);
+    const ctx_third = try manager.add(&third, test_realm);
     try std.testing.expectEqual(ctx_first, ctx_third);
 
     try std.testing.expect(manager.get(&first) == null);
@@ -1248,7 +1243,7 @@ test "index table keeps probe chains intact after churn" {
     for (&conns, 0..) |*conn, i| {
         // 指针间隔 16 字节，散列后大量落在相邻桶里，正好压测探测链。
         conn.* = .{ .inner = @ptrFromInt(0x10000 + i * 16) };
-        _ = try manager.add(conn, test_realm, null);
+        _ = try manager.add(conn, test_realm);
     }
     try std.testing.expectEqual(@as(usize, capacity), manager.count());
 
@@ -1269,7 +1264,7 @@ test "index table keeps probe chains intact after churn" {
 
     // 槽位全部回收后可以重新填满。
     i = 0;
-    while (i < capacity) : (i += 2) _ = try manager.add(&conns[i], test_realm, null);
+    while (i < capacity) : (i += 2) _ = try manager.add(&conns[i], test_realm);
     try std.testing.expectEqual(@as(usize, capacity), manager.count());
 }
 
@@ -1291,9 +1286,9 @@ test "one dest_id addresses every connection bound to it" {
     var desktop = QUICConnection{ .inner = @ptrFromInt(0x2000) };
     var other = QUICConnection{ .inner = @ptrFromInt(0x3000) };
 
-    _ = try manager.add(&phone, test_realm, null);
-    _ = try manager.add(&desktop, test_realm, null);
-    _ = try manager.add(&other, test_realm, null);
+    _ = try manager.add(&phone, test_realm);
+    _ = try manager.add(&desktop, test_realm);
+    _ = try manager.add(&other, test_realm);
 
     manager.bindDest(handleOf(&manager, &phone), 42);
     manager.bindDest(handleOf(&manager, &desktop), 42);
@@ -1314,7 +1309,7 @@ test "dest_id 0 means not addressable and never enters the index" {
     defer manager.deinit();
 
     var conn = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    const ctx = try manager.add(&conn, test_realm, null);
+    const ctx = try manager.add(&conn, test_realm);
 
     manager.bindDest(ctx.session_handle, 0);
     try std.testing.expectEqual(@as(u64, 0), ctx.dest_id);
@@ -1331,9 +1326,9 @@ test "removing a connection unlinks it and keeps the rest of the chain reachable
     var b = QUICConnection{ .inner = @ptrFromInt(0x2000) };
     var c = QUICConnection{ .inner = @ptrFromInt(0x3000) };
 
-    _ = try manager.add(&a, test_realm, null);
-    _ = try manager.add(&b, test_realm, null);
-    _ = try manager.add(&c, test_realm, null);
+    _ = try manager.add(&a, test_realm);
+    _ = try manager.add(&b, test_realm);
+    _ = try manager.add(&c, test_realm);
     const a_handle = handleOf(&manager, &a);
     const b_handle = handleOf(&manager, &b);
     const c_handle = handleOf(&manager, &c);
@@ -1362,7 +1357,7 @@ test "the index entry disappears when its last connection goes away" {
     defer manager.deinit();
 
     var conn = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    _ = try manager.add(&conn, test_realm, null);
+    _ = try manager.add(&conn, test_realm);
     manager.bindDest(handleOf(&manager, &conn), 77);
     try std.testing.expectEqual(@as(usize, 1), manager.destCount(test_realm, 77));
 
@@ -1371,7 +1366,7 @@ test "the index entry disappears when its last connection goes away" {
 
     // 槽位复用之后也不能"复活"旧绑定。
     var reused = QUICConnection{ .inner = @ptrFromInt(0x4000) };
-    const ctx = try manager.add(&reused, test_realm, null);
+    const ctx = try manager.add(&reused, test_realm);
     try std.testing.expectEqual(@as(u64, 0), ctx.dest_id);
     try std.testing.expectEqual(@as(usize, 0), manager.destCount(test_realm, 77));
 }
@@ -1382,7 +1377,7 @@ test "rebinding moves a connection off its old dest_id" {
     defer manager.deinit();
 
     var conn = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    const ctx = try manager.add(&conn, test_realm, null);
+    const ctx = try manager.add(&conn, test_realm);
 
     manager.bindDest(ctx.session_handle, 1);
     manager.bindDest(ctx.session_handle, 2);
@@ -1403,7 +1398,7 @@ test "dest chains survive a churn that stresses the probe sequence" {
     var session_handles: [capacity]SessionHandle = undefined;
     for (&conns, 0..) |*conn, i| {
         conn.* = .{ .inner = @ptrFromInt(0x10000 + i * 16) };
-        _ = try manager.add(conn, test_realm, null);
+        _ = try manager.add(conn, test_realm);
         session_handles[i] = handleOf(&manager, conn);
         // 4 个标识，每个标识下 16 条连接。
         manager.bindDest(session_handles[i], @as(u64, i % 4) + 1);
@@ -1446,8 +1441,8 @@ test "the same dest_id in two realms addresses two different connections" {
     var in_a = QUICConnection{ .inner = @ptrFromInt(0x1000) };
     var in_b = QUICConnection{ .inner = @ptrFromInt(0x2000) };
 
-    _ = try manager.add(&in_a, realm_a, null);
-    _ = try manager.add(&in_b, realm_b, null);
+    _ = try manager.add(&in_a, realm_a);
+    _ = try manager.add(&in_b, realm_b);
 
     // 两条连接绑同一个 dest_id，但属于不同 realm。
     const in_a_handle = handleOf(&manager, &in_a);
@@ -1477,7 +1472,7 @@ test "a ConnToken locates exactly one connection and expires with its slot" {
     defer manager.deinit();
 
     var first = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    _ = try manager.add(&first, test_realm, null);
+    _ = try manager.add(&first, test_realm);
 
     const first_handle = handleOf(&manager, &first);
     const token = manager.tokenFor(first_handle).?;
@@ -1494,7 +1489,7 @@ test "a ConnToken locates exactly one connection and expires with its slot" {
 
     // 关键回归：槽位被复用后旧 token 不能命中新占用者，否则就是"踢错人"。
     var reused = QUICConnection{ .inner = @ptrFromInt(0x2000) };
-    _ = try manager.add(&reused, test_realm, null);
+    _ = try manager.add(&reused, test_realm);
     const reused_handle = handleOf(&manager, &reused);
     const fresh = manager.tokenFor(reused_handle).?;
     try std.testing.expectEqual(token.slot, fresh.slot);
@@ -1526,8 +1521,8 @@ test "a ConnToken from a previous process incarnation never locates a new connec
 
     var old_connection = QUICConnection{ .inner = @ptrFromInt(0x1000) };
     var new_connection = QUICConnection{ .inner = @ptrFromInt(0x2000) };
-    _ = try previous.add(&old_connection, test_realm, null);
-    _ = try current.add(&new_connection, test_realm, null);
+    _ = try previous.add(&old_connection, test_realm);
+    _ = try current.add(&new_connection, test_realm);
 
     const old_token = previous.tokenFor(handleOf(&previous, &old_connection)).?;
     const new_handle = handleOf(&current, &new_connection);
@@ -1575,21 +1570,47 @@ test "a noisy realm is refused before it starves the others" {
     var handles: [10]QUICConnection = undefined;
     for (&handles, 0..) |*handle, i| handle.* = .{ .inner = @ptrFromInt(0x1000 + i * 0x100) };
 
-    // realm 1 独占到水位线（10 × 70% = 7）之前不受限——空闲机器上的突发不该被拒。
+    const high: RealmId = 1024;
+    // 高编号是唯一活跃 realm 时，可超过水位线。留出一条尚未入组的连接。
     var taken: usize = 0;
-    while (taken < 7) : (taken += 1) _ = try manager.add(&handles[taken], 1, null);
+    while (taken < 8) : (taken += 1) _ = try manager.add(&handles[taken], high);
 
-    // realm 2 进来一条，活跃 realm 变 2，份额降到 5。realm 1 已占 7 > 5。
-    _ = try manager.add(&handles[7], 2, null);
+    // 7 条连接各占 8 个组播成员边，合计 56/80，恰好达到边池水位线。
+    for (handles[0..7]) |*conn| {
+        for (1..max_groups_per_connection + 1) |group_id| {
+            try manager.joinGroup(handleOf(&manager, conn), group_id);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 8), manager.conn_quota.count(high));
+    try std.testing.expectEqual(@as(u32, 56), manager.group_quota.count(high));
 
-    // 于是 realm 1 被拒——而且是 RealmQuotaExceeded，不是 TooManyConnections：
-    // 池里明明还有两个空位，运维必须能区分"整机满了"和"你超额了"。
+    // realm 2 进入后，连接份额降为 5，成员边份额降为 40。
+    const newcomer = try manager.add(&handles[8], 2);
+    try manager.joinGroup(newcomer.session_handle, 1);
+
+    // 两个池都还有空位：拒绝必须来自 realm 配额，不能被池满或单连接组数上限掩盖。
     try std.testing.expectError(
         ConnectionManager.Error.RealmQuotaExceeded,
-        manager.add(&handles[8], 1, null),
+        manager.add(&handles[9], high),
     );
-    // 而 realm 2 只占 1 格，远低于份额，照常放行。
-    _ = try manager.add(&handles[8], 2, null);
+    try std.testing.expectError(
+        ConnectionManager.Error.RealmQuotaExceeded,
+        manager.joinGroup(handleOf(&manager, &handles[7]), 1),
+    );
+    try std.testing.expectEqual(@as(usize, 9), manager.count());
+    try std.testing.expectEqual(@as(usize, 57), manager.group_quota.total);
+    _ = try manager.add(&handles[9], 2);
+    try manager.joinGroup(newcomer.session_handle, 2);
+
+    // 连接关闭同时归还会话与成员边，包括高编号的所有占用。
+    for (&handles) |*conn| manager.remove(conn);
+    try std.testing.expectEqual(@as(usize, 0), manager.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.conn_quota.total);
+    try std.testing.expectEqual(@as(usize, 0), manager.group_quota.total);
+    try std.testing.expectEqual(@as(usize, 0), manager.conn_quota.active_realms);
+    try std.testing.expectEqual(@as(usize, 0), manager.group_quota.active_realms);
+    try std.testing.expectEqual(@as(u32, 0), manager.conn_quota.count(high));
+    try std.testing.expectEqual(@as(u32, 0), manager.group_quota.count(high));
 }
 
 test "quota counters return to zero after a churn cycle" {
@@ -1603,7 +1624,7 @@ test "quota counters return to zero after a churn cycle" {
         var conns: [4]QUICConnection = undefined;
         for (&conns, 0..) |*conn, i| {
             conn.* = .{ .inner = @ptrFromInt(0x1000 + i * 0x100) };
-            _ = try manager.add(conn, @intCast(i + 1), null);
+            _ = try manager.add(conn, @intCast(i + 1));
             // 顺手也占几条组播成员边，一起验证它们的归还。
             const handle = handleOf(&manager, conn);
             try manager.joinGroup(handle, 100 + i);
@@ -1626,8 +1647,8 @@ test "a connection can belong to several groups and a group to several connectio
 
     var phone = QUICConnection{ .inner = @ptrFromInt(0x1000) };
     var desktop = QUICConnection{ .inner = @ptrFromInt(0x2000) };
-    _ = try manager.add(&phone, test_realm, null);
-    _ = try manager.add(&desktop, test_realm, null);
+    _ = try manager.add(&phone, test_realm);
+    _ = try manager.add(&desktop, test_realm);
 
     // 一条连接进两个组（一个协作文档 + 一个游戏房间），一个组有两条连接。
     const phone_handle = handleOf(&manager, &phone);
@@ -1659,7 +1680,7 @@ test "closing a connection leaves every group it was in" {
     defer manager.deinit();
 
     var conn = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    _ = try manager.add(&conn, test_realm, null);
+    _ = try manager.add(&conn, test_realm);
     const handle = handleOf(&manager, &conn);
     try manager.joinGroup(handle, 1);
     try manager.joinGroup(handle, 2);
@@ -1672,7 +1693,7 @@ test "closing a connection leaves every group it was in" {
 
     // 边池必须真的还回来了，否则连接反复建立/关闭会把它耗干。
     var again = QUICConnection{ .inner = @ptrFromInt(0x3000) };
-    _ = try manager.add(&again, test_realm, null);
+    _ = try manager.add(&again, test_realm);
     var i: u64 = 0;
     const again_handle = handleOf(&manager, &again);
     while (i < max_groups_per_connection) : (i += 1) try manager.joinGroup(again_handle, i + 1);
@@ -1686,8 +1707,8 @@ test "groups are isolated per realm" {
 
     var in_a = QUICConnection{ .inner = @ptrFromInt(0x1000) };
     var in_b = QUICConnection{ .inner = @ptrFromInt(0x2000) };
-    _ = try manager.add(&in_a, 7, null);
-    _ = try manager.add(&in_b, 9, null);
+    _ = try manager.add(&in_a, 7);
+    _ = try manager.add(&in_b, 9);
 
     const in_a_handle = handleOf(&manager, &in_a);
     const in_b_handle = handleOf(&manager, &in_b);
@@ -1707,7 +1728,7 @@ test "the membership edge pool has a hard ceiling per connection" {
     defer manager.deinit();
 
     var conn = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    _ = try manager.add(&conn, test_realm, null);
+    _ = try manager.add(&conn, test_realm);
 
     var i: u64 = 0;
     const handle = handleOf(&manager, &conn);
@@ -1727,8 +1748,8 @@ test "group membership is queryable per connection, and scoped by realm" {
 
     var mine = QUICConnection{ .inner = @ptrFromInt(0x1000) };
     var theirs = QUICConnection{ .inner = @ptrFromInt(0x2000) };
-    _ = try manager.add(&mine, test_realm, null);
-    _ = try manager.add(&theirs, test_realm + 1, null);
+    _ = try manager.add(&mine, test_realm);
+    _ = try manager.add(&theirs, test_realm + 1);
 
     const mine_handle = handleOf(&manager, &mine);
     const theirs_handle = handleOf(&manager, &theirs);
@@ -1751,7 +1772,7 @@ test "the datagram channel table maps both ways and is cleared on revocation" {
     defer manager.deinit();
 
     var conn = QUICConnection{ .inner = @ptrFromInt(0x1000) };
-    const ctx = try manager.add(&conn, test_realm, null);
+    const ctx = try manager.add(&conn, test_realm);
 
     ctx.bindChannel(0, 100);
     ctx.bindChannel(3, 200);

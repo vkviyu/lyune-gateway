@@ -135,7 +135,6 @@ fn RingQueue(comptime T: type) type {
                 .items = items,
                 .quota = if (tracks_realm) try foundation.quota.Quota.init(
                     allocator,
-                    foundation.quota.max_tracked_realms,
                     capacity,
                     foundation.quota.default_watermark_percent,
                 ) else {},
@@ -472,14 +471,16 @@ test "a realm over its share is refused while the queue still has room" {
     var router = try MessageRouter.init(std.testing.io, std.testing.allocator, 1, 10);
     defer router.deinit();
 
-    // 水位线（70%）以下无条件放行：realm 1 先积到 7 条，此刻只有它活跃，份额 = 全队列。
+    const high: foundation.realm.RealmId = std.math.maxInt(foundation.realm.RealmId);
+    // 高编号 realm 先积到水位线，此刻只有它活跃，份额 = 全队列。
     var i: usize = 0;
-    while (i < 7) : (i += 1) try router.deliver(0, "storm", 1, 0);
+    while (i < 7) : (i += 1) try router.deliver(0, "storm", high, 0);
+    try std.testing.expectEqual(@as(u32, 7), router.queues[0].quota.count(high));
 
     // realm 2 进来，活跃变 2，份额腰斩到 5。
     try router.deliver(0, "quiet", 2, 0);
-    // realm 1 已占 7 > 5 → 被拒，尽管队列还有 2 个空位。
-    try std.testing.expectError(error.RealmOverShare, router.deliver(0, "storm", 1, 0));
+    // 高编号 realm 已占 7 > 5 → 被拒，尽管队列还有 2 个空位。
+    try std.testing.expectError(error.RealmOverShare, router.deliver(0, "storm", high, 0));
     // realm 2 只占 1，照常放行。
     try router.deliver(0, "quiet", 2, 0);
 
@@ -488,6 +489,7 @@ test "a realm over its share is refused while the queue still has room" {
     while (router.pop(0)) |_| {}
     try std.testing.expectEqual(@as(usize, 0), router.queues[0].quota.total);
     try std.testing.expectEqual(@as(usize, 0), router.queues[0].quota.active_realms);
+    try std.testing.expectEqual(@as(u32, 0), router.queues[0].quota.count(high));
 }
 
 test "bounded packet queue preserves FIFO and rejects overflow" {

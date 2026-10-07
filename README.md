@@ -59,9 +59,10 @@ cluster side paths:
 
 ## 构建与测试
 
-最低 Zig 版本为 `0.16.0`。依赖由 `build.zig.zon`、`build/` 和 `libs/` 管理。
+审计基线固定使用 Zig `0.16.0`（见 `.zigversion`）；暂缓 0.17 迁移。依赖由 `build.zig.zon`、`build/` 和 `libs/` 管理。
 
 ```bash
+zvm use 0.16.0
 zig build
 zig build test --summary all
 zig build -Doptimize=ReleaseSafe
@@ -73,12 +74,13 @@ zig build -Doptimize=ReleaseSafe
 zig build test -Denable-integration-tests=true --summary all
 ```
 
-当前验证结果：
+当前代码回归结果（Zig 0.16.0，2026-10-08）：
 
-- `zig fmt --check build.zig src` 通过；
-- 默认测试 285 个：284 通过、1 跳过；
-- Reactor 与 client-agent 的 Go 测试通过，React 生产构建通过；
+- `zig fmt --check build.zig build.zig.zon build/boringssl src` 通过；
+- Debug 与 ReleaseSafe 默认测试均为 288 个：287 通过、1 跳过；
 - `ReleaseSafe` 构建 9/9 步通过。
+
+此前 Mac 验证中的 Reactor 与 client-agent Go 测试、React 生产构建均通过；运行记录见 [两阶段真实环境验证](docs/validation.md)。
 
 这些结果覆盖单元测试、确定性模拟和部分 loopback UDP 测试，但不能替代 Linux 内核 cBPF、多网关进程和长时间网络故障测试。
 
