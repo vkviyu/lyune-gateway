@@ -1,0 +1,7 @@
+{
+  "listen": "127.0.0.1:8787",
+  "gateway_address": "120.53.107.49:8443",
+  "server_name": "localhost",
+  "insecure_skip_verify": true,
+  "allowed_origins": ["http://127.0.0.1:5173", "http://localhost:5173"]
+}

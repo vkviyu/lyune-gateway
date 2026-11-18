@@ -8,7 +8,19 @@
 - `/api/im/*`：真实用户认证、独立会话、群命令和后端 `.peer` 推送。应用 token 只保存在 agent 内存，浏览器只持有随机 session id。
 
 ```bash
-go run . --listen 127.0.0.1:8787
+go run . --config config/client-agent.json
 ```
 
-它只应监听 loopback，不是远程管理 API，也不是生产客户端 SDK。完整启动顺序与验收记录见 `../../docs/validation.md`。
+默认配置让 agent 监听 `127.0.0.1:8787` 并连接本机 Gateway。测试云服务器时，复制并修改 `config/client-agent.json`：
+
+```json
+{
+  "listen": "127.0.0.1:8787",
+  "gateway_address": "你的云 Gateway 公网地址:8443",
+  "server_name": "证书中的域名",
+  "insecure_skip_verify": false,
+  "allowed_origins": ["http://127.0.0.1:5173", "http://localhost:5173"]
+}
+```
+
+`gateway_address` 是 Gateway 的 UDP/QUIC 地址，`server_name` 必须匹配 Gateway 证书的 SAN。只有开发自签名证书无法在本机信任时才使用 `insecure_skip_verify: true`。agent 只应监听 loopback，不是远程管理 API，也不是生产客户端 SDK。

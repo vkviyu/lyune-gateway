@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	agentconfig "github.com/vkviyu/lyune-gateway/validation/client-agent/internal/config"
 	"github.com/vkviyu/lyune-gateway/validation/client-agent/internal/wire"
 )
 
@@ -23,6 +24,7 @@ type Agent struct {
 	target      string
 	serverName  string
 	connectedAt time.Time
+	config      agentconfig.Config
 	imMu        sync.RWMutex
 	imSessions  map[string]*imSession
 }
@@ -88,10 +90,14 @@ type exchangeResponse struct {
 }
 
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8787", "HTTP listen address for the validation UI")
+	configPath := flag.String("config", "config/client-agent.json", "client-agent JSON configuration file")
 	flag.Parse()
 
-	agent := &Agent{}
+	config, err := agentconfig.Load(*configPath)
+	if err != nil {
+		log.Fatalf("load config %q: %v", *configPath, err)
+	}
+	agent := &Agent{config: config}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", agent.handleStatus)
 	mux.HandleFunc("/api/connect", agent.handleConnect)
@@ -109,11 +115,11 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:              *listen,
-		Handler:           localCORS(mux),
+		Addr:              config.Listen,
+		Handler:           localCORS(mux, config.AllowedOrigins),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Printf("Lyune validation client-agent listening on http://%s", *listen)
+	log.Printf("Lyune validation client-agent listening on http://%s gateway=%s server_name=%s", config.Listen, config.GatewayAddress, config.ServerName)
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -138,10 +144,13 @@ func (a *Agent) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if request.Address == "" {
-		request.Address = "127.0.0.1:8443"
+		request.Address = a.config.GatewayAddress
 	}
 	if request.ServerName == "" {
-		request.ServerName = "localhost"
+		request.ServerName = a.config.ServerName
+	}
+	if !request.InsecureSkipVerify {
+		request.InsecureSkipVerify = a.config.InsecureSkipVerify
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
@@ -531,14 +540,18 @@ func methodNotAllowed(w http.ResponseWriter) {
 	writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 }
 
-func localCORS(next http.Handler) http.Handler {
+func localCORS(next http.Handler, allowedOrigins []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "http://127.0.0.1:5173" || origin == "http://localhost:5173" {
+		for _, allowed := range allowedOrigins {
+			if origin != allowed {
+				continue
+			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			break
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

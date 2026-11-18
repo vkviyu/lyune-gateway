@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	agentconfig "github.com/vkviyu/lyune-gateway/validation/client-agent/internal/config"
 )
 
 type config struct {
@@ -137,9 +139,10 @@ type summary struct {
 
 func main() {
 	var cfg config
+	configPath := flag.String("config", "config/client-agent.json", "client-agent JSON configuration file")
 	flag.StringVar(&cfg.agentURL, "agent", "http://127.0.0.1:8787", "validation client-agent base URL")
-	flag.StringVar(&cfg.gateway, "gateway", "127.0.0.1:8443", "Gateway QUIC address")
-	flag.StringVar(&cfg.serverName, "server-name", "localhost", "Gateway TLS server name")
+	flag.StringVar(&cfg.gateway, "gateway", "", "override Gateway QUIC address")
+	flag.StringVar(&cfg.serverName, "server-name", "", "override Gateway TLS server name")
 	flag.StringVar(&cfg.prefix, "prefix", fmt.Sprintf("m15-%d", time.Now().Unix()), "unique database scenario prefix")
 	flag.StringVar(&cfg.password, "password", "M15-valid-password-2026", "password for disposable validation users")
 	flag.IntVar(&cfg.users, "users", 8, "number of distinct real users and QUIC sessions")
@@ -148,6 +151,16 @@ func main() {
 	flag.IntVar(&cfg.queries, "queries", 32, "required history/presence queries")
 	flag.Parse()
 
+	agentConfig, err := agentconfig.Load(*configPath)
+	if err != nil {
+		fatal(err)
+	}
+	if cfg.gateway == "" {
+		cfg.gateway = agentConfig.GatewayAddress
+	}
+	if cfg.serverName == "" {
+		cfg.serverName = agentConfig.ServerName
+	}
 	if cfg.users < 2 || cfg.users > 32 || cfg.messages < 1 || cfg.messages > 100 || cfg.typings < 1 || cfg.queries < 1 {
 		fatal(errors.New("users must be 2-32, messages 1-100, and typings/queries positive"))
 	}

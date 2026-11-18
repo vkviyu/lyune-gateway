@@ -2,14 +2,27 @@
 
 这是两阶段真实环境验证使用的轻量 React/Vite IM 客户端，不依赖 `liky`。它不是展示固定测试数据的控制台：页面可以注册/登录真实用户、创建群、凭邀请码加入、读取 SQLite 历史并让两个独立浏览器会话实时互发消息。
 
-页面提供两条真实传输路径：默认由浏览器原生 `WebSocket` 直接连接 Gateway 的 `wss://localhost:8444/lyune/v2`；切换到 Raw QUIC 后，页面通过 `/api` 控制相邻的 `validation/client-agent` 建立独立 `lyune/2` QUIC 连接。两条路径都经同一个 Gateway Worker 到 Reactor 完成 auth 和 `.service(1,2)` 命令，并接收 Reactor 主动发出的 `.peer` 流。完整拓扑、启动顺序和判定标准见 `../../docs/validation.md`。
+页面提供两条真实传输路径：WSS 配置由 `config/web-client.json` 提供，浏览器原生 `WebSocket` 直接连接 Gateway；切换到 Raw QUIC 后，页面通过 `/api` 控制相邻的 `validation/client-agent` 建立独立 `lyune/2` QUIC 连接。Raw QUIC 的 Gateway 地址、TLS SNI 和证书校验策略统一由 `client-agent/config/client-agent.json` 提供，web-client 只发送认证和业务数据。两条路径都经同一个 Gateway Worker 到 Reactor 完成 auth 和 `.service(1,2)` 命令，并接收 Reactor 主动发出的 `.peer` 流。完整拓扑、启动顺序和判定标准见 `../../docs/validation.md`。
 
 ```bash
 npm install
 npm run dev
 ```
 
-开发服务器监听 `127.0.0.1:5173`，并把 `/api` 代理到 `127.0.0.1:8787`。
+开发服务器监听 `127.0.0.1:5173`，并把 `/api` 代理到本地 `client-agent`。`client-agent` 的监听地址由它自己的 JSON 配置控制；如果不是 `127.0.0.1:8787`，同步修改 `vite.config.ts` 中的代理目标。`client_agent_base_url` 留空表示使用这个 Vite 代理；前端 API 路径已经包含 `/api`，不要把它配置成 `/api`。
+
+测试云服务器时，复制并修改 `config/web-client.json`：
+
+```json
+{
+  "wss_url": "wss://你的云 Gateway 域名:8444/lyune/v2",
+  "client_agent_base_url": ""
+}
+```
+
+同时修改相邻 `validation/client-agent/config/client-agent.json` 中的
+`gateway_address`、`server_name` 和 `insecure_skip_verify`。Raw QUIC 的连接参数只在
+client-agent 配置中维护一份。
 
 WSS 使用项目根目录的自签名开发证书。它已包含 `localhost` 和 `127.0.0.1` SAN，但浏览器仍要求用户显式信任。macOS 首次运行时：
 

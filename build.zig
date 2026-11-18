@@ -375,7 +375,8 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addCSourceFile(.{
         .file = b.path("src/io/reuseport.c"),
-        .flags = &.{"-std=c11"},
+        // SO_ATTACH_REUSEPORT_CBPF 是 glibc 的 GNU 扩展，严格 -std=c11 下不可见。
+        .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
     });
     exe.root_module.addCSourceFile(.{
         .file = b.path("src/wss/tls_shim.c"),

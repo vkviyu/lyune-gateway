@@ -1,508 +1,828 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { WssImSession, type WssPushEvent } from './wss_session'
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { WssImSession, type WssPushEvent } from "./wss_session";
+import { config } from "./config";
 
-type User = { id: number; username: string }
-type Group = { id: number; name: string; invite_code: string; owner_id: number; joined_at?: string }
-type Message = { id: number; group_id: number; sender: User; text: string; created_at: string }
-type Presence = { user: User; online: boolean; online_sessions: number }
+type User = { id: number; username: string };
+type Group = {
+  id: number;
+  name: string;
+  invite_code: string;
+  owner_id: number;
+  joined_at?: string;
+};
+type Message = {
+  id: number;
+  group_id: number;
+  sender: User;
+  text: string;
+  created_at: string;
+};
+type Presence = { user: User; online: boolean; online_sessions: number };
 
 type SessionStatus = {
-  session_id: string
-  connected: boolean
-  authenticated: boolean
-  target?: string
-  alpn?: string
-  local_address?: string
-  remote_address?: string
-  connected_at?: string
-  dest_id?: number
-  admission_ttl_seconds?: number
-  user?: User
-  connection_closed_by?: string
-}
+  session_id: string;
+  connected: boolean;
+  authenticated: boolean;
+  target?: string;
+  alpn?: string;
+  local_address?: string;
+  remote_address?: string;
+  connected_at?: string;
+  dest_id?: number;
+  admission_ttl_seconds?: number;
+  user?: User;
+  connection_closed_by?: string;
+};
 
 type CommandResponse = {
-  ok: boolean
-  type: string
-  error?: string
-  user?: User
-  group?: Group
-  groups?: Group[]
-  message?: Message
-  messages?: Message[]
-  presence?: Presence[]
-  group_id?: number
-}
+  ok: boolean;
+  type: string;
+  error?: string;
+  user?: User;
+  group?: Group;
+  groups?: Group[];
+  message?: Message;
+  messages?: Message[];
+  presence?: Presence[];
+  group_id?: number;
+};
 
 type PushEvent = {
-  seq: number
-  received_at: string
-  targets: number[]
-  payload: CommandResponse
-}
+  seq: number;
+  received_at: string;
+  targets: number[];
+  payload: CommandResponse;
+};
 
-type TransportMode = 'wss' | 'raw-quic'
+type TransportMode = "wss" | "raw-quic";
 
-const sessionKey = 'lyune-im-session-id'
-const sessionTransportKey = 'lyune-im-session-transport'
+const sessionKey = "lyune-im-session-id";
+const sessionTransportKey = "lyune-im-session-transport";
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(`${config.clientAgentBaseURL}${path}`, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-  })
-  const payload = await response.json()
-  if (!response.ok) throw new Error(payload.error ?? `HTTP ${response.status}`)
-  return payload as T
+    headers: { "Content-Type": "application/json", ...init?.headers },
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error ?? `HTTP ${response.status}`);
+  return payload as T;
 }
 
 function mergeMessages(current: Message[], incoming: Message[]) {
-  const byID = new Map(current.map((message) => [message.id, message]))
-  for (const message of incoming) byID.set(message.id, message)
-  return [...byID.values()].sort((left, right) => left.id - right.id)
+  const byID = new Map(current.map((message) => [message.id, message]));
+  for (const message of incoming) byID.set(message.id, message);
+  return [...byID.values()].sort((left, right) => left.id - right.id);
 }
 
 function timeLabel(value: string) {
-  return new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  return new Date(value).toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 function App() {
-  const [session, setSession] = useState<SessionStatus | null>(null)
-  const [groups, setGroups] = useState<Group[]>([])
-  const [activeGroupID, setActiveGroupID] = useState<number | null>(null)
-  const [messages, setMessages] = useState<Message[]>([])
-  const [presence, setPresence] = useState<Presence[]>([])
-  const [typingUsers, setTypingUsers] = useState<User[]>([])
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [transportMode, setTransportMode] = useState<TransportMode>('wss')
-  const [address, setAddress] = useState('127.0.0.1:8443')
-  const [wssURL, setWssURL] = useState('wss://localhost:8444/lyune/v2')
-  const [serverName, setServerName] = useState('localhost')
-  const [authMode, setAuthMode] = useState<'login' | 'register'>('register')
-  const [groupName, setGroupName] = useState('Lyune 实验群')
-  const [inviteCode, setInviteCode] = useState('')
-  const [draft, setDraft] = useState('')
-  const [busy, setBusy] = useState<string | null>(null)
-  const [notice, setNotice] = useState<{ tone: 'ok' | 'error' | 'info'; text: string } | null>(null)
-  const [pushState, setPushState] = useState<'idle' | 'listening' | 'retrying'>('idle')
-  const lastEventSeq = useRef(0)
-  const chatEnd = useRef<HTMLDivElement | null>(null)
-  const lastTypingSentAt = useRef(0)
-  const wssSession = useRef<WssImSession | null>(null)
+  const [session, setSession] = useState<SessionStatus | null>(null);
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [activeGroupID, setActiveGroupID] = useState<number | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [presence, setPresence] = useState<Presence[]>([]);
+  const [typingUsers, setTypingUsers] = useState<User[]>([]);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [transportMode, setTransportMode] = useState<TransportMode>("wss");
+  const [wssURL, setWssURL] = useState(config.wssURL);
+  const [authMode, setAuthMode] = useState<"login" | "register">("register");
+  const [groupName, setGroupName] = useState("Lyune 实验群");
+  const [inviteCode, setInviteCode] = useState("");
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{
+    tone: "ok" | "error" | "info";
+    text: string;
+  } | null>(null);
+  const [pushState, setPushState] = useState<"idle" | "listening" | "retrying">(
+    "idle",
+  );
+  const lastEventSeq = useRef(0);
+  const chatEnd = useRef<HTMLDivElement | null>(null);
+  const lastTypingSentAt = useRef(0);
+  const wssSession = useRef<WssImSession | null>(null);
 
   const activeGroup = useMemo(
     () => groups.find((group) => group.id === activeGroupID) ?? null,
     [groups, activeGroupID],
-  )
+  );
 
-  const command = useCallback(async (body: Omit<Record<string, unknown>, 'session_id'>) => {
-    if (!session?.session_id) throw new Error('当前没有已认证会话')
-    if (transportMode === 'wss') {
-      const active = wssSession.current
-      if (!active) throw new Error('WSS 会话已经关闭')
-      return active.command(body) as Promise<CommandResponse>
-    }
-    const result = await api<CommandResponse>('/api/im/command', {
-      method: 'POST', body: JSON.stringify({ session_id: session.session_id, ...body }),
-    })
-    if (!result.ok) throw new Error(result.error ?? '后端拒绝了请求')
-    return result
-  }, [session?.session_id, transportMode])
+  const command = useCallback(
+    async (body: Omit<Record<string, unknown>, "session_id">) => {
+      if (!session?.session_id) throw new Error("当前没有已认证会话");
+      if (transportMode === "wss") {
+        const active = wssSession.current;
+        if (!active) throw new Error("WSS 会话已经关闭");
+        return active.command(body) as Promise<CommandResponse>;
+      }
+      const result = await api<CommandResponse>("/api/im/command", {
+        method: "POST",
+        body: JSON.stringify({ session_id: session.session_id, ...body }),
+      });
+      if (!result.ok) throw new Error(result.error ?? "后端拒绝了请求");
+      return result;
+    },
+    [session?.session_id, transportMode],
+  );
 
   const refreshGroups = useCallback(async () => {
-    const result = await command({ type: 'list_groups' })
-    setGroups(result.groups ?? [])
-    return result.groups ?? []
-  }, [command])
+    const result = await command({ type: "list_groups" });
+    setGroups(result.groups ?? []);
+    return result.groups ?? [];
+  }, [command]);
 
-  const openGroup = useCallback(async (groupID: number) => {
-    setBusy('history')
-    try {
-      const [result, presenceResult] = await Promise.all([
-        command({ type: 'history', group_id: groupID }),
-        command({ type: 'presence', group_id: groupID }),
-      ])
-      setActiveGroupID(groupID)
-      setMessages(result.messages ?? [])
-      setPresence(presenceResult.presence ?? [])
-      setTypingUsers([])
-      setNotice(null)
-    } catch (error) {
-      setNotice({ tone: 'error', text: error instanceof Error ? error.message : String(error) })
-    } finally {
-      setBusy(null)
-    }
-  }, [command])
+  const openGroup = useCallback(
+    async (groupID: number) => {
+      setBusy("history");
+      try {
+        const [result, presenceResult] = await Promise.all([
+          command({ type: "history", group_id: groupID }),
+          command({ type: "presence", group_id: groupID }),
+        ]);
+        setActiveGroupID(groupID);
+        setMessages(result.messages ?? []);
+        setPresence(presenceResult.presence ?? []);
+        setTypingUsers([]);
+        setNotice(null);
+      } catch (error) {
+        setNotice({
+          tone: "error",
+          text: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        setBusy(null);
+      }
+    },
+    [command],
+  );
 
   useEffect(() => {
-    const saved = sessionStorage.getItem(sessionKey)
-    if (!saved || sessionStorage.getItem(sessionTransportKey) !== 'raw-quic') return
-    setTransportMode('raw-quic')
-    void api<SessionStatus>(`/api/im/status?session_id=${encodeURIComponent(saved)}`)
+    const saved = sessionStorage.getItem(sessionKey);
+    if (!saved || sessionStorage.getItem(sessionTransportKey) !== "raw-quic")
+      return;
+    setTransportMode("raw-quic");
+    void api<SessionStatus>(
+      `/api/im/status?session_id=${encodeURIComponent(saved)}`,
+    )
       .then((status) => {
-        if (!status.connected || !status.authenticated) throw new Error('saved session is no longer active')
-        setSession(status)
+        if (!status.connected || !status.authenticated)
+          throw new Error("saved session is no longer active");
+        setSession(status);
       })
       .catch(() => {
-        sessionStorage.removeItem(sessionKey)
-        sessionStorage.removeItem(sessionTransportKey)
-      })
-  }, [])
+        sessionStorage.removeItem(sessionKey);
+        sessionStorage.removeItem(sessionTransportKey);
+      });
+  }, []);
 
-  useEffect(() => () => {
-    wssSession.current?.close()
-    wssSession.current = null
-  }, [])
+  useEffect(
+    () => () => {
+      wssSession.current?.close();
+      wssSession.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
-    if (!session?.authenticated) return
-    void refreshGroups().catch((error) => setNotice({ tone: 'error', text: String(error) }))
-  }, [session?.authenticated, refreshGroups])
+    if (!session?.authenticated) return;
+    void refreshGroups().catch((error) =>
+      setNotice({ tone: "error", text: String(error) }),
+    );
+  }, [session?.authenticated, refreshGroups]);
 
-  const applyPush = useCallback((event: PushEvent) => {
-    lastEventSeq.current = Math.max(lastEventSeq.current, event.seq)
-    const message = event.payload.message
-    if (event.payload.type === 'message' && message) {
-      setMessages((current) => message.group_id === activeGroupID ? mergeMessages(current, [message]) : current)
-      if (message.sender.id !== session?.user?.id) {
-        setNotice({ tone: 'info', text: `${message.sender.username} 发来一条新消息` })
+  const applyPush = useCallback(
+    (event: PushEvent) => {
+      lastEventSeq.current = Math.max(lastEventSeq.current, event.seq);
+      const message = event.payload.message;
+      if (event.payload.type === "message" && message) {
+        setMessages((current) =>
+          message.group_id === activeGroupID
+            ? mergeMessages(current, [message])
+            : current,
+        );
+        if (message.sender.id !== session?.user?.id) {
+          setNotice({
+            tone: "info",
+            text: `${message.sender.username} 发来一条新消息`,
+          });
+        }
       }
-    }
-    if (event.payload.type === 'typing' && event.payload.user && event.payload.group_id === activeGroupID && event.payload.user.id !== session?.user?.id) {
-      const typingUser = event.payload.user
-      setTypingUsers((current) => [...current.filter((user) => user.id !== typingUser.id), typingUser])
-      window.setTimeout(() => {
-        setTypingUsers((current) => current.filter((user) => user.id !== typingUser.id))
-      }, 2200)
-    }
-  }, [activeGroupID, session?.user?.id])
+      if (
+        event.payload.type === "typing" &&
+        event.payload.user &&
+        event.payload.group_id === activeGroupID &&
+        event.payload.user.id !== session?.user?.id
+      ) {
+        const typingUser = event.payload.user;
+        setTypingUsers((current) => [
+          ...current.filter((user) => user.id !== typingUser.id),
+          typingUser,
+        ]);
+        window.setTimeout(() => {
+          setTypingUsers((current) =>
+            current.filter((user) => user.id !== typingUser.id),
+          );
+        }, 2200);
+      }
+    },
+    [activeGroupID, session?.user?.id],
+  );
 
   useEffect(() => {
-    if (!session?.session_id || !session.authenticated) return
-    if (transportMode === 'wss') {
-      const active = wssSession.current
-      if (!active) return
-      setPushState('listening')
-      active.onPush = (event: WssPushEvent) => applyPush(event as unknown as PushEvent)
+    if (!session?.session_id || !session.authenticated) return;
+    if (transportMode === "wss") {
+      const active = wssSession.current;
+      if (!active) return;
+      setPushState("listening");
+      active.onPush = (event: WssPushEvent) =>
+        applyPush(event as unknown as PushEvent);
       active.onClose = (reason) => {
-        setPushState('retrying')
-        setNotice({ tone: 'error', text: reason })
-        setSession((current) => current ? { ...current, connected: false, connection_closed_by: reason } : current)
-      }
+        setPushState("retrying");
+        setNotice({ tone: "error", text: reason });
+        setSession((current) =>
+          current
+            ? { ...current, connected: false, connection_closed_by: reason }
+            : current,
+        );
+      };
       return () => {
-        active.onPush = null
-        active.onClose = null
-      }
+        active.onPush = null;
+        active.onClose = null;
+      };
     }
 
-    const controller = new AbortController()
-    let stopped = false
+    const controller = new AbortController();
+    let stopped = false;
     const listen = async () => {
-      setPushState('listening')
+      setPushState("listening");
       while (!stopped) {
         try {
           const result = await api<{ events: PushEvent[] }>(
             `/api/im/events?session_id=${encodeURIComponent(session.session_id)}&after=${lastEventSeq.current}&timeout_ms=25000`,
             { signal: controller.signal },
-          )
-          setPushState('listening')
-          for (const event of result.events) applyPush(event)
+          );
+          setPushState("listening");
+          for (const event of result.events) applyPush(event);
         } catch {
-          if (controller.signal.aborted) return
-          setPushState('retrying')
-          await new Promise((resolve) => window.setTimeout(resolve, 800))
+          if (controller.signal.aborted) return;
+          setPushState("retrying");
+          await new Promise((resolve) => window.setTimeout(resolve, 800));
         }
       }
-    }
-    void listen()
+    };
+    void listen();
     return () => {
-      stopped = true
-      controller.abort()
-    }
-  }, [session?.session_id, session?.authenticated, transportMode, applyPush])
+      stopped = true;
+      controller.abort();
+    };
+  }, [session?.session_id, session?.authenticated, transportMode, applyPush]);
 
   useEffect(() => {
-    if (!activeGroupID || !session?.authenticated) return
-    let stopped = false
+    if (!activeGroupID || !session?.authenticated) return;
+    let stopped = false;
     const refresh = async () => {
       try {
-        const result = await command({ type: 'presence', group_id: activeGroupID })
-        if (!stopped) setPresence(result.presence ?? [])
+        const result = await command({
+          type: "presence",
+          group_id: activeGroupID,
+        });
+        if (!stopped) setPresence(result.presence ?? []);
       } catch {
         // Presence is supplementary UI state; command and push failures remain visible elsewhere.
       }
-    }
-    const timer = window.setInterval(() => void refresh(), 5000)
-    void refresh()
-    return () => { stopped = true; window.clearInterval(timer) }
-  }, [activeGroupID, session?.authenticated, command])
+    };
+    const timer = window.setInterval(() => void refresh(), 5000);
+    void refresh();
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [activeGroupID, session?.authenticated, command]);
 
   useEffect(() => {
-    if (!draft.trim() || !activeGroupID || !session?.authenticated) return
+    if (!draft.trim() || !activeGroupID || !session?.authenticated) return;
     const timer = window.setTimeout(() => {
-      const now = Date.now()
-      if (now - lastTypingSentAt.current < 1200) return
-      lastTypingSentAt.current = now
-      void command({ type: 'typing', group_id: activeGroupID }).catch(() => undefined)
-    }, 220)
-    return () => window.clearTimeout(timer)
-  }, [draft, activeGroupID, session?.authenticated, command])
+      const now = Date.now();
+      if (now - lastTypingSentAt.current < 1200) return;
+      lastTypingSentAt.current = now;
+      void command({ type: "typing", group_id: activeGroupID }).catch(
+        () => undefined,
+      );
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [draft, activeGroupID, session?.authenticated, command]);
 
   useEffect(() => {
-    chatEnd.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+    chatEnd.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   const authenticate = async (event: FormEvent) => {
-    event.preventDefault()
-    setBusy('auth')
-    setNotice(null)
+    event.preventDefault();
+    setBusy("auth");
+    setNotice(null);
     try {
-      let status: SessionStatus
-      if (transportMode === 'wss') {
-        wssSession.current?.close()
-        const direct = await WssImSession.connect(wssURL)
+      let status: SessionStatus;
+      if (transportMode === "wss") {
+        wssSession.current?.close();
+        const direct = await WssImSession.connect(wssURL);
         try {
-          status = await direct.authenticate(authMode, username, password) as SessionStatus
-          wssSession.current = direct
+          status = (await direct.authenticate(
+            authMode,
+            username,
+            password,
+          )) as SessionStatus;
+          wssSession.current = direct;
         } catch (error) {
-          direct.close()
-          throw error
+          direct.close();
+          throw error;
         }
       } else {
-        status = await api<SessionStatus>('/api/im/auth', {
-          method: 'POST',
+        status = await api<SessionStatus>("/api/im/auth", {
+          method: "POST",
           body: JSON.stringify({
-            action: authMode, username, password, address, server_name: serverName,
-            insecure_skip_verify: true,
+            action: authMode,
+            username,
+            password,
           }),
-        })
+        });
       }
-      sessionStorage.setItem(sessionKey, status.session_id)
-      sessionStorage.setItem(sessionTransportKey, transportMode)
-      lastEventSeq.current = 0
-      setSession(status)
-      setPassword('')
-      setNotice({ tone: 'ok', text: `${authMode === 'register' ? '注册并登录' : '登录'}成功，后端授予 dest_id ${status.dest_id}` })
+      sessionStorage.setItem(sessionKey, status.session_id);
+      sessionStorage.setItem(sessionTransportKey, transportMode);
+      lastEventSeq.current = 0;
+      setSession(status);
+      setPassword("");
+      setNotice({
+        tone: "ok",
+        text: `${authMode === "register" ? "注册并登录" : "登录"}成功，后端授予 dest_id ${status.dest_id}`,
+      });
     } catch (error) {
-      setNotice({ tone: 'error', text: error instanceof Error ? error.message : String(error) })
+      setNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
     } finally {
-      setBusy(null)
+      setBusy(null);
     }
-  }
+  };
 
   const logout = async () => {
-    if (transportMode === 'wss') {
-      wssSession.current?.close()
-      wssSession.current = null
+    if (transportMode === "wss") {
+      wssSession.current?.close();
+      wssSession.current = null;
     } else if (session?.session_id) {
-      await api('/api/im/logout', { method: 'POST', body: JSON.stringify({ session_id: session.session_id }) }).catch(() => undefined)
+      await api("/api/im/logout", {
+        method: "POST",
+        body: JSON.stringify({ session_id: session.session_id }),
+      }).catch(() => undefined);
     }
-    sessionStorage.removeItem(sessionKey)
-    sessionStorage.removeItem(sessionTransportKey)
-    setSession(null)
-    setGroups([])
-    setMessages([])
-    setPresence([])
-    setTypingUsers([])
-    setActiveGroupID(null)
-    setNotice(null)
-  }
+    sessionStorage.removeItem(sessionKey);
+    sessionStorage.removeItem(sessionTransportKey);
+    setSession(null);
+    setGroups([]);
+    setMessages([]);
+    setPresence([]);
+    setTypingUsers([]);
+    setActiveGroupID(null);
+    setNotice(null);
+  };
 
   const createGroup = async (event: FormEvent) => {
-    event.preventDefault()
-    setBusy('create')
+    event.preventDefault();
+    setBusy("create");
     try {
-      const result = await command({ type: 'create_group', name: groupName })
-      const group = result.group!
-      setGroups((current) => [...current.filter((item) => item.id !== group.id), group])
-      setActiveGroupID(group.id)
-      setMessages([])
-      setNotice({ tone: 'ok', text: `群组已创建；把邀请码 ${group.invite_code} 发给另一位用户` })
+      const result = await command({ type: "create_group", name: groupName });
+      const group = result.group!;
+      setGroups((current) => [
+        ...current.filter((item) => item.id !== group.id),
+        group,
+      ]);
+      setActiveGroupID(group.id);
+      setMessages([]);
+      setNotice({
+        tone: "ok",
+        text: `群组已创建；把邀请码 ${group.invite_code} 发给另一位用户`,
+      });
     } catch (error) {
-      setNotice({ tone: 'error', text: error instanceof Error ? error.message : String(error) })
+      setNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
     } finally {
-      setBusy(null)
+      setBusy(null);
     }
-  }
+  };
 
   const joinGroup = async (event: FormEvent) => {
-    event.preventDefault()
-    setBusy('join')
+    event.preventDefault();
+    setBusy("join");
     try {
-      const result = await command({ type: 'join_group', invite_code: inviteCode })
-      const group = result.group!
-      await refreshGroups()
-      setInviteCode('')
-      await openGroup(group.id)
-      setNotice({ tone: 'ok', text: `已由后端授权加入「${group.name}」` })
+      const result = await command({
+        type: "join_group",
+        invite_code: inviteCode,
+      });
+      const group = result.group!;
+      await refreshGroups();
+      setInviteCode("");
+      await openGroup(group.id);
+      setNotice({ tone: "ok", text: `已由后端授权加入「${group.name}」` });
     } catch (error) {
-      setNotice({ tone: 'error', text: error instanceof Error ? error.message : String(error) })
+      setNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
     } finally {
-      setBusy(null)
+      setBusy(null);
     }
-  }
+  };
 
   const sendMessage = async (event: FormEvent) => {
-    event.preventDefault()
-    if (!activeGroup || !draft.trim()) return
-    const text = draft.trim()
-    setDraft('')
-    setBusy('send')
+    event.preventDefault();
+    if (!activeGroup || !draft.trim()) return;
+    const text = draft.trim();
+    setDraft("");
+    setBusy("send");
     try {
-      const result = await command({ type: 'send_message', group_id: activeGroup.id, text })
-      if (result.message) setMessages((current) => mergeMessages(current, [result.message!]))
+      const result = await command({
+        type: "send_message",
+        group_id: activeGroup.id,
+        text,
+      });
+      if (result.message)
+        setMessages((current) => mergeMessages(current, [result.message!]));
     } catch (error) {
-      setDraft(text)
-      setNotice({ tone: 'error', text: error instanceof Error ? error.message : String(error) })
+      setDraft(text);
+      setNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
     } finally {
-      setBusy(null)
+      setBusy(null);
     }
-  }
+  };
 
   if (!session?.authenticated) {
     return (
       <main className="auth-shell">
         <section className="auth-story">
           <p className="eyebrow">LYUNE / MAC STAGE · REAL IM</p>
-          <h1>不是 echo。<br />是真实的身份与消息。</h1>
-          <p className="lead">默认由浏览器直接建立 <code>WSS → TransportSession</code>；也可切换 Raw QUIC 对照。两条传输共用同一套认证、Exchange、路由和推送语义。</p>
+          <h1>
+            不是 echo。
+            <br />
+            是真实的身份与消息。
+          </h1>
+          <p className="lead">
+            默认由浏览器直接建立 <code>WSS → TransportSession</code>；也可切换
+            Raw QUIC 对照。两条传输共用同一套认证、Exchange、路由和推送语义。
+          </p>
           <div className="path-card">
-            {(transportMode === 'wss'
-              ? ['Web :5173', 'WSS :8444', 'Gateway Core', 'Reactor :9443', 'SQLite']
-              : ['Web :5173', 'Agent :8787', 'Raw QUIC :8443', 'Reactor :9443', 'SQLite']
+            {(transportMode === "wss"
+              ? [
+                  "Web :5173",
+                  "WSS :8444",
+                  "Gateway Core",
+                  "Reactor :9443",
+                  "SQLite",
+                ]
+              : [
+                  "Web :5173",
+                  "Agent :8787",
+                  "Raw QUIC :8443",
+                  "Reactor :9443",
+                  "SQLite",
+                ]
             ).map((label, index) => (
-              <div className="path-node" key={label}><span>{String(index + 1).padStart(2, '0')}</span>{label}</div>
+              <div className="path-node" key={label}>
+                <span>{String(index + 1).padStart(2, "0")}</span>
+                {label}
+              </div>
             ))}
           </div>
         </section>
         <section className="auth-card">
           <div className="auth-tabs">
-            <button className={authMode === 'register' ? 'active' : ''} onClick={() => setAuthMode('register')}>注册</button>
-            <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')}>登录</button>
+            <button
+              className={authMode === "register" ? "active" : ""}
+              onClick={() => setAuthMode("register")}
+            >
+              注册
+            </button>
+            <button
+              className={authMode === "login" ? "active" : ""}
+              onClick={() => setAuthMode("login")}
+            >
+              登录
+            </button>
           </div>
           <div className="auth-title">
             <span className="live-dot" />
-            <div><h2>{authMode === 'register' ? '创建真实用户' : '验证已有用户'}</h2><p>密码不少于 8 位；用户名为 3–24 位字母、数字或下划线。</p></div>
+            <div>
+              <h2>
+                {authMode === "register" ? "创建真实用户" : "验证已有用户"}
+              </h2>
+              <p>密码不少于 8 位；用户名为 3–24 位字母、数字或下划线。</p>
+            </div>
           </div>
           <form onSubmit={authenticate}>
             <div className="auth-tabs">
-              <button type="button" className={transportMode === 'wss' ? 'active' : ''} onClick={() => setTransportMode('wss')}>浏览器直连 WSS</button>
-              <button type="button" className={transportMode === 'raw-quic' ? 'active' : ''} onClick={() => setTransportMode('raw-quic')}>Raw QUIC 对照</button>
+              <button
+                type="button"
+                className={transportMode === "wss" ? "active" : ""}
+                onClick={() => setTransportMode("wss")}
+              >
+                浏览器直连 WSS
+              </button>
+              <button
+                type="button"
+                className={transportMode === "raw-quic" ? "active" : ""}
+                onClick={() => setTransportMode("raw-quic")}
+              >
+                Raw QUIC 对照
+              </button>
             </div>
-            <label>用户名<input autoFocus autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="alice_01" /></label>
-            <label>密码<input type="password" autoComplete={authMode === 'register' ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="至少 8 位" /></label>
+            <label>
+              用户名
+              <input
+                autoFocus
+                autoComplete="username"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                placeholder="alice_01"
+              />
+            </label>
+            <label>
+              密码
+              <input
+                type="password"
+                autoComplete={
+                  authMode === "register" ? "new-password" : "current-password"
+                }
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder="至少 8 位"
+              />
+            </label>
             <details>
               <summary>本地网关连接参数</summary>
-              {transportMode === 'wss' ? (
+              {transportMode === "wss" ? (
                 <>
-                  <label>WSS URL<input value={wssURL} onChange={(event) => setWssURL(event.target.value)} /></label>
-                  <p className="dev-warning">浏览器不能跳过 WSS 证书校验；首次运行需在 macOS/浏览器中信任项目的 server.crt。</p>
+                  <label>
+                    WSS URL
+                    <input
+                      value={wssURL}
+                      onChange={(event) => setWssURL(event.target.value)}
+                    />
+                  </label>
+                  <p className="dev-warning">
+                    浏览器不能跳过 WSS 证书校验；首次运行需在
+                    macOS/浏览器中信任项目的 server.crt。
+                  </p>
                 </>
               ) : (
-                <>
-                  <div className="two-fields">
-                    <label>Gateway<input value={address} onChange={(event) => setAddress(event.target.value)} /></label>
-                    <label>TLS SNI<input value={serverName} onChange={(event) => setServerName(event.target.value)} /></label>
-                  </div>
-                  <p className="dev-warning">本地 Raw QUIC 对照通过 client-agent 显式跳过开发证书链校验。</p>
-                </>
+                <p className="dev-warning">
+                  Raw QUIC 连接目标、TLS SNI 和证书策略由本地 client-agent
+                  配置决定。
+                </p>
               )}
             </details>
-            <button className="primary wide" disabled={busy === 'auth'}>{busy === 'auth' ? '正在走完整认证链路…' : authMode === 'register' ? '注册并进入 Lyune' : '登录 Lyune'}</button>
+            <button className="primary wide" disabled={busy === "auth"}>
+              {busy === "auth"
+                ? "正在走完整认证链路…"
+                : authMode === "register"
+                  ? "注册并进入 Lyune"
+                  : "登录 Lyune"}
+            </button>
           </form>
           {notice && <p className={`notice ${notice.tone}`}>{notice.text}</p>}
-          <p className="auth-footnote">前端无法给自己指定 <code>dest_id</code>；它只接受认证服务通过网关授予的身份。</p>
+          <p className="auth-footnote">
+            前端无法给自己指定 <code>dest_id</code>
+            ；它只接受认证服务通过网关授予的身份。
+          </p>
         </section>
       </main>
-    )
+    );
   }
 
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">L</span><div><strong>Lyune IM</strong><small>MAC VALIDATION</small></div></div>
+        <div className="brand">
+          <span className="brand-mark">L</span>
+          <div>
+            <strong>Lyune IM</strong>
+            <small>MAC VALIDATION</small>
+          </div>
+        </div>
         <div className="identity-card">
-          <div className="avatar">{session.user?.username.slice(0, 1).toUpperCase()}</div>
-          <div><strong>{session.user?.username}</strong><small>dest_id {session.dest_id}</small></div>
+          <div className="avatar">
+            {session.user?.username.slice(0, 1).toUpperCase()}
+          </div>
+          <div>
+            <strong>{session.user?.username}</strong>
+            <small>dest_id {session.dest_id}</small>
+          </div>
           <span className="online-dot" title="online" />
         </div>
-        <div className="section-label"><span>我的群组</span><button onClick={() => void refreshGroups()} title="刷新">↻</button></div>
+        <div className="section-label">
+          <span>我的群组</span>
+          <button onClick={() => void refreshGroups()} title="刷新">
+            ↻
+          </button>
+        </div>
         <nav className="group-list">
           {groups.map((group) => (
-            <button key={group.id} className={activeGroupID === group.id ? 'active' : ''} onClick={() => void openGroup(group.id)}>
-              <span className="group-symbol">#</span><span><strong>{group.name}</strong><small>group {group.id}</small></span>
+            <button
+              key={group.id}
+              className={activeGroupID === group.id ? "active" : ""}
+              onClick={() => void openGroup(group.id)}
+            >
+              <span className="group-symbol">#</span>
+              <span>
+                <strong>{group.name}</strong>
+                <small>group {group.id}</small>
+              </span>
             </button>
           ))}
-          {groups.length === 0 && <p className="empty-groups">还没有群组。创建一个，或用邀请码加入。</p>}
+          {groups.length === 0 && (
+            <p className="empty-groups">
+              还没有群组。创建一个，或用邀请码加入。
+            </p>
+          )}
         </nav>
         <div className="group-actions">
           <form onSubmit={createGroup}>
-            <label>创建群组<input value={groupName} onChange={(event) => setGroupName(event.target.value)} /></label>
+            <label>
+              创建群组
+              <input
+                value={groupName}
+                onChange={(event) => setGroupName(event.target.value)}
+              />
+            </label>
             <button disabled={busy !== null}>创建</button>
           </form>
           <form onSubmit={joinGroup}>
-            <label>邀请码<input value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="12 位邀请码" /></label>
+            <label>
+              邀请码
+              <input
+                value={inviteCode}
+                onChange={(event) => setInviteCode(event.target.value)}
+                placeholder="12 位邀请码"
+              />
+            </label>
             <button disabled={busy !== null || !inviteCode}>加入</button>
           </form>
         </div>
-        <button className="logout" onClick={() => void logout()}>退出并关闭 {transportMode === 'wss' ? 'WSS' : 'QUIC'} 会话</button>
+        <button className="logout" onClick={() => void logout()}>
+          退出并关闭 {transportMode === "wss" ? "WSS" : "QUIC"} 会话
+        </button>
       </aside>
 
       <section className="chat-pane">
         <header className="chat-header">
           <div>
             <p className="eyebrow">SERVICE 1/2 · SQLITE AUTHORIZATION</p>
-            <h2>{activeGroup ? activeGroup.name : '选择或创建一个群组'}</h2>
+            <h2>{activeGroup ? activeGroup.name : "选择或创建一个群组"}</h2>
           </div>
           <div className="transport-status">
-            <span className={pushState === 'listening' ? 'online-dot' : 'warn-dot'} />
-            <div><strong>{pushState === 'listening' ? '.peer 实时监听中' : '推送通道重试中'}</strong><small>{transportMode === 'wss' ? session.target : `${session.local_address} → ${session.remote_address}`} · {session.alpn}</small></div>
+            <span
+              className={pushState === "listening" ? "online-dot" : "warn-dot"}
+            />
+            <div>
+              <strong>
+                {pushState === "listening"
+                  ? ".peer 实时监听中"
+                  : "推送通道重试中"}
+              </strong>
+              <small>
+                {transportMode === "wss"
+                  ? session.target
+                  : `${session.local_address} → ${session.remote_address}`}{" "}
+                · {session.alpn}
+              </small>
+            </div>
           </div>
         </header>
 
-        {notice && <div className={`toast ${notice.tone}`}><span>{notice.text}</span><button onClick={() => setNotice(null)}>×</button></div>}
+        {notice && (
+          <div className={`toast ${notice.tone}`}>
+            <span>{notice.text}</span>
+            <button onClick={() => setNotice(null)}>×</button>
+          </div>
+        )}
 
         {!activeGroup ? (
           <div className="welcome-state">
-            <div className="orbit"><span>{transportMode === 'wss' ? 'WSS' : 'QUIC'}</span></div>
+            <div className="orbit">
+              <span>{transportMode === "wss" ? "WSS" : "QUIC"}</span>
+            </div>
             <h3>用两个真实用户开始</h3>
-            <p>当前标签页是 <strong>{session.user?.username}</strong>。创建群组后，在另一个标签页注册第二个用户并输入邀请码；双方随后会通过各自独立的 {transportMode === 'wss' ? 'WSS' : 'QUIC'} 会话收发消息。</p>
+            <p>
+              当前标签页是 <strong>{session.user?.username}</strong>
+              。创建群组后，在另一个标签页注册第二个用户并输入邀请码；双方随后会通过各自独立的{" "}
+              {transportMode === "wss" ? "WSS" : "QUIC"} 会话收发消息。
+            </p>
           </div>
         ) : (
           <>
             <div className="invite-strip">
-              <span>邀请码</span><code>{activeGroup.invite_code}</code><button onClick={() => void navigator.clipboard.writeText(activeGroup.invite_code)}>复制</button>
-              <span className="presence-summary">{presence.filter((item) => item.online).length}/{presence.length} 位用户在线 · {presence.reduce((total, item) => total + item.online_sessions, 0)} 条连接</span>
+              <span>邀请码</span>
+              <code>{activeGroup.invite_code}</code>
+              <button
+                onClick={() =>
+                  void navigator.clipboard.writeText(activeGroup.invite_code)
+                }
+              >
+                复制
+              </button>
+              <span className="presence-summary">
+                {presence.filter((item) => item.online).length}/
+                {presence.length} 位用户在线 ·{" "}
+                {presence.reduce(
+                  (total, item) => total + item.online_sessions,
+                  0,
+                )}{" "}
+                条连接
+              </span>
             </div>
             <div className="message-list">
-              {messages.length === 0 && <div className="day-divider"><span>消息已由 Reactor 从 SQLite 读取</span></div>}
+              {messages.length === 0 && (
+                <div className="day-divider">
+                  <span>消息已由 Reactor 从 SQLite 读取</span>
+                </div>
+              )}
               {messages.map((message) => {
-                const own = message.sender.id === session.user?.id
+                const own = message.sender.id === session.user?.id;
                 return (
-                  <article className={`message ${own ? 'own' : ''}`} key={message.id}>
-                    <div className="message-avatar">{message.sender.username.slice(0, 1).toUpperCase()}</div>
-                    <div className="message-content"><div className="message-meta"><strong>{message.sender.username}</strong><time>{timeLabel(message.created_at)}</time><small>#{message.id}</small></div><p>{message.text}</p></div>
+                  <article
+                    className={`message ${own ? "own" : ""}`}
+                    key={message.id}
+                  >
+                    <div className="message-avatar">
+                      {message.sender.username.slice(0, 1).toUpperCase()}
+                    </div>
+                    <div className="message-content">
+                      <div className="message-meta">
+                        <strong>{message.sender.username}</strong>
+                        <time>{timeLabel(message.created_at)}</time>
+                        <small>#{message.id}</small>
+                      </div>
+                      <p>{message.text}</p>
+                    </div>
                   </article>
-                )
+                );
               })}
               <div ref={chatEnd} />
             </div>
-            <div className="typing-state">{typingUsers.length > 0 ? `${typingUsers.map((user) => user.username).join('、')} 正在输入…` : ' '}</div>
+            <div className="typing-state">
+              {typingUsers.length > 0
+                ? `${typingUsers.map((user) => user.username).join("、")} 正在输入…`
+                : " "}
+            </div>
             <form className="composer" onSubmit={sendMessage}>
-              <textarea rows={2} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() }
-              }} placeholder={`发消息到 #${activeGroup.name}；Enter 发送，Shift+Enter 换行`} />
-              <button disabled={!draft.trim() || busy === 'send'}>{busy === 'send' ? '发送中' : '发送'}</button>
+              <textarea
+                rows={2}
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    event.currentTarget.form?.requestSubmit();
+                  }
+                }}
+                placeholder={`发消息到 #${activeGroup.name}；Enter 发送，Shift+Enter 换行`}
+              />
+              <button disabled={!draft.trim() || busy === "send"}>
+                {busy === "send" ? "发送中" : "发送"}
+              </button>
             </form>
           </>
         )}
         <footer className="protocol-footer">
-          <span>AUTH TTL {session.admission_ttl_seconds}s</span><span>SESSION {session.session_id.slice(0, 8)}…</span><span>{transportMode === 'wss' ? 'lyune.v2/WSS' : 'lyune/2/QUIC'} · required / none · lifecycle</span>
+          <span>AUTH TTL {session.admission_ttl_seconds}s</span>
+          <span>SESSION {session.session_id.slice(0, 8)}…</span>
+          <span>
+            {transportMode === "wss" ? "lyune.v2/WSS" : "lyune/2/QUIC"} ·
+            required / none · lifecycle
+          </span>
         </footer>
       </section>
     </main>
-  )
+  );
 }
 
-export default App
+export default App;

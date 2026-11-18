@@ -261,11 +261,14 @@ func (a *Agent) imSessionForAuth(ctx context.Context, request imAuthRequest) (*i
 	}
 	address := request.Address
 	if address == "" {
-		address = "127.0.0.1:8443"
+		address = a.config.GatewayAddress
 	}
 	serverName := request.ServerName
 	if serverName == "" {
-		serverName = "localhost"
+		serverName = a.config.ServerName
+	}
+	if !request.Insecure {
+		request.Insecure = a.config.InsecureSkipVerify
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
