@@ -310,7 +310,35 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 	if err != nil {
 		return exchangeResult{Error: fmt.Sprintf("open stream: %v", err)}
 	}
-	deadline := started.Add(time.Duration(request.TimeoutMS) * time.Millisecond)
+	return exchangeOnStream(ctx, stream, request, started)
+}
+
+type requestStream interface {
+	io.ReadWriteCloser
+	Context() context.Context
+	StreamID() quic.StreamID
+	SetDeadline(time.Time) error
+	CancelRead(quic.StreamErrorCode)
+	CancelWrite(quic.StreamErrorCode)
+}
+
+func remoteStreamError(err error) bool {
+	var streamErr *quic.StreamError
+	return errors.As(err, &streamErr) && streamErr.Remote
+}
+
+func finishUpload(stream requestStream) error {
+	err := stream.Close()
+	// quic-go v0.59 Close returns an untyped error for a canceled sender.
+	// Its send-side context preserves the typed STOP_SENDING cause.
+	if err != nil && (remoteStreamError(err) || remoteStreamError(context.Cause(stream.Context()))) {
+		return nil
+	}
+	return err
+}
+
+func exchangeOnStream(ctx context.Context, stream requestStream, request exchangeRequest, started time.Time) exchangeResult {
+	deadline, _ := ctx.Deadline()
 	_ = stream.SetDeadline(deadline)
 	result := exchangeResult{StreamID: uint64(stream.StreamID())}
 	if request.StopResponse {
@@ -365,12 +393,14 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 		return exchangeResult{StreamID: result.StreamID, Error: "kind must be service or control"}
 	}
 
+upload:
 	for index, chunk := range request.Chunks {
 		flags := wire.Flags(0)
 		if index == len(request.Chunks)-1 {
 			flags |= wire.FlagEOF
 		}
 		var frame *wire.Frame
+		var err error
 		if index == 0 {
 			frame, err = wire.NewOpen(dest, group, routeKey, responseMode, flags, []byte(chunk))
 		} else {
@@ -382,6 +412,9 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 			return exchangeResult{StreamID: result.StreamID, Error: fmt.Sprintf("build frame: %v", err)}
 		}
 		if err := wire.WriteFrame(stream, frame); err != nil {
+			if remoteStreamError(err) {
+				break
+			}
 			stream.CancelRead(1)
 			stream.CancelWrite(1)
 			return exchangeResult{StreamID: result.StreamID, Error: fmt.Sprintf("write frame: %v", err)}
@@ -415,11 +448,16 @@ func runExchange(parent context.Context, conn *quic.Conn, request exchangeReques
 				stream.CancelWrite(1)
 				return exchangeResult{StreamID: result.StreamID, Error: ctx.Err().Error()}
 			case <-time.After(time.Duration(request.DelayMS) * time.Millisecond):
+			case <-stream.Context().Done():
+				if remoteStreamError(context.Cause(stream.Context())) {
+					break upload
+				}
 			}
 		}
 	}
 	result.RequestFinMS = time.Since(started).Milliseconds()
-	if err := stream.Close(); err != nil {
+	if err := finishUpload(stream); err != nil {
+		stream.CancelRead(1)
 		return exchangeResult{StreamID: result.StreamID, Error: fmt.Sprintf("close request side: %v", err)}
 	}
 	if request.StopResponse {

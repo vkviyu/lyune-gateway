@@ -785,23 +785,84 @@ pub const GatewayWorker = struct {
 
     /// 把一条连接上还没收尾的交换逐条结束掉。
     fn finishOpenExchanges(self: *Self, ctx: *ConnectionContext) void {
-        var it = ctx.inbound_exchanges.valueIterator();
-        while (it.next()) |entry| {
-            if (entry.backend) |stream| self.finishBackendStream(stream);
+        var routes: [64]inflight.ExpiredRoute = undefined;
+        while (true) {
+            const count = self.inflight.takeSessionRoutes(ctx.session_handle, &routes);
+            for (routes[0..count]) |entry| self.cancelBackendStream(entry.key);
+            if (count < routes.len) break;
+        }
+        // Auth requests have already FINished their input, but still own a backend
+        // response stream. Lifecycle publications deliberately have no client owner.
+        var auths = self.inflight.auths.iterator();
+        while (auths.next()) |entry| {
+            if (entry.value_ptr.client_session.eql(ctx.session_handle)) self.cancelBackendStream(entry.key_ptr.*);
+        }
+        var inputs = ctx.inbound_exchanges.valueIterator();
+        while (inputs.next()) |entry| {
+            if (entry.push_session != 0) egress.abortSessionById(self, entry.push_session);
         }
     }
 
-    /// 给后端流补一个空的 fin 分片，让它正常收尾。
-    ///
-    /// 尽力而为：找不到 transport 或发送失败都只记日志——此时客户端连接已经
-    /// 不在了，没有人可以被通知，后端最终会自己超时。
-    ///
-    /// pub 是给 ingress.zig 用的：上行路径在交换作废或客户端关流时也要收尾后端流。
-    pub fn finishBackendStream(self: *Self, stream: connection.BackendStream) void {
-        const transport = self.transport_registry.find(stream.scope) orelse return;
-        _ = transport.sendStream(stream.scope.route, stream.key.stream, &.{}, true) catch |err| {
-            err_handler.reportError(.session, "Failed to finish backend stream", err);
+    /// Only normal client FIN uses this path. Cancellation must never synthesize FIN.
+    pub fn finishBackendStream(self: *Self, stream: connection.BackendStream) backend.TransportError!void {
+        const transport = self.transport_registry.findById(stream.key.transport) orelse return error.Closed;
+        _ = try transport.sendStream(stream.scope.route, stream.key.stream, &.{}, true);
+        self.inflight.finishRequest(stream.key, quic.c.currentTime());
+    }
+
+    pub fn cancelBackendStream(self: *Self, key: inflight.StreamKey) void {
+        if (self.transport_registry.findById(key.transport)) |transport| transport.invalidateStream(key.stream);
+    }
+
+    pub fn routeOwner(route: inflight.Route) ?inflight.ClientResponse {
+        return route.owner orelse switch (route.target) {
+            .client => |target| target,
+            .discard => null,
         };
+    }
+
+    /// The route can already have been extracted by a timeout/failure batch.
+    /// dropFrameSpill defers freeing a buffer borrowed by ingress's frame dispatcher.
+    pub fn retireRouteInput(self: *Self, route: inflight.Route) void {
+        const owner = routeOwner(route) orelse return;
+        const ctx = self.conn_manager.getByHandle(owner.session) orelse return;
+        if (!route.request_done) {
+            ctx.transport.stopReceive(owner.stream_id, 0);
+            ctx.stopped_inputs.remember(owner.stream_id);
+        }
+        ctx.dropFrameSpill(owner.stream_id);
+        ctx.removeInboundExchange(owner.stream_id);
+    }
+
+    pub fn failRoute(self: *Self, key: inflight.StreamKey, route: inflight.Route, message: ?[]const u8) void {
+        self.cancelBackendStream(key);
+        switch (route.target) {
+            .client => |target| {
+                if (route.response_done) {
+                    // Backend FIN already completed this client's response.
+                } else if (message) |text| {
+                    self.replyControl(target.session, target.stream_id, .gateway_error, text);
+                } else if (self.conn_manager.getByHandle(target.session)) |ctx| {
+                    if (!ctx.responseClosed(target.stream_id)) {
+                        ctx.transport.resetSend(target.stream_id, 0);
+                        ctx.noteResponseClosed(target.stream_id);
+                    }
+                }
+            },
+            .discard => {
+                // A .none request may not have reached its input FIN yet.
+                if (routeOwner(route)) |owner| {
+                    if (self.conn_manager.getByHandle(owner.session)) |ctx| {
+                        if (!ctx.responseClosed(owner.stream_id)) {
+                            ctx.transport.resetSend(owner.stream_id, 0);
+                            ctx.noteResponseClosed(owner.stream_id);
+                        }
+                    }
+                }
+            },
+        }
+        self.retireRouteInput(route);
+        self.inflight.closeRoute(key);
     }
 
     /// 后端轮询的主体：先排空响应，再做一次摊薄的过期回收。
@@ -838,13 +899,7 @@ pub const GatewayWorker = struct {
             const count = self.inflight.takeExpiredRoutes(now, &routes);
             if (count != 0) expired_any = true;
             for (routes[0..count]) |expired| {
-                switch (expired.route.target) {
-                    .client => |target| self.replyControl(target.session, target.stream_id, .gateway_error, "backend response timeout"),
-                    .discard => {},
-                }
-                if (self.transport_registry.findById(expired.key.transport)) |transport| {
-                    transport.invalidateStream(expired.key.stream);
-                }
+                self.failRoute(expired.key, expired.route, "backend response timeout");
             }
             if (count < routes.len) break;
         }
@@ -859,6 +914,7 @@ pub const GatewayWorker = struct {
                     self.replyControl(pending.client_session, pending.client_stream_id, .auth_failure, "authentication backend timeout");
                 }
                 pending.buffer.deinit(self.allocator);
+                self.retireAuthInput(pending);
                 if (self.transport_registry.findById(expired.key.transport)) |transport| {
                     transport.invalidateStream(expired.key.stream);
                 }
@@ -922,6 +978,7 @@ pub const GatewayWorker = struct {
                 }
                 continue;
             };
+            if (route.response_done) continue;
 
             switch (route.target) {
                 .discard => {},
@@ -930,20 +987,22 @@ pub const GatewayWorker = struct {
                     // 必须确认它仍在管理器中，否则在途表里的旧身份会命中失效资源。
                     const client_ctx = self.conn_manager.getByHandle(target.session) orelse {
                         std.log.warn("[ROUTE] client gone before backend response: backend_stream={}", .{event.stream_id});
-                        self.inflight.closeRoute(key);
+                        self.failRoute(key, route, null);
                         continue;
                     };
 
                     client_ctx.transport.write(target.stream_id, event.data, event.is_fin) catch |err| {
                         err_handler.reportError(.session, "Failed to write backend response to client", err);
-                        self.inflight.closeRoute(key);
+                        self.failRoute(key, route, null);
                         continue;
                     };
+                    if (event.is_fin) client_ctx.noteResponseClosed(target.stream_id);
                 },
             }
 
             if (event.is_fin) {
-                self.inflight.closeRoute(key);
+                self.inflight.finishResponse(key, quic.c.currentTime());
+                if (route.request_done) self.retireStoppedInput(route);
             } else {
                 // 成功写回一个完整后端事件才刷新；发送失败会走上面的关闭分支。
                 _ = self.inflight.touchRoute(key, quic.c.currentTime());
@@ -960,21 +1019,49 @@ pub const GatewayWorker = struct {
             .data => unreachable,
         };
 
+        // Auth is sent in one write with FIN. STOP only acknowledges that already
+        // closed request direction; the auth result must still be consumed.
+        if (event.kind == .stop_sending and self.inflight.hasAuth(key)) return;
         if (self.inflight.takeAuth(key)) |pending_value| {
             var pending = pending_value;
             if (!pending.response_suppressed) {
                 self.replyControl(pending.client_session, pending.client_stream_id, .auth_failure, reason);
             }
             pending.buffer.deinit(self.allocator);
+            self.retireAuthInput(pending);
+            self.cancelBackendStream(key);
             return;
         }
 
         if (self.inflight.lookupRoute(key)) |route| {
-            switch (route.target) {
-                .client => |target| self.replyControl(target.session, target.stream_id, .gateway_error, reason),
-                .discard => {},
+            if (event.kind == .stop_sending) {
+                if (route.request_done) return;
+                if (routeOwner(route)) |owner| {
+                    if (self.conn_manager.getByHandle(owner.session)) |ctx| {
+                        if (ctx.inboundExchange(owner.stream_id)) |active| {
+                            active.input_stopped = true;
+                            active.backend = null;
+                            if (!active.transport_fin) ctx.transport.stopReceive(owner.stream_id, 0);
+                        } else {
+                            ctx.transport.stopReceive(owner.stream_id, 0);
+                        }
+                        ctx.stopped_inputs.remember(owner.stream_id);
+                        ctx.dropFrameSpill(owner.stream_id);
+                        if (route.target == .discard and !ctx.responseClosed(owner.stream_id)) {
+                            // A no-response upload stopped before EOF was not
+                            // fully accepted; do not manufacture a successful FIN.
+                            ctx.transport.resetSend(owner.stream_id, 0);
+                            ctx.noteResponseClosed(owner.stream_id);
+                        }
+                        // No parsing marker is needed: the bounded stopped history
+                        // absorbs late bytes and reciprocal RESET without allocation.
+                        ctx.removeInboundExchange(owner.stream_id);
+                    }
+                }
+                self.inflight.finishRequest(key, quic.c.currentTime());
+            } else {
+                self.failRoute(key, route, null);
             }
-            self.inflight.closeRoute(key);
             return;
         }
 
@@ -992,27 +1079,57 @@ pub const GatewayWorker = struct {
     /// 不再悬挂到自己的 deadline。
     fn failTransportRequests(self: *Self, transport: BackendTransport) void {
         const selector = transport.failureSelector();
-        var routes: [64]inflight.Route = undefined;
+        // Preserve exact keys; taking only Route values loses the stream to cancel.
+        var keys: [64]inflight.StreamKey = undefined;
         while (true) {
-            const count = self.inflight.takeFailedRoutes(transport.id(), selector, &routes);
-            for (routes[0..count]) |route| switch (route.target) {
-                .client => |target| self.replyControl(target.session, target.stream_id, .gateway_error, "backend connection failed"),
-                .discard => {},
-            };
-            if (count < routes.len) break;
+            var count: usize = 0;
+            var it = self.inflight.routes.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.transport != transport.id() or !selector.matches(entry.key_ptr.stream)) continue;
+                keys[count] = entry.key_ptr.*;
+                count += 1;
+                if (count == keys.len) break;
+            }
+            for (keys[0..count]) |key| self.failRoute(key, self.inflight.lookupRoute(key).?, "backend connection failed");
+            if (count < keys.len) break;
         }
 
-        var auths: [64]inflight.PendingAuth = undefined;
         while (true) {
-            const count = self.inflight.takeFailedAuths(transport.id(), selector, &auths);
-            for (auths[0..count]) |pending_value| {
-                var pending = pending_value;
+            var count: usize = 0;
+            var it = self.inflight.auths.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.transport != transport.id() or !selector.matches(entry.key_ptr.stream)) continue;
+                keys[count] = entry.key_ptr.*;
+                count += 1;
+                if (count == keys.len) break;
+            }
+            for (keys[0..count]) |key| {
+                var pending = self.inflight.takeAuth(key).?;
                 if (!pending.response_suppressed) {
                     self.replyControl(pending.client_session, pending.client_stream_id, .auth_failure, "authentication backend failed");
                 }
                 pending.buffer.deinit(self.allocator);
+                self.retireAuthInput(pending);
+                self.cancelBackendStream(key);
             }
-            if (count < auths.len) break;
+            if (count < keys.len) break;
+        }
+    }
+
+    fn retireAuthInput(self: *Self, pending: inflight.PendingAuth) void {
+        const ctx = self.conn_manager.getByHandle(pending.client_session) orelse return;
+        ctx.dropFrameSpill(pending.client_stream_id);
+        ctx.removeInboundExchange(pending.client_stream_id);
+    }
+
+    fn retireStoppedInput(self: *Self, route: inflight.Route) void {
+        const owner = routeOwner(route) orelse return;
+        const ctx = self.conn_manager.getByHandle(owner.session) orelse return;
+        if (ctx.inboundExchange(owner.stream_id)) |active| {
+            if (active.input_stopped) {
+                ctx.dropFrameSpill(owner.stream_id);
+                ctx.removeInboundExchange(owner.stream_id);
+            }
         }
     }
 
@@ -1069,6 +1186,7 @@ pub const GatewayWorker = struct {
     /// pub 是给 ingress.zig 用的：门禁拒绝与各类上行失败都要回一个 gateway_error。
     pub fn replyControl(self: *Self, session: SessionHandle, stream_id: u64, ctrl_type: protocol.frame.ControlType, body: []const u8) void {
         const ctx = self.conn_manager.getByHandle(session) orelse return;
+        if (ctx.responseClosed(stream_id)) return;
 
         var buf: [1024]u8 = undefined;
         var encoder = protocol.codec.FrameEncoder.init(&buf);
@@ -1078,7 +1196,9 @@ pub const GatewayWorker = struct {
         };
         ctx.transport.write(stream_id, data, true) catch |err| {
             err_handler.reportError(.session, "Failed to write control frame to client", err);
+            ctx.transport.resetSend(stream_id, 0);
         };
+        ctx.noteResponseClosed(stream_id);
     }
 
     /// 成功接纳一个 `ResponseMode.none` 请求后关闭返回方向，不发送应用帧。
@@ -1087,9 +1207,12 @@ pub const GatewayWorker = struct {
     /// 请求也已交给 BackendTransport。后端是否完成业务处理不会再回到客户端。
     pub fn finishResponseWithoutPayload(self: *Self, session: SessionHandle, stream_id: u64) void {
         const ctx = self.conn_manager.getByHandle(session) orelse return;
+        if (ctx.responseClosed(stream_id)) return;
         ctx.transport.write(stream_id, &.{}, true) catch |err| {
             err_handler.reportError(.session, "Failed to finish no-response exchange", err);
+            ctx.transport.resetSend(stream_id, 0);
         };
+        ctx.noteResponseClosed(stream_id);
     }
 
     /// 吊销连接准入并发布一次连接级 offline；用户级多设备聚合不在 Gateway。
@@ -2821,4 +2944,618 @@ test "an uplink datagram fans out through the same routing as a reliable multica
     try std.testing.expectEqual(@as(u16, 1), list.count);
     try std.testing.expectEqual(@as(u64, 555), list.get(0));
     try std.testing.expectEqualStrings("xy", parsed.body[list.prefixLen()..]);
+}
+
+// Count all operations between checkpoints: an extra FIN, reset or close must fail the test.
+const ServiceTrace = struct {
+    const Op = enum { open, write, stop, reset, discard, close, invalidate };
+    calls: usize = 0,
+    op: Op = undefined,
+    stream: u64 = undefined,
+    fin: bool = false,
+    bytes: [256]u8 = undefined,
+    len: usize = 0,
+
+    fn record(self: *@This(), op: Op, stream: u64, bytes: []const u8, fin: bool) void {
+        self.calls += 1;
+        self.op = op;
+        self.stream = stream;
+        self.fin = fin;
+        self.len = bytes.len;
+        @memcpy(self.bytes[0..bytes.len], bytes);
+    }
+
+    fn expect(self: *@This(), op: Op, stream: u64, bytes: []const u8, fin: bool) !void {
+        try std.testing.expectEqual(@as(usize, 1), self.calls);
+        try std.testing.expectEqual(op, self.op);
+        try std.testing.expectEqual(stream, self.stream);
+        try std.testing.expectEqual(fin, self.fin);
+        try std.testing.expectEqualSlices(u8, bytes, self.bytes[0..self.len]);
+        self.calls = 0;
+    }
+
+    fn quiet(self: *const @This()) !void {
+        try std.testing.expectEqual(@as(usize, 0), self.calls);
+    }
+
+    fn session(self: *@This()) TransportSession {
+        return TransportSession.init(.raw_quic, self, &.{
+            .claim_inbound_exchange = claim,
+            .write = write,
+            .send_ephemeral = ephemeral,
+            .reset_send = reset,
+            .stop_receive = stop,
+            .discard = discard,
+            .close = close,
+        }, null);
+    }
+
+    fn cast(ptr: *anyopaque) *ServiceTrace {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn claim(_: *anyopaque, _: u64) bool {
+        return true;
+    }
+    fn write(ptr: *anyopaque, stream: u64, bytes: []const u8, fin: bool) TransportSession.Error!void {
+        cast(ptr).record(.write, stream, bytes, fin);
+    }
+    fn ephemeral(_: *anyopaque, _: []const u8) TransportSession.Error!void {
+        unreachable;
+    }
+    fn reset(ptr: *anyopaque, stream: u64, _: u64) void {
+        cast(ptr).record(.reset, stream, "", false);
+    }
+    fn stop(ptr: *anyopaque, stream: u64, _: u64) void {
+        cast(ptr).record(.stop, stream, "", false);
+    }
+    fn discard(ptr: *anyopaque, stream: u64, _: u64) void {
+        cast(ptr).record(.discard, stream, "", false);
+    }
+    fn close(ptr: *anyopaque, _: u64) void {
+        cast(ptr).record(.close, 0, "", false);
+    }
+};
+
+const ServiceBackend = struct {
+    sent: ServiceTrace = .{},
+    next_stream: u64 = 0,
+    pending: ?backend.transport.TransportRecv = null,
+    released: usize = 0,
+    failed_stream: ?u64 = null,
+    stopped_write: ?u64 = null,
+
+    fn transport(self: *@This()) BackendTransport {
+        return BackendTransport.init(@This(), self);
+    }
+    pub fn resolveImpl(_: *@This(), _: RouteId, _: ?backend.transport.ResolveCallback, _: ?*anyopaque) void {}
+    pub fn sendStreamImpl(self: *@This(), _: RouteId, handle: ?u64, bytes: []const u8, fin: bool) backend.TransportError!u64 {
+        if (handle != null and handle == self.stopped_write) return error.RequestStopped;
+        const stream = handle orelse self.next_stream;
+        if (handle == null) self.next_stream += 4;
+        self.sent.record(if (handle == null) .open else .write, stream, bytes, fin);
+        return stream;
+    }
+    pub fn receiveImpl(self: *@This()) backend.TransportError!?backend.transport.TransportRecv {
+        if (self.failed_stream != null) return error.ConnectionFailed;
+        defer self.pending = null;
+        return self.pending;
+    }
+    pub fn releaseRecvImpl(self: *@This(), _: backend.transport.TransportRecv) void {
+        self.released += 1;
+    }
+    pub fn failureSelectorImpl(self: *@This()) backend.transport.StreamSelector {
+        return .{ .mask = std.math.maxInt(u64), .value = self.failed_stream.? };
+    }
+    pub fn invalidateStreamImpl(self: *@This(), stream: u64) void {
+        self.sent.record(.invalidate, stream, "", false);
+    }
+    pub fn closeImpl(_: *@This()) void {}
+};
+
+const ServiceFixture = struct {
+    coordinator: control.Coordinator = undefined,
+    worker: GatewayWorker = undefined,
+    server: ServiceBackend = .{},
+    client: ServiceTrace = .{},
+    handler: client_session.Handler = undefined,
+    session: SessionHandle = undefined,
+
+    // Initialize in place because the registry, worker and handler borrow fixture members.
+    fn init(self: *@This()) !void {
+        const allocator = std.testing.allocator;
+        self.coordinator = try testCoordinator(allocator);
+        errdefer self.coordinator.deinit();
+        try self.coordinator.start();
+        errdefer self.coordinator.stop();
+        var registry = TransportRegistry.init(allocator);
+        self.worker = blk: {
+            errdefer registry.deinit();
+            try registry.register(.direct, test_scope, self.server.transport());
+            break :blk try testWorker(allocator, &self.coordinator, registry);
+        };
+        errdefer self.worker.deinit();
+        self.handler = self.worker.sessionHandler();
+        self.session = try self.handler.accept(self.client.session(), null);
+    }
+
+    fn deinit(self: *@This()) void {
+        self.worker.deinit();
+        self.coordinator.stop();
+        self.coordinator.deinit();
+    }
+
+    fn open(self: *@This(), session: SessionHandle, stream: u64) !inflight.StreamKey {
+        var buf: [64]u8 = undefined;
+        var encoder = codec.FrameEncoder.init(&buf);
+        const bytes = try encoder.encodeOpen(.service, test_route, .required, .{}, "request");
+        self.handler.streamData(session, stream, bytes, false);
+        const ctx = self.worker.conn_manager.getByHandle(session) orelse return error.SessionMissing;
+        const input = ctx.inboundExchange(stream) orelse return error.OpenNotAccepted;
+        const dest = input.backend orelse return error.BackendStreamMissing;
+        try self.server.sent.expect(.open, dest.key.stream, bytes, false);
+        try std.testing.expect(self.worker.inflight.lookupRoute(dest.key) != null);
+        return dest.key;
+    }
+
+    fn deliver(self: *@This(), key: inflight.StreamKey, kind: backend.transport.RecvKind, bytes: []const u8, fin: bool) !void {
+        const released = self.server.released;
+        self.server.pending = .{ .stream_id = key.stream, .kind = kind, .data = bytes, .is_fin = fin };
+        self.worker.drainTransport(self.server.transport(), test_realm);
+        try std.testing.expectEqual(released + 1, self.server.released);
+    }
+
+    fn response(self: *@This(), key: inflight.StreamKey, client: *ServiceTrace, stream: u64, payload: []const u8, fin: bool) !void {
+        var buf: [64]u8 = undefined;
+        var encoder = codec.FrameEncoder.init(&buf);
+        const bytes = try encoder.encodeData(.{ .eof = fin }, payload);
+        try self.deliver(key, .data, bytes, fin);
+        try client.expect(.write, stream, bytes, fin);
+    }
+
+    fn expectRoutes(self: *@This(), count: u32) !void {
+        try std.testing.expectEqual(count, self.worker.inflight.routeCount());
+        try std.testing.expectEqual(count, self.worker.inflight.route_quota.count(test_realm));
+    }
+};
+
+test "service response FIN preserves request DATA until application EOF or raw empty FIN" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+
+    for ([_]bool{ false, true }, 0..) |raw_fin, i| {
+        const stream: u64 = 4 * i;
+        const key = try f.open(f.session, stream);
+        try f.response(key, &f.client, stream, "early reply", true);
+        try f.expectRoutes(1);
+        var buf: [64]u8 = undefined;
+        var encoder = codec.FrameEncoder.init(&buf);
+        const body = try encoder.encodeData(.{}, "after response FIN");
+        f.handler.streamData(f.session, stream, body, false);
+        try f.server.sent.expect(.write, key.stream, body, false);
+        const end: []const u8 = if (raw_fin) "" else try encoder.encodeData(.{ .eof = true }, "tail");
+        f.handler.streamData(f.session, stream, end, raw_fin);
+        try f.server.sent.expect(.write, key.stream, end, true);
+        try f.expectRoutes(0);
+        if (!raw_fin) f.handler.streamData(f.session, stream, "", true);
+        try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.inboundExchange(stream) == null);
+        try f.server.sent.quiet();
+        try f.client.quiet();
+    }
+}
+
+test "service backend STOP and response FIN in either order preserve business bytes across RESET acknowledgement" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+
+    for (0..3) |i| {
+        const stream: u64 = 4 * i;
+        const key = try f.open(f.session, stream);
+        const sibling = try f.open(f.session, 16 + stream);
+        // STOP, ACK, FIN; STOP, FIN, delayed ACK; FIN, STOP, ACK.
+        if (i == 2) try f.response(key, &f.client, stream, "decision", true);
+        try serviceSpill(&f, f.session, stream);
+        try f.deliver(key, .stop_sending, "", false);
+        try f.client.expect(.stop, stream, "", false);
+        try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.frameSpill(stream) == null);
+        if (i != 2) {
+            const route = f.worker.inflight.lookupRoute(key) orelse return error.StopLostResponse;
+            try std.testing.expect(route.request_done);
+            try std.testing.expect(!route.response_done);
+            try std.testing.expectEqual(inflight.ResponseTarget.client, std.meta.activeTag(route.target));
+        }
+        var buf: [64]u8 = undefined;
+        var encoder = codec.FrameEncoder.init(&buf);
+        const late = try encoder.encodeData(.{}, "already in transit");
+        f.handler.streamData(f.session, stream, late, false);
+        if (i == 0) f.handler.control(f.session, stream, .reset);
+        if (i != 2) {
+            try f.response(key, &f.client, stream, "business data", false);
+            try f.response(key, &f.client, stream, "decision", true);
+        }
+        if (i != 0) f.handler.control(f.session, stream, .reset);
+        // Delayed backend controls cannot issue another terminal event.
+        try f.deliver(key, .stop_sending, "", false);
+        try f.deliver(key, .stream_reset, "", false);
+        try f.client.quiet();
+        try f.server.sent.quiet();
+        try f.expectRoutes(1);
+        try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.inboundExchange(stream) == null);
+        try serviceFinishSibling(&f, f.session, &f.client, 16 + stream, sibling);
+    }
+}
+
+test "service delayed backend STOP after request EOF leaves the pending response readable" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    const key = try f.open(f.session, 4);
+    var buf: [64]u8 = undefined;
+    var encoder = codec.FrameEncoder.init(&buf);
+    const end = try encoder.encodeData(.{ .eof = true }, "end");
+    f.handler.streamData(f.session, 4, end, false);
+    try f.server.sent.expect(.write, key.stream, end, true);
+    try f.deliver(key, .stop_sending, "", false);
+    f.handler.control(f.session, 4, .reset);
+    try f.client.quiet();
+    try f.response(key, &f.client, 4, "committed", true);
+    try f.expectRoutes(0);
+    try f.server.sent.quiet();
+}
+
+test "service timeout after response FIN stops remaining input and releases only the expired exchange" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    const expired = try f.open(f.session, 4);
+    const sibling = try f.open(f.session, 8);
+    try f.response(expired, &f.client, 4, "finished response", true);
+    try serviceSpill(&f, f.session, 4);
+
+    const route = f.worker.inflight.lookupRoute(expired) orelse return error.ResponseFinLostRequest;
+    try std.testing.expect(!route.request_done);
+    try std.testing.expect(route.response_done);
+    const deadline = route.last_active_at + inflight.request_timeout_us;
+    // Move the sibling's activity forward without sleeping or depending on scheduling.
+    try std.testing.expect(f.worker.inflight.touchRoute(sibling, deadline));
+    try std.testing.expect(!f.worker.expireInflight(deadline - 1));
+    try f.client.quiet();
+    try f.server.sent.quiet();
+    try std.testing.expect(f.worker.expireInflight(deadline));
+    try f.client.expect(.stop, 4, "", false);
+    try f.server.sent.expect(.invalidate, expired.stream, "", false);
+    try f.expectRoutes(1);
+    try std.testing.expect(f.worker.inflight.lookupRoute(expired) == null);
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.frameSpill(4) == null);
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.inboundExchange(4) == null);
+
+    // An acknowledgement, late DATA and raw FIN cannot write after invalidation.
+    f.handler.control(f.session, 4, .reset);
+    var buf: [64]u8 = undefined;
+    var encoder = codec.FrameEncoder.init(&buf);
+    const late = try encoder.encodeData(.{ .eof = true }, "late");
+    f.handler.streamData(f.session, 4, late, true);
+    try f.client.quiet();
+    try f.server.sent.quiet();
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.inboundExchange(4) == null);
+    try std.testing.expect(!f.worker.expireInflight(deadline));
+    try serviceFinishSibling(&f, f.session, &f.client, 8, sibling);
+}
+
+test "service session close after response FIN cleans owned discard routes and leaves another session alive" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    var other_client = ServiceTrace{};
+    const other_session = try f.handler.accept(other_client.session(), null);
+    const closing = try f.open(f.session, 4);
+    const sibling = try f.open(other_session, 4);
+    try f.response(closing, &f.client, 4, "finished response", true);
+    try serviceSpill(&f, f.session, 4);
+    // The owner must survive suppression of the response target.
+    f.handler.control(f.session, 4, .stop);
+    // A completed response does not need another reset.
+    try f.client.quiet();
+    f.handler.closed(f.session);
+    try f.server.sent.expect(.invalidate, closing.stream, "", false);
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session) == null);
+    try f.expectRoutes(1);
+    try std.testing.expect(f.worker.inflight.lookupRoute(closing) == null);
+    f.handler.control(f.session, 4, .reset);
+    f.handler.streamData(f.session, 4, "", true);
+    try f.deliver(closing, .stream_reset, "", false);
+    try f.client.quiet();
+    try f.server.sent.quiet();
+    try other_client.quiet();
+    try serviceFinishSibling(&f, other_session, &other_client, 4, sibling);
+}
+
+test "no-response early backend FIN waits for input and cancellation never acknowledges incomplete input" {
+    for ([_]bool{ false, true }) |cancel| {
+        var f = ServiceFixture{};
+        try f.init();
+        defer f.deinit();
+        var buf: [64]u8 = undefined;
+        var encoder = codec.FrameEncoder.init(&buf);
+        const open = try encoder.encodeOpen(.service, test_route, .none, .{}, "upload");
+        f.handler.streamData(f.session, 4, open, false);
+        const ctx = f.worker.conn_manager.getByHandle(f.session).?;
+        const key = ctx.inboundExchange(4).?.backend.?.key;
+        try f.server.sent.expect(.open, key.stream, open, false);
+        try f.deliver(key, .data, "", true);
+        try f.client.quiet();
+        try f.expectRoutes(1);
+        if (cancel) {
+            const deadline = f.worker.inflight.lookupRoute(key).?.last_active_at + inflight.request_timeout_us;
+            try std.testing.expect(f.worker.expireInflight(deadline));
+            // RESET response and STOP input; no success write/FIN.
+            try std.testing.expectEqual(@as(usize, 2), f.client.calls);
+            try std.testing.expectEqual(ServiceTrace.Op.stop, f.client.op);
+            try std.testing.expect(!f.client.fin);
+            try f.server.sent.expect(.invalidate, key.stream, "", false);
+        } else {
+            const end = try encoder.encodeData(.{ .eof = true }, "tail");
+            f.handler.streamData(f.session, 4, end, true);
+            try f.server.sent.expect(.write, key.stream, end, true);
+            try f.client.expect(.write, 4, "", true);
+        }
+        try f.expectRoutes(0);
+        try std.testing.expect(ctx.inboundExchange(4) == null);
+    }
+}
+
+test "active response closure survives history eviction and lower stream OPEN remains legal" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    const key = try f.open(f.session, 4);
+    try f.response(key, &f.client, 4, "completed", true);
+    const ctx = f.worker.conn_manager.getByHandle(f.session).?;
+    // Simulate newer completed exchanges moving the bounded history window.
+    ctx.noteResponseClosed(4096);
+    ctx.retired_inputs.remember(4096);
+    try std.testing.expect(!ctx.closed_responses.contains(4, false));
+    try std.testing.expect(ctx.responseClosed(4));
+    f.handler.control(f.session, 4, .reset);
+    try f.client.quiet();
+    try f.server.sent.expect(.invalidate, key.stream, "", false);
+    try f.expectRoutes(0);
+    // Raw QUIC streams may deliver their first OPEN out of stream-ID order.
+    const later = try f.open(f.session, 8);
+    try serviceFinishSibling(&f, f.session, &f.client, 8, later);
+}
+
+test "queued backend STOP racing DATA and empty client FIN preserves business response" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    const key = try f.open(f.session, 4);
+    f.server.stopped_write = key.stream;
+    var buf: [64]u8 = undefined;
+    var encoder = codec.FrameEncoder.init(&buf);
+    const data = try encoder.encodeData(.{}, "racing upload");
+    f.handler.streamData(f.session, 4, data, false);
+    f.handler.streamData(f.session, 4, "", true);
+    try f.server.sent.quiet();
+    try f.client.quiet();
+    try f.expectRoutes(1);
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.inboundExchange(4).?.transport_fin);
+    try f.deliver(key, .stop_sending, "", false);
+    // Client already sent transport FIN; another STOP is unnecessary.
+    try f.client.quiet();
+    try f.response(key, &f.client, 4, "business result", true);
+    try f.expectRoutes(0);
+    f.handler.control(f.session, 4, .reset);
+    try f.client.quiet();
+    try f.server.sent.quiet();
+}
+
+const ServiceReceiveErrors = struct {
+    threadlocal var count: usize = 0;
+    threadlocal var last: ?anyerror = null;
+
+    fn record(ctx: err_handler.ErrorContext) void {
+        count += 1;
+        last = ctx.raw_error;
+    }
+};
+
+test "service backend connection failure after response FIN stops input without rewriting the response or its sibling" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    const failed = try f.open(f.session, 4);
+    const sibling = try f.open(f.session, 8);
+    try f.response(failed, &f.client, 4, "finished response", true);
+    try serviceSpill(&f, f.session, 4);
+    {
+        // Capture the expected receive error; unexpected additional errors still fail.
+        ServiceReceiveErrors.count = 0;
+        ServiceReceiveErrors.last = null;
+        err_handler.setHandler(ServiceReceiveErrors.record);
+        defer err_handler.resetHandler();
+        f.server.failed_stream = failed.stream;
+        f.worker.drainTransport(f.server.transport(), test_realm);
+        f.server.failed_stream = null;
+        try std.testing.expectEqual(@as(usize, 1), ServiceReceiveErrors.count);
+        try std.testing.expectEqual(error.ConnectionFailed, ServiceReceiveErrors.last.?);
+    }
+    try f.client.expect(.stop, 4, "", false);
+    try f.server.sent.expect(.invalidate, failed.stream, "", false);
+    try f.expectRoutes(1);
+    try std.testing.expect(f.worker.inflight.lookupRoute(failed) == null);
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.frameSpill(4) == null);
+    f.handler.control(f.session, 4, .reset);
+    f.handler.streamData(f.session, 4, "", true);
+    try f.client.quiet();
+    try f.server.sent.quiet();
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.inboundExchange(4) == null);
+    try serviceFinishSibling(&f, f.session, &f.client, 8, sibling);
+}
+
+test "service backend RESET after response FIN stops the unfinished input and preserves its sibling" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    const failed = try f.open(f.session, 4);
+    const sibling = try f.open(f.session, 8);
+    try f.response(failed, &f.client, 4, "finished response", true);
+    try serviceSpill(&f, f.session, 4);
+    try f.deliver(failed, .stream_reset, "", false);
+    try f.client.expect(.stop, 4, "", false);
+    try f.server.sent.expect(.invalidate, failed.stream, "", false);
+    try f.expectRoutes(1);
+    try std.testing.expect(f.worker.inflight.lookupRoute(failed) == null);
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.frameSpill(4) == null);
+    f.handler.control(f.session, 4, .reset);
+    try f.deliver(failed, .stream_reset, "", false);
+    try f.client.quiet();
+    try f.server.sent.quiet();
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.inboundExchange(4) == null);
+    try serviceFinishSibling(&f, f.session, &f.client, 8, sibling);
+}
+
+test "service client RESET after response FIN cancels unfinished request without resetting completed response" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    const failed = try f.open(f.session, 4);
+    const sibling = try f.open(f.session, 8);
+    try f.response(failed, &f.client, 4, "finished response", true);
+    try serviceSpill(&f, f.session, 4);
+    f.handler.control(f.session, 4, .reset);
+    try f.server.sent.expect(.invalidate, failed.stream, "", false);
+    try f.client.quiet();
+    try f.expectRoutes(1);
+    try std.testing.expect(f.worker.inflight.lookupRoute(failed) == null);
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.frameSpill(4) == null);
+    try std.testing.expect(f.worker.conn_manager.getByHandle(f.session).?.inboundExchange(4) == null);
+    f.handler.control(f.session, 4, .reset);
+    try f.deliver(failed, .stop_sending, "", false);
+    try f.client.quiet();
+    try f.server.sent.quiet();
+    try serviceFinishSibling(&f, f.session, &f.client, 8, sibling);
+}
+
+fn serviceFinishSibling(f: *ServiceFixture, session: SessionHandle, client: *ServiceTrace, stream: u64, key: inflight.StreamKey) !void {
+    const route = f.worker.inflight.lookupRoute(key) orelse return error.SiblingRouteLost;
+    try std.testing.expect(!route.request_done);
+    try std.testing.expect(!route.response_done);
+    const ctx = f.worker.conn_manager.getByHandle(session) orelse return error.SiblingSessionLost;
+    const input = ctx.inboundExchange(stream) orelse return error.SiblingInputLost;
+    try std.testing.expect(!input.input_stopped);
+    try std.testing.expectEqual(key, input.backend.?.key);
+    var buf: [64]u8 = undefined;
+    var encoder = codec.FrameEncoder.init(&buf);
+    const end = try encoder.encodeData(.{ .eof = true }, "sibling request");
+    f.handler.streamData(session, stream, end, true);
+    try f.server.sent.expect(.write, key.stream, end, true);
+    try f.response(key, client, stream, "sibling response", true);
+    try f.expectRoutes(0);
+    try std.testing.expect(ctx.inboundExchange(stream) == null);
+    try f.server.sent.quiet();
+    try client.quiet();
+}
+
+// Go through framing, rather than inserting a synthetic spill directly into the context.
+fn serviceSpill(f: *ServiceFixture, session: SessionHandle, stream: u64) !void {
+    var buf: [64]u8 = undefined;
+    var encoder = codec.FrameEncoder.init(&buf);
+    const bytes = try encoder.encodeData(.{}, "incomplete body");
+    const fragment = bytes[0 .. bytes.len - 1];
+    f.handler.streamData(session, stream, fragment, false);
+    const ctx = f.worker.conn_manager.getByHandle(session) orelse return error.SessionMissing;
+    const spill = ctx.frameSpill(stream) orelse return error.PartialFrameNotBuffered;
+    try std.testing.expectEqualSlices(u8, fragment, spill.items);
+    try f.server.sent.quiet();
+    try f.client.quiet();
+}
+
+test "service raw empty FIN without application EOF clears a partial frame in either response FIN order" {
+    var f = ServiceFixture{};
+    try f.init();
+    defer f.deinit();
+    for ([_]bool{ false, true }, 0..) |response_first, i| {
+        const stream: u64 = 4 * i;
+        const key = try f.open(f.session, stream);
+        if (response_first) try f.response(key, &f.client, stream, "early response", true);
+        try serviceSpill(&f, f.session, stream);
+        f.handler.streamData(f.session, stream, "", true);
+        try f.server.sent.expect(.write, key.stream, "", true);
+        const ctx = f.worker.conn_manager.getByHandle(f.session).?;
+        try std.testing.expect(ctx.frameSpill(stream) == null);
+        try std.testing.expect(ctx.inboundExchange(stream) == null);
+        try f.client.quiet();
+        if (!response_first) {
+            const route = f.worker.inflight.lookupRoute(key) orelse return error.RawFinLostResponse;
+            try std.testing.expect(route.request_done);
+            try std.testing.expect(!route.response_done);
+            try f.response(key, &f.client, stream, "late response", true);
+        }
+        try f.expectRoutes(0);
+        f.handler.control(f.session, stream, .reset);
+        try f.client.quiet();
+        try f.server.sent.quiet();
+    }
+}
+
+test "service partial input spill is released by STOP timeout RESET and session close after response FIN" {
+    const Termination = enum { backend_stop, timeout, backend_reset, client_reset, session_close };
+    for (std.enums.values(Termination)) |termination| {
+        var f = ServiceFixture{};
+        try f.init();
+        defer f.deinit();
+        var other_client = ServiceTrace{};
+        const other_session = try f.handler.accept(other_client.session(), null);
+        const key = try f.open(f.session, 4);
+        const sibling = try f.open(other_session, 4);
+        try f.response(key, &f.client, 4, "early response", true);
+
+        var buf: [64]u8 = undefined;
+        var encoder = codec.FrameEncoder.init(&buf);
+        const bytes = try encoder.encodeData(.{}, "unfinished frame");
+        // Drive the real framing path: only part of the DATA header has arrived.
+        f.handler.streamData(f.session, 4, bytes[0..3], false);
+        const ctx = f.worker.conn_manager.getByHandle(f.session).?;
+        try std.testing.expect(ctx.frameSpill(4) != null);
+        try f.server.sent.quiet();
+        try f.client.quiet();
+
+        switch (termination) {
+            .backend_stop => try f.deliver(key, .stop_sending, "", false),
+            .timeout => {
+                const route = f.worker.inflight.lookupRoute(key) orelse return error.ResponseFinLostRequest;
+                const deadline = route.last_active_at + inflight.request_timeout_us;
+                try std.testing.expect(f.worker.inflight.touchRoute(sibling, deadline));
+                try std.testing.expect(f.worker.expireInflight(deadline));
+            },
+            .backend_reset => try f.deliver(key, .stream_reset, "", false),
+            .client_reset => f.handler.control(f.session, 4, .reset),
+            .session_close => f.handler.closed(f.session),
+        }
+        switch (termination) {
+            .backend_stop, .timeout, .backend_reset => try f.client.expect(.stop, 4, "", false),
+            .client_reset, .session_close => try f.client.quiet(),
+        }
+        if (termination == .backend_stop) {
+            try f.server.sent.quiet();
+        } else {
+            try f.server.sent.expect(.invalidate, key.stream, "", false);
+        }
+        try f.expectRoutes(1);
+        try std.testing.expect(f.worker.inflight.lookupRoute(key) == null);
+        if (termination == .session_close) {
+            try std.testing.expect(f.worker.conn_manager.getByHandle(f.session) == null);
+        } else {
+            try std.testing.expect(ctx.frameSpill(4) == null);
+            try std.testing.expect(ctx.inboundExchange(4) == null);
+        }
+        f.handler.control(f.session, 4, .reset);
+        f.handler.streamData(f.session, 4, bytes[3..], true);
+        try f.client.quiet();
+        try f.server.sent.quiet();
+        try other_client.quiet();
+        try serviceFinishSibling(&f, other_session, &other_client, 4, sibling);
+    }
 }

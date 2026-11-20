@@ -39,6 +39,9 @@ pub const TransportError = error{
     ConnectionFailed,
     /// 发送数据失败
     SendFailed,
+    /// An existing request write failed with STOP_SENDING still queued for that handle.
+    /// The event remains available to receive(); the response direction stays independent.
+    RequestStopped,
     /// 接收数据失败
     ReceiveFailed,
     /// 路由未找到（RouteId 未注册）

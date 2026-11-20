@@ -407,13 +407,19 @@ func (s *imSession) sendNoResponse(parent context.Context, request *wire.Frame) 
 	if err != nil {
 		return fmt.Errorf("open no-response stream: %w", err)
 	}
-	_ = stream.SetDeadline(time.Now().Add(4 * time.Second))
-	if err := wire.WriteFrame(stream, request); err != nil {
+	return sendNoResponseOnStream(ctx, stream, request)
+}
+
+func sendNoResponseOnStream(ctx context.Context, stream requestStream, request *wire.Frame) error {
+	deadline, _ := ctx.Deadline()
+	_ = stream.SetDeadline(deadline)
+	if err := wire.WriteFrame(stream, request); err != nil && !remoteStreamError(err) {
 		stream.CancelRead(1)
 		stream.CancelWrite(1)
 		return fmt.Errorf("write no-response request: %w", err)
 	}
-	if err := stream.Close(); err != nil {
+	if err := finishUpload(stream); err != nil {
+		stream.CancelRead(1)
 		return fmt.Errorf("finish no-response request: %w", err)
 	}
 	response, err := wire.ReadFrame(stream)
@@ -436,14 +442,19 @@ func (s *imSession) exchange(parent context.Context, request *wire.Frame) (*wire
 	if err != nil {
 		return nil, fmt.Errorf("open QUIC stream: %w", err)
 	}
-	deadline := time.Now().Add(12 * time.Second)
+	return imExchangeOnStream(ctx, stream, request)
+}
+
+func imExchangeOnStream(ctx context.Context, stream requestStream, request *wire.Frame) (*wire.Frame, error) {
+	deadline, _ := ctx.Deadline()
 	_ = stream.SetDeadline(deadline)
-	if err := wire.WriteFrame(stream, request); err != nil {
+	if err := wire.WriteFrame(stream, request); err != nil && !remoteStreamError(err) {
 		stream.CancelRead(1)
 		stream.CancelWrite(1)
 		return nil, fmt.Errorf("write request: %w", err)
 	}
-	if err := stream.Close(); err != nil {
+	if err := finishUpload(stream); err != nil {
+		stream.CancelRead(1)
 		return nil, fmt.Errorf("finish request: %w", err)
 	}
 	response, err := wire.ReadFrame(stream)

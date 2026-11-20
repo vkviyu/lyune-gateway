@@ -139,6 +139,16 @@ pub fn handleSessionData(self: *GatewayWorker, session: SessionHandle, stream_id
         },
     }
 
+    // Never infer retirement from the numeric age of an OPEN: QUIC streams are
+    // independently ordered. Existing parsers and exchanges take precedence.
+    if (!ctx.peer_node and ctx.inboundExchange(stream_id) == null and ctx.frameSpill(stream_id) == null and
+        ctx.stopped_inputs.contains(stream_id, false)) return;
+    if (ctx.inboundExchange(stream_id)) |active| {
+        if (active.input_stopped) {
+            if (is_fin) ctx.removeInboundExchange(stream_id);
+            return;
+        }
+    }
     var dispatcher = FrameDispatcher{ .worker = self, .ctx = ctx, .stream_id = stream_id };
 
     // 已有残帧就接着用那份缓冲；没有就借栈上的空壳，避免无谓的表操作。
@@ -146,6 +156,7 @@ pub fn handleSessionData(self: *GatewayWorker, session: SessionHandle, stream_id
     const existing = ctx.frameSpill(stream_id);
     const spill = existing orelse &fresh_spill;
 
+    ctx.draining_stream = stream_id;
     const drained = framing.drainFrames(
         FrameDispatcher,
         &dispatcher,
@@ -155,6 +166,7 @@ pub fn handleSessionData(self: *GatewayWorker, session: SessionHandle, stream_id
         data,
         codec.MAX_FRAME_SIZE,
     );
+    ctx.draining_stream = null;
 
     // 先把缓冲状态落回 ctx：栈上那份残帧不落盘就会随本函数返回丢失，
     // 而后续清理必须在 drainFrames 返回之后才能碰它。
@@ -171,6 +183,10 @@ pub fn handleSessionData(self: *GatewayWorker, session: SessionHandle, stream_id
             fresh_spill.deinit(self.allocator);
         }
     } else if (spill.items.len == 0) {
+        ctx.dropFrameSpill(stream_id);
+    }
+    if (ctx.deferred_spill_drop) {
+        ctx.deferred_spill_drop = false;
         ctx.dropFrameSpill(stream_id);
     }
 
@@ -221,40 +237,66 @@ pub fn handleSessionControl(self: *GatewayWorker, session: SessionHandle, stream
     switch (event) {
         .reset => resetClientInput(self, ctx, stream_id),
         .stop => {
+            // Push directions are independent of client request routing.
+            if (stream_id & 3 != 0 or ctx.peer_node) {
+                ctx.transport.resetSend(stream_id, 0);
+                return;
+            }
+            const already_closed = ctx.responseClosed(stream_id);
             _ = self.inflight.suppressClientResponse(ctx.session_handle, stream_id);
             _ = self.inflight.suppressAuthResponse(ctx.session_handle, stream_id);
 
             // RFC 9000 的 STOP_SENDING 要求发送方用 RESET_STREAM 收敛自己的发送状态。
             // 不复用 replyControl：任何应用字节都可能被 reset 丢掉，而且对端已经明确
             // 表示不再接收这一方向。
-            ctx.transport.resetSend(stream_id, 0);
+            if (!already_closed) ctx.transport.resetSend(stream_id, 0);
+            ctx.noteResponseClosed(stream_id);
         },
     }
 }
 
 /// 丢弃一条被 RESET_STREAM 中止的输入方向及其局部分帧状态。
 fn resetClientInput(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64) void {
+    const had_spill = ctx.frameSpill(stream_id) != null;
     ctx.dropFrameSpill(stream_id);
 
     const active = ctx.inboundExchange(stream_id) orelse {
+        if (stream_id & 3 != 0) return;
+        // A physical FIN may already have removed the parser, while a completed
+        // request still owns its response. RESET then only acknowledges input.
+        var routes = self.inflight.routes.valueIterator();
+        while (routes.next()) |route| {
+            const owner = GatewayWorker.routeOwner(route.*) orelse continue;
+            if (owner.session.eql(ctx.session_handle) and owner.stream_id == stream_id) return;
+        }
+        var auths = self.inflight.auths.valueIterator();
+        while (auths.next()) |pending| {
+            if (pending.client_session.eql(ctx.session_handle) and pending.client_stream_id == stream_id) return;
+        }
+        if (!had_spill and (ctx.retired_inputs.contains(stream_id, true) or
+            ctx.stopped_inputs.contains(stream_id, true))) return;
         // RESET 可能先于同一流已排队的应用字节到达，picoquic 会按最终大小丢弃那些
         // 字节。此时还没有 InboundExchange，但返回方向仍必须明确异常结束。
-        ctx.transport.resetSend(stream_id, 0);
+        if (!ctx.responseClosed(stream_id)) ctx.transport.resetSend(stream_id, 0);
+        ctx.noteResponseClosed(stream_id);
+        ctx.stopped_inputs.remember(stream_id);
+        ctx.retired_inputs.remember(stream_id);
         return;
     };
-    if (!active.input_complete) {
-        // 请求没有应用 eof，不能让它继续占着回程映射。DirectTransport 当前用 FIN
-        // 收尾后端输入，让后端能立即发现缺少应用 eof；响应映射随即删除并被丢弃。
+    if (!active.input_complete and !active.input_stopped) {
+        // 未提交完整输入的主动取消必须取消后端流，不能伪装成正常 FIN。
         if (active.backend) |backend| {
-            self.finishBackendStream(backend);
+            self.cancelBackendStream(backend.key);
             self.inflight.closeRoute(backend.key);
         }
         if (active.push_session != 0) egress.abortSessionById(self, active.push_session);
 
         // 输入缺少应用 eof，这次交换不可能再成功。RESET 返回方向让客户端立即得到
         // 异常结束；若只清内部状态，客户端会一直读到自己的 deadline。
-        ctx.transport.resetSend(stream_id, 0);
+        if (!ctx.responseClosed(stream_id)) ctx.transport.resetSend(stream_id, 0);
+        ctx.noteResponseClosed(stream_id);
     }
+    if (active.input_stopped or !active.input_complete) ctx.stopped_inputs.remember(stream_id);
     // 已经完整提交的请求只释放输入解析状态，回程映射继续存活；RESET_STREAM 本身
     // 不等同于 STOP_SENDING，客户端仍可能等待另一方向的响应。
     ctx.removeInboundExchange(stream_id);
@@ -267,6 +309,7 @@ fn resetClientInput(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u6
 /// 后续帧即使伪造 8 字节的 OPEN 帧头，也改不了已经定型的投递目标。
 pub fn dispatchFrame(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u64, parsed: codec.Frame) FrameOutcome {
     if (ctx.inboundExchange(stream_id)) |active| {
+        if (active.input_stopped) return .stop_stream;
         // eof 之后这条流上不该再有帧。这是无歧义的编码器错误：网关这边条目还在，
         // 说明它确实见过这次交换的结束标记。
         if (active.input_complete) {
@@ -284,6 +327,7 @@ pub fn dispatchFrame(self: *GatewayWorker, ctx: *ConnectionContext, stream_id: u
         return appendToExchange(self, ctx, stream_id, active, parsed);
     }
 
+    if (!ctx.peer_node and ctx.stopped_inputs.contains(stream_id, false)) return .stop_stream;
     if (parsed.header.isOpen()) return openInboundExchange(self, ctx, stream_id, parsed);
 
     // 查不到交换的 DATA 帧一律丢弃，**不**升级为协议违规。
@@ -502,8 +546,10 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     };
 
     self.inflight.openRoute(backend.key, .{
+        .owner = .{ .session = ctx.session_handle, .stream_id = stream_id },
+        .request_done = is_last,
         .target = switch (header.response_mode) {
-            .required => .{ .client = .{ .session = ctx.session_handle, .stream_id = stream_id } },
+            .required => if (ctx.closed_responses.contains(stream_id, false)) .discard else .{ .client = .{ .session = ctx.session_handle, .stream_id = stream_id } },
             .none => .discard,
         },
         .realm = ctx.realm,
@@ -511,7 +557,7 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
     }) catch |err| {
         // 登记不上回程映射，后端的响应就找不回客户端。当场把后端流收尾，
         // 否则它会一直等一个永远不来的 eof。
-        self.finishBackendStream(backend);
+        self.cancelBackendStream(backend.key);
         err_handler.reportError(.session, "Failed to track in-flight request", err);
         self.replyControl(ctx.session_handle, stream_id, .gateway_error, "gateway busy");
         return .continue_stream;
@@ -522,8 +568,9 @@ fn openServiceExchange(self: *GatewayWorker, ctx: *ConnectionContext, stream_id:
         .backend = if (is_last) null else backend,
         .response_mode = header.response_mode,
         .input_complete = is_last,
+        .response_closed = ctx.responseClosed(stream_id),
     }) catch |err| {
-        self.finishBackendStream(backend);
+        self.cancelBackendStream(backend.key);
         self.inflight.closeRoute(backend.key);
         err_handler.reportError(.session, "Failed to track exchange", err);
         self.replyControl(ctx.session_handle, stream_id, .gateway_error, "gateway busy");
@@ -559,14 +606,18 @@ fn appendToExchange(
         return .continue_stream;
     };
 
-    const transport = self.transport_registry.find(backend.scope) orelse {
+    const candidate = self.transport_registry.find(backend.scope);
+    const transport = (if (candidate) |value|
+        (if (value.id() == backend.key.transport) value else null)
+    else
+        null) orelse {
         // transport 中途消失（配置重载/后端摘除）。后端已经收到前半段，
         // 继续发只会拼出一条残缺的字节流，因此这次交换就地作废。
         std.log.warn("[STREAM] transport disappeared mid-exchange: stream={}", .{stream_id});
-        self.inflight.closeRoute(backend.key);
+        if (self.inflight.lookupRoute(backend.key)) |route| self.failRoute(backend.key, route, "backend unavailable");
         ctx.removeInboundExchange(stream_id);
-        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "backend unavailable");
-        return .continue_stream;
+        ctx.dropFrameSpill(stream_id);
+        return .stop_stream;
     };
 
     // 映射可能已经因真实空闲而被周期回收；先判定再发送，不能把一帧交给后端后才
@@ -578,17 +629,20 @@ fn appendToExchange(
         // 补 FIN：picoquic 会把它作为单流写失败返回，错误处理若放大就会误伤共享连接
         // 上仍然活跃的兄弟 exchange。只收掉本地解析状态；客户端此前已经收到 timeout。
         ctx.removeInboundExchange(stream_id);
-        return .continue_stream;
+        ctx.dropFrameSpill(stream_id);
+        return .stop_stream;
     }
 
     const is_last = parsed.header.isLast();
     _ = transport.sendStream(backend.scope.route, backend.key.stream, parsed.bytes, is_last) catch |err| {
+        // The transport has observed STOP, but the queued event owns the state
+        // transition. In particular, do not turn its still-valid response into an error.
+        if (err == error.RequestStopped) return .continue_stream;
         err_handler.reportError(.session, "Failed to append to backend stream", err);
-        self.finishBackendStream(backend);
-        self.inflight.closeRoute(backend.key);
+        if (self.inflight.lookupRoute(backend.key)) |route| self.failRoute(backend.key, route, "backend unavailable");
         ctx.removeInboundExchange(stream_id);
-        self.replyControl(ctx.session_handle, stream_id, .gateway_error, "backend unavailable");
-        return .continue_stream;
+        ctx.dropFrameSpill(stream_id);
+        return .stop_stream;
     };
 
     if (is_last) {
@@ -596,6 +650,7 @@ fn appendToExchange(
         // 回程映射不能删——后端的响应还没回来。
         active.backend = null;
         active.input_complete = true;
+        self.inflight.finishRequest(backend.key, quic.c.currentTime());
         if (active.response_mode == .none) {
             self.finishResponseWithoutPayload(ctx.session_handle, stream_id);
         }
@@ -615,7 +670,21 @@ pub fn finishClientStream(self: *GatewayWorker, ctx: *ConnectionContext, stream_
         ctx.dropFrameSpill(stream_id);
     }
     if (ctx.inboundExchange(stream_id)) |active| {
-        if (active.backend) |backend| self.finishBackendStream(backend);
+        if (active.input_stopped) {
+            ctx.removeInboundExchange(stream_id);
+            return;
+        }
+        if (active.backend) |backend| {
+            self.finishBackendStream(backend) catch |err| {
+                if (err == error.RequestStopped) {
+                    active.transport_fin = true;
+                    return;
+                }
+                if (self.inflight.lookupRoute(backend.key)) |route| self.failRoute(backend.key, route, "backend unavailable");
+                ctx.removeInboundExchange(stream_id);
+                return;
+            };
+        }
         if (!active.input_complete and active.response_mode == .none) {
             self.finishResponseWithoutPayload(ctx.session_handle, stream_id);
         }

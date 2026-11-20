@@ -180,9 +180,13 @@ Exchange。这个约束消除了“同一个 stream id 上两轮 OPEN 互相覆�
 - 客户端发 `RESET_STREAM`：取消客户端 → Gateway 的输入。请求尚未完整提交时，Gateway
   取消对应后端输入并清理 Exchange；若应用 EOF 已经提交，副作用可能已经发生，响应仍可返回。
 - 客户端发 `STOP_SENDING`：取消 Gateway → 客户端的返回。Gateway 不回滚已经提交的请求，
-  只把该 Exchange 的响应目标切换为 discard，并把停止信号传播到对应后端流。
-- 后端对流发 reset/stop：`DirectTransport` 必须把事件连同后端连接和 stream id 交给 Worker，
-  Worker 再精确终止对应客户端流，不能把取消静默退化成客户端 deadline。
+  把该 Exchange 的响应目标切换为 discard，并以 RESET 收敛客户端返回方向；后端响应继续
+  排空到 FIN、故障或空闲超时。请求尚未发完时仍可继续上传。
+- 后端发 `STOP_SENDING`：只停止 Gateway → 后端的请求输入。Gateway 通知客户端停写，
+  保留后端 → 客户端的响应路由，直到响应 FIN、RESET、故障或空闲超时。客户端确认 STOP
+  的 RESET 不得再次取消响应；Raw QUIC 与 WSS 客户端也必须继续读取业务响应。
+- 后端发 `RESET_STREAM`：响应异常终止，Gateway 取消对应交换尚未结束的方向，释放映射、
+  输入解析状态和配额。已经正常 FIN 的客户端响应不能再被重置。
 
 应用 `eof`/传输 FIN 表示正常完整结束；reset/stop 表示取消。两者不能互换，否则接收方会把
 半条流当作完整业务输入，或者让已取消交换继续占用 inflight 与接收槽位。
@@ -604,10 +608,10 @@ TransportSession ephemeral 事件（Raw QUIC DATAGRAM / WSS EPHEMERAL record）
 语法与客户端方向完全相同（`.gateway` + `route_key = ControlType`），**但白名单不同**，
 这正是 §1.5「语法对称，权限不对称」。
 
-| 控制类型                     | body                               | 作用                 |
-| ---------------------------- | ---------------------------------- | -------------------- |
-| `kick_off`                   | `TokenList` of `conn_token`        | 断开指定的那几条连接 |
-| `join_group` / `leave_group` | `group_id` + `TokenList`           | 维护组播组成员       |
+| 控制类型                     | body                        | 作用                 |
+| ---------------------------- | --------------------------- | -------------------- |
+| `kick_off`                   | `TokenList` of `conn_token` | 断开指定的那几条连接 |
+| `join_group` / `leave_group` | `group_id` + `TokenList`    | 维护组播组成员       |
 
 三者都按 **`conn_token`** 而不是 `dest_id` 定位，理由相同：`dest_id` 是一对多的（§5.6），
 而"换设备登录只踢旧设备"、"这台设备打开了这个文档"都必须精确到一条连接。后端在认证时
@@ -638,6 +642,16 @@ node/worker/slot/generation 从初值重新出现。两者缺一，迟到的 kic
 后端写几次、什么时候带 `eof`，客户端就那样收到。网关不合并也不拆分。
 因此四种组合都合法：一次性请求 + 流式响应（AI 逐 token）、流式请求 + 一次性响应
 （上传后回 ack）、以及另外两种。
+
+请求输入与响应输出独立结束。后端响应先 FIN 时，只标记响应方向结束，仍转发该请求的
+后续 DATA；请求 EOF/正常传输 FIN 与响应 FIN 都到达后才删除普通 inflight 映射。
+后端 STOP 则把请求方向标记为停止，不等同于响应失败。超时、连接断开和主动取消走独立的
+异常回收，按后端连接代际与流句柄取消，不影响同连接其他交换。
+
+仍在上传的半关闭请求继续占用原有 inflight/realm 配额，并沿用双向有效活动的 60 秒空闲
+超时；FIN/STOP 重复事件不会续期。响应目标为 discard 时也保留请求所属客户端身份，
+保证客户端断开能取消未完成的上传。已经提交的无响应请求以及网关生命周期通知仍等待
+后端正常收尾、故障或空闲超时。
 
 ### 7.4 网关主动发起的交换
 

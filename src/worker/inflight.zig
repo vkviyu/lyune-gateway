@@ -6,7 +6,7 @@
 //! ## 为什么独立成模块
 //!
 //! 这两张表是两条无界内存增长的防线，而它们的回收路径有三条：
-//!   1. 正常路径——后端响应带 fin 时删除；
+//!   1. 正常路径——请求和响应两个方向都结束时删除；
 //!   2. 连接关闭——客户端走了，属于它的条目必须全清，否则回程会拿到野指针；
 //!   3. 超时兜底——后端不回包、只回一半、或 fin 丢失时，条目只能靠时间回收。
 //!
@@ -83,14 +83,19 @@ pub const ResponseTarget = union(enum) {
 /// 后端流 -> 响应去向的回程映射。
 pub const Route = struct {
     target: ResponseTarget,
+    /// 请求所属客户端流；响应被抑制为 discard 后仍保留，供断连取消使用。
+    owner: ?ClientResponse = null,
+    /// 默认兼容已完整提交的单帧请求；流式请求应显式设为 false。
+    request_done: bool = true,
+    response_done: bool = false,
     /// 发起这条请求的连接所属 realm；配额归还时从这里取（见文件开头）。
     realm: RealmId,
-    /// 最近一次成功转发完整应用帧的时刻（微秒）。客户端上行和后端下行都会刷新；
+    /// 最近一次成功转发完整应用帧或某方向首次结束的时刻（微秒）。
     /// 后端不回包、双方都停止活动或 fin 丢失时，条目最终由空闲超时回收。
     last_active_at: u64,
 };
 
-/// 超时摘出的普通请求。key 仍需保留：Worker 用它找到 transport，并按后端流句柄
+/// 超时或断连摘出的普通请求。key 仍需保留：Worker 用它找到 transport，并按后端流句柄
 /// 精确淘汰无响应的连接；Route 则决定是否以及向哪个客户端回错。
 pub const ExpiredRoute = struct {
     key: StreamKey,
@@ -228,6 +233,9 @@ pub const Tables = struct {
         // 的成因，而且症状要几天后才显现。
         if (entry.found_existing) self.route_quota.release(entry.value_ptr.realm);
         entry.value_ptr.* = route;
+        if (route.owner == null and route.target == .client) {
+            entry.value_ptr.owner = route.target.client;
+        }
         self.route_quota.acquire(route.realm);
         self.noteExpiry(route.last_active_at);
     }
@@ -248,6 +256,24 @@ pub const Tables = struct {
 
     pub fn closeRoute(self: *Tables, key: StreamKey) void {
         self.dropRoute(key);
+    }
+
+    /// 标记请求完成；重复通知及已删除的键不刷新时钟，不重复归还配额。
+    pub fn finishRequest(self: *Tables, key: StreamKey, now: u64) void {
+        const route = self.routes.getPtr(key) orelse return;
+        if (route.request_done) return;
+        route.request_done = true;
+        route.last_active_at = now;
+        if (route.response_done) _ = self.takeRoute(key);
+    }
+
+    /// 标记响应完成；上行尚未结束时保留路由和配额。
+    pub fn finishResponse(self: *Tables, key: StreamKey, now: u64) void {
+        const route = self.routes.getPtr(key) orelse return;
+        if (route.response_done) return;
+        route.response_done = true;
+        route.last_active_at = now;
+        if (route.request_done) _ = self.takeRoute(key);
     }
 
     /// 客户端不再接收某条流的返回方向时，把目标原地降级为 discard。
@@ -453,6 +479,26 @@ pub const Tables = struct {
     // 回收
     // ========================================================================
 
+    /// 摘出断连时需要取消的客户端请求，最多填满 out。调用方可重复调用直到返回 0。
+    /// 已完整提交的 discard 请求和无 owner 的 lifecycle 请求继续等待后端收尾。
+    pub fn takeSessionRoutes(self: *Tables, session: SessionHandle, out: []ExpiredRoute) usize {
+        if (out.len == 0) return 0;
+        var count: usize = 0;
+        var it = self.routes.iterator();
+        while (it.next()) |entry| {
+            const route = entry.value_ptr;
+            const owner = route.owner orelse continue;
+            if (!owner.session.eql(session)) continue;
+            if (route.target == .discard and route.request_done) continue;
+            out[count].key = entry.key_ptr.*;
+            count += 1;
+            if (count == out.len) break;
+        }
+        // 扫描结束后再删除，避免迭代期间修改哈希表。
+        for (out[0..count]) |*item| item.route = self.takeRoute(item.key).?;
+        return count;
+    }
+
     /// routes 的唯一删除出口；配额递减贴在这里，三条回收路径都经由它。
     fn takeRoute(self: *Tables, key: StreamKey) ?Route {
         const removed = self.routes.fetchRemove(key) orelse return null;
@@ -536,6 +582,199 @@ fn routeClient(route: Route) ClientResponse {
         .client => |client| client,
         .discard => unreachable,
     };
+}
+
+test "route completion in either order is idempotent and releases quota once" {
+    for ([_]bool{ false, true }) |request_first| {
+        for ([_]bool{ false, true }) |discard| {
+            var tables = try Tables.init(std.testing.allocator);
+            defer tables.deinit();
+            const key = streamKey(7);
+            var route = clientRoute(fakeSession(1), 4, 3, 100);
+            route.request_done = false;
+            if (discard) route.target = .discard;
+            try tables.openRoute(key, route);
+
+            if (request_first) tables.finishRequest(key, 200) else tables.finishResponse(key, 200);
+            const half = tables.lookupRoute(key).?;
+            try std.testing.expectEqual(request_first, half.request_done);
+            try std.testing.expectEqual(!request_first, half.response_done);
+            try std.testing.expectEqual(@as(u64, 200), half.last_active_at);
+            try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
+            try std.testing.expectEqual(@as(u32, 1), tables.route_quota.count(3));
+
+            if (request_first) tables.finishRequest(key, 300) else tables.finishResponse(key, 300);
+            try std.testing.expectEqualDeep(half, tables.lookupRoute(key).?);
+            if (request_first) tables.finishResponse(key, 400) else tables.finishRequest(key, 400);
+            try std.testing.expect(tables.lookupRoute(key) == null);
+            tables.finishRequest(key, 500);
+            tables.finishResponse(key, 600);
+            tables.closeRoute(key);
+            try std.testing.expectEqual(@as(u32, 0), tables.routeCount());
+            try std.testing.expectEqual(@as(u32, 0), tables.route_quota.count(3));
+            try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
+            try std.testing.expectEqual(@as(usize, 0), tables.route_quota.active_realms);
+        }
+    }
+}
+
+test "route completion defaults preserve submitted requests and infer owner" {
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+    const key = streamKey(1);
+    const route = clientRoute(fakeSession(1), 4, 1, 100);
+    try std.testing.expect(route.owner == null);
+    try tables.openRoute(key, route);
+    const stored = tables.lookupRoute(key).?;
+    try std.testing.expectEqualDeep(route.target.client, stored.owner.?);
+    try std.testing.expect(stored.request_done);
+    try std.testing.expect(!stored.response_done);
+    tables.finishRequest(key, 200);
+    try std.testing.expectEqual(@as(u64, 100), tables.lookupRoute(key).?.last_active_at);
+    tables.finishResponse(key, 300);
+    try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
+
+    var replacement = route;
+    replacement.owner = .{ .session = fakeSession(2), .stream_id = 8 };
+    replacement.request_done = false;
+    try tables.openRoute(key, replacement);
+    try std.testing.expectEqualDeep(replacement.owner, tables.lookupRoute(key).?.owner);
+    tables.finishResponse(key, 400);
+    replacement.realm = 2;
+    try tables.openRoute(key, replacement);
+    try std.testing.expect(!tables.lookupRoute(key).?.response_done);
+    try std.testing.expectEqual(@as(u32, 0), tables.route_quota.count(1));
+    try std.testing.expectEqual(@as(u32, 1), tables.route_quota.count(2));
+    tables.finishRequest(key, 500);
+    tables.finishResponse(key, 600);
+    try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
+}
+
+test "half closed routes expire from the genuine transition despite duplicate FIN" {
+    for ([_]bool{ false, true }) |request_first| {
+        var tables = try Tables.init(std.testing.allocator);
+        defer tables.deinit();
+        const key = streamKey(1);
+        var route = clientRoute(fakeSession(1), 4, 1, 100);
+        route.request_done = false;
+        try tables.openRoute(key, route);
+        if (request_first) tables.finishRequest(key, 200) else tables.finishResponse(key, 200);
+        if (request_first) tables.finishRequest(key, 900) else tables.finishResponse(key, 900);
+        var out: [1]ExpiredRoute = undefined;
+        try std.testing.expectEqual(@as(usize, 0), tables.takeExpiredRoutes(100 + request_timeout_us, &out));
+        tables.refreshExpiryDeadline();
+        try std.testing.expect(!tables.expirationDue(200 + request_timeout_us - 1));
+        try std.testing.expect(tables.expirationDue(200 + request_timeout_us));
+        try std.testing.expectEqual(@as(usize, 0), tables.takeExpiredRoutes(200 + request_timeout_us - 1, &out));
+        try std.testing.expectEqual(@as(usize, 1), tables.takeExpiredRoutes(200 + request_timeout_us, &out));
+        try std.testing.expectEqual(key, out[0].key);
+        try std.testing.expectEqual(request_first, out[0].route.request_done);
+        try std.testing.expectEqual(!request_first, out[0].route.response_done);
+        tables.finishRequest(key, 1_000);
+        tables.finishResponse(key, 1_000);
+        try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
+        tables.refreshExpiryDeadline();
+        try std.testing.expect(tables.next_expiry_at == null);
+    }
+}
+
+test "session extraction filters discard requests by ownership and submission" {
+    const session = fakeSession(1);
+    const owner = ClientResponse{ .session = session, .stream_id = 4 };
+    const other = ClientResponse{ .session = fakeSession(2), .stream_id = 4 };
+    const reused = ClientResponse{ .session = .{ .slot = session.slot, .generation = 2 }, .stream_id = 4 };
+    const Case = struct {
+        target: ResponseTarget = .discard,
+        owner: ?ClientResponse = null,
+        request_done: bool = false,
+        response_done: bool = false,
+        cancel: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .target = .{ .client = owner }, .cancel = true },
+        .{ .target = .{ .client = owner }, .request_done = true, .cancel = true },
+        .{ .target = .{ .client = owner }, .response_done = true, .cancel = true },
+        .{ .owner = owner, .cancel = true },
+        .{ .owner = owner, .response_done = true, .cancel = true },
+        .{ .owner = owner, .request_done = true },
+        .{},
+        .{ .request_done = true },
+        .{ .owner = other },
+        .{ .owner = reused },
+        .{ .target = .{ .client = other } },
+        // Explicit ownership takes precedence over the response destination.
+        .{ .target = .{ .client = owner }, .owner = other },
+    };
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+    for (cases, 0..) |case, i| {
+        try tables.openRoute(streamKey(@intCast(i)), .{
+            .target = case.target,
+            .owner = case.owner,
+            .request_done = case.request_done,
+            .response_done = case.response_done,
+            .realm = @intCast(i + 1),
+            .last_active_at = 100,
+        });
+    }
+    var out: [1]ExpiredRoute = undefined;
+    try std.testing.expectEqual(@as(usize, 0), tables.takeSessionRoutes(session, out[0..0]));
+    var seen = [_]bool{false} ** cases.len;
+    var total: usize = 0;
+    while (tables.takeSessionRoutes(session, &out) != 0) {
+        const i: usize = @intCast(out[0].key.stream);
+        try std.testing.expect(cases[i].cancel);
+        try std.testing.expect(!seen[i]);
+        seen[i] = true;
+        total += 1;
+        try std.testing.expect(out[0].route.owner.?.session.eql(session));
+        try std.testing.expectEqual(cases[i].request_done, out[0].route.request_done);
+        try std.testing.expectEqual(cases[i].response_done, out[0].route.response_done);
+    }
+    for (cases, 0..) |case, i| {
+        try std.testing.expectEqual(case.cancel, seen[i]);
+        try std.testing.expectEqual(!case.cancel, tables.lookupRoute(streamKey(@intCast(i))) != null);
+        try std.testing.expectEqual(@as(u32, if (case.cancel) 0 else 1), tables.route_quota.count(@intCast(i + 1)));
+    }
+    try std.testing.expectEqual(cases.len - total, tables.route_quota.total);
+    tables.purge(.{ .older_than = 101 });
+    try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
+}
+
+test "session extraction keeps suppressed submitted requests and batches active requests" {
+    var tables = try Tables.init(std.testing.allocator);
+    defer tables.deinit();
+    const session = fakeSession(1);
+    try tables.openRoute(streamKey(0), clientRoute(session, 0, 1, 100));
+    try std.testing.expect(tables.suppressClientResponse(session, 0));
+    const total = purge_batch * 2 + 5;
+    for (0..total) |i| {
+        var route = clientRoute(session, @intCast(i + 1), 2, 100);
+        route.request_done = false;
+        try tables.openRoute(streamKey(@intCast(i + 1)), route);
+        try std.testing.expect(tables.suppressClientResponse(session, @intCast(i + 1)));
+    }
+    var out: [purge_batch + 1]ExpiredRoute = undefined;
+    var taken: usize = 0;
+    while (true) {
+        const count = tables.takeSessionRoutes(session, &out);
+        if (count == 0) break;
+        try std.testing.expectEqual(@min(out.len, total - taken), count);
+        for (out[0..count]) |item| {
+            try std.testing.expect(item.route.target == .discard);
+            try std.testing.expect(!item.route.request_done);
+            try std.testing.expect(item.route.owner.?.session.eql(session));
+            try std.testing.expectEqual(item.key.stream, item.route.owner.?.stream_id);
+        }
+        taken += count;
+    }
+    try std.testing.expectEqual(total, taken);
+    try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
+    try std.testing.expectEqual(@as(u32, 0), tables.route_quota.count(2));
+    tables.purge(.{ .session = session });
+    try std.testing.expectEqual(@as(u32, 1), tables.routeCount());
+    tables.finishResponse(streamKey(0), 200);
+    try std.testing.expectEqual(@as(usize, 0), tables.route_quota.total);
 }
 
 test "route lifecycle: open, lookup, close" {

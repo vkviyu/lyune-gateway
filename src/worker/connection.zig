@@ -64,6 +64,37 @@ pub const InboundExchange = struct {
     response_mode: protocol.frame.ResponseMode = .required,
     /// 已收到带 eof 的帧，这次入站输入结束了，但流还没被 QUIC FIN 收走。
     input_complete: bool = false,
+    /// 已要求客户端停写；迟到的输入及 RESET 不得中止响应方向。
+    input_stopped: bool = false,
+    /// 活动上传的响应结束状态不能随有界历史窗口淘汰。
+    response_closed: bool = false,
+    /// FIN arrived while the backend's STOP event was still queued.
+    transport_fin: bool = false,
+};
+
+/// Bounded retirement history. Active exchanges always take precedence over this
+/// window; old unknown control events are treated as acknowledgements.
+pub const StreamHistory = struct {
+    highest: u64 = 0,
+    bits: u256 = 0,
+
+    pub fn remember(self: *StreamHistory, stream: u64) void {
+        const ordinal = stream / 4;
+        if (ordinal > self.highest) {
+            const shift = ordinal - self.highest;
+            self.bits = if (shift >= 256) 0 else self.bits << @intCast(shift);
+            self.highest = ordinal;
+        }
+        const age = self.highest - ordinal;
+        if (age < 256) self.bits |= @as(u256, 1) << @intCast(age);
+    }
+
+    pub fn contains(self: StreamHistory, stream: u64, assume_old: bool) bool {
+        const ordinal = stream / 4;
+        if (ordinal > self.highest) return false;
+        const age = self.highest - ordinal;
+        return if (age >= 256) assume_old else self.bits & (@as(u256, 1) << @intCast(age)) != 0;
+    }
 };
 
 /// 一条连接在整个集群里的唯一标识。
@@ -170,6 +201,11 @@ pub const ConnectionContext = struct {
 
     /// 入站 stream_id -> 接收状态。它不保存后端响应本身的生命周期。
     inbound_exchanges: std.AutoHashMap(u64, InboundExchange),
+    retired_inputs: StreamHistory = .{},
+    stopped_inputs: StreamHistory = .{},
+    closed_responses: StreamHistory = .{},
+    draining_stream: ?u64 = null,
+    deferred_spill_drop: bool = false,
 
     /// 本次分帧循环结束后需要关闭这条连接。
     ///
@@ -218,6 +254,10 @@ pub const ConnectionContext = struct {
 
     /// 释放并移除这条流的残帧缓冲。
     pub fn dropFrameSpill(self: *ConnectionContext, stream_id: u64) void {
+        if (self.draining_stream == stream_id) {
+            self.deferred_spill_drop = true;
+            return;
+        }
         if (self.frame_spills.fetchRemove(stream_id)) |removed| {
             var spill = removed.value;
             spill.deinit(self.allocator);
@@ -232,6 +272,18 @@ pub const ConnectionContext = struct {
         return self.inbound_exchanges.getPtr(stream_id);
     }
 
+    pub fn responseClosed(self: *ConnectionContext, stream_id: u64) bool {
+        if (self.inboundExchange(stream_id)) |active| {
+            if (active.response_closed) return true;
+        }
+        return self.closed_responses.contains(stream_id, false);
+    }
+
+    pub fn noteResponseClosed(self: *ConnectionContext, stream_id: u64) void {
+        if (self.inboundExchange(stream_id)) |active| active.response_closed = true;
+        self.closed_responses.remember(stream_id);
+    }
+
     /// 登记一次新交换。
     pub fn registerInboundExchange(self: *ConnectionContext, stream_id: u64, entry: InboundExchange) !void {
         try self.inbound_exchanges.put(stream_id, entry);
@@ -239,6 +291,7 @@ pub const ConnectionContext = struct {
 
     /// 移除交换状态（QUIC FIN，或这条流被终止）。
     pub fn removeInboundExchange(self: *ConnectionContext, stream_id: u64) void {
+        if (!self.peer_node) self.retired_inputs.remember(stream_id);
         _ = self.inbound_exchanges.remove(stream_id);
     }
 

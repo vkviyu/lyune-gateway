@@ -534,6 +534,18 @@ pub const BackendPool = struct {
         return self.arena.enqueueControl(list, stream_id, kind);
     }
 
+    /// Read-only lookup of a full handle, including its connection and generation.
+    /// Used only after a failed existing-stream write; leave FIFO ownership/order intact.
+    pub fn hasQueuedStop(self: *const BackendPool, list: *const SlotList, handle: u64) bool {
+        var next = list.head;
+        while (next) |index| {
+            const slot = &self.arena.slots[index];
+            if (slot.kind == .stop_sending and slot.stream_id == handle) return true;
+            next = slot.next;
+        }
+        return false;
+    }
+
     /// 取出队头槽位；返回的 data 是池内缓冲的借用，处理完必须 `release`。
     pub fn pop(self: *BackendPool, list: *SlotList) ?Ready {
         const index = self.arena.pop(list) orelse return null;
@@ -647,6 +659,56 @@ pub const BackendPool = struct {
 
 fn testArena(slots: usize, per_conn: usize) !SlotArena {
     return SlotArena.init(std.testing.allocator, slots, per_conn);
+}
+
+test "queued STOP lookup matches only the exact handle in its FIFO without consuming it" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var pool = try BackendPool.init(std.testing.allocator, &loop, .{ .recv_slots = 8, .max_slots_per_conn = 8 });
+    defer pool.deinit();
+    var list: SlotList = .{};
+    var other: SlotList = .{};
+    defer pool.dropQueued(&list);
+    defer pool.dropQueued(&other);
+
+    // Same layout as DirectTransport: connection:16 | generation:16 | stream:32.
+    const handle: u64 = (@as(u64, 7) << 48) | (@as(u64, 3) << 32) | 4;
+    try std.testing.expect(!pool.hasQueuedStop(&list, handle));
+    try std.testing.expect(pool.enqueue(&list, handle, "response", false));
+    try std.testing.expect(pool.enqueue(&list, handle, &.{}, true));
+    try std.testing.expect(pool.enqueueControl(&list, handle, .stream_reset));
+    try std.testing.expect(!pool.hasQueuedStop(&list, handle));
+    try std.testing.expect(pool.enqueueControl(&other, handle, .stop_sending));
+    try std.testing.expect(!pool.hasQueuedStop(&list, handle));
+    try std.testing.expect(pool.enqueueControl(&list, handle, .stop_sending));
+
+    const before = pool.stats();
+    try std.testing.expect(pool.hasQueuedStop(&list, handle));
+    try std.testing.expect(pool.hasQueuedStop(&list, handle));
+    try std.testing.expect(!pool.hasQueuedStop(&list, handle + 4));
+    try std.testing.expect(!pool.hasQueuedStop(&list, handle + (@as(u64, 1) << 32)));
+    try std.testing.expect(!pool.hasQueuedStop(&list, handle + (@as(u64, 1) << 48)));
+    try std.testing.expectEqualDeep(before, pool.stats());
+    try std.testing.expectEqual(@as(usize, 4), list.count);
+
+    const data = pool.pop(&list).?;
+    try std.testing.expectEqualStrings("response", data.data);
+    pool.release(data.index);
+    const fin = pool.pop(&list).?;
+    try std.testing.expectEqual(RecvKind.data, fin.kind);
+    try std.testing.expect(fin.is_fin);
+    pool.release(fin.index);
+    const reset = pool.pop(&list).?;
+    try std.testing.expectEqual(RecvKind.stream_reset, reset.kind);
+    pool.release(reset.index);
+    const stop = pool.pop(&list).?;
+    try std.testing.expectEqual(RecvKind.stop_sending, stop.kind);
+    try std.testing.expectEqual(handle, stop.stream_id);
+    // A popped but not yet released slot is no longer a pending STOP.
+    try std.testing.expect(!pool.hasQueuedStop(&list, handle));
+    pool.release(stop.index);
+    try std.testing.expect(pool.enqueue(&list, handle, "reused slot", false));
+    try std.testing.expect(!pool.hasQueuedStop(&list, handle));
 }
 
 test "the shared arena keeps each connection's byte order" {

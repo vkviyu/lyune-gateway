@@ -331,7 +331,14 @@ const BackendConn = struct {
             break :blk DirectTransport.handleStreamId(value);
         } else self.nextBidiStreamId();
 
-        conn.streamWrite(stream_id, data, is_fin) catch return TransportError.SendFailed;
+        conn.streamWrite(stream_id, data, is_fin) catch {
+            // picoquic rejects even an empty FIN after STOP. Until Worker polls
+            // the event, classify this exact handle without consuming its STOP.
+            if (handle) |value| {
+                if (self.transport.pool.hasQueuedStop(&self.queue, value)) return TransportError.RequestStopped;
+            }
+            return TransportError.SendFailed;
+        };
         // add_to_stream 只入 picoquic 队列；不主动驱动共享客户端的话，空闲连接上的
         // 应用数据会一直等到最远 10 秒后的 QUIC timer 才真正发出。
         self.transport.pool.flushClient();
@@ -1125,8 +1132,124 @@ test "DirectTransport closed state logic" {
 
 test "existing stream-local send failures do not poison a shared connection" {
     try std.testing.expect(!DirectTransport.existingStreamFailureBreaksConnection(TransportError.SendFailed));
+    try std.testing.expect(!DirectTransport.existingStreamFailureBreaksConnection(TransportError.RequestStopped));
     try std.testing.expect(!DirectTransport.existingStreamFailureBreaksConnection(TransportError.Closed));
     try std.testing.expect(DirectTransport.existingStreamFailureBreaksConnection(TransportError.ConnectionFailed));
+}
+
+test "real picoquic STOP rejects append and empty FIN before Worker polls without affecting siblings" {
+    const allocator = std.testing.allocator;
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var router = try @import("../io/mod.zig").handoff.LocalPacketRouter.init(std.testing.io, allocator, 1, 4);
+    defer router.deinit();
+
+    const Probe = struct {
+        raw: ?quic.c.QuicCnx = null,
+        stop_result: ?c_int = null,
+
+        fn onData(ctx: ?*anyopaque, conn: *QUICConnection, sid: u64, _: []const u8, _: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (sid == 0 and self.stop_result == null) {
+                self.raw = conn.inner;
+                self.stop_result = quic.c.c.picoquic_stop_sending(conn.inner, sid, 0);
+            }
+        }
+    };
+    var probe: Probe = .{};
+    var server = try reactor.server.ServerDriver.init(allocator, .{
+        .cert_file = "server.crt",
+        .key_file = "server.key",
+        .bind_address = .{ 127, 0, 0, 1 },
+        .bind_port = 0,
+    }, 1, 0, &loop, null, &router, null);
+    defer server.deinit();
+    server.setCallbacks(&probe, null, Probe.onData, null);
+    server.start();
+
+    var shared = try testPool(&loop);
+    defer shared.deinit();
+    const port = server.io_loop.getLocalAddr().getPort();
+    const endpoints = [_]Endpoint{.{ .host = "127.0.0.1", .port = port }};
+    var resolver = StaticResolver{ .address = foundation.net.initIp4(.{ 127, 0, 0, 1 }, port) };
+    var transport = try DirectTransport.init(allocator, .{
+        .endpoints = &endpoints,
+        .verify_cert = false,
+    }, &loop, resolver.asResolver(), foundation.realm.default_realm, &shared);
+    defer transport.deinit();
+    const api = transport.asTransport();
+    const route = RouteId.init(1, 0);
+    api.resolve(route, null, null);
+    const conn = transport.conns.items[0];
+    var attempts: usize = 0;
+    while (!conn.isReady() and attempts < 5000) : (attempts += 1) {
+        try loop.run(.no_wait);
+        try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(conn.isReady());
+    const raw = conn.cnx.?;
+    const client_conn = QUICConnection.fromRaw(raw);
+    const stopped = try api.sendStream(route, null, "request", false);
+    const sibling = try api.sendStream(route, null, "sibling", false);
+    const finished = try api.sendStream(route, null, "done", true);
+    // Put data ahead of STOP to prove classification does not drain/reorder it.
+    try std.testing.expect(conn.enqueueRecv(0, "prior response", false));
+    attempts = 0;
+    while (!shared.hasQueuedStop(&conn.queue, stopped) and attempts < 5000) : (attempts += 1) {
+        try loop.run(.no_wait);
+        try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(?c_int, 0), probe.stop_result);
+    try std.testing.expect(shared.hasQueuedStop(&conn.queue, stopped));
+
+    // Exercise the actual linked C API as well as the transport vtable.
+    try std.testing.expectEqual(@as(c_int, -1), quic.c.c.picoquic_add_to_stream(raw, 0, "late", 4, 0));
+    try std.testing.expectEqual(@as(c_int, -1), quic.c.c.picoquic_add_to_stream(raw, 0, null, 0, 1));
+    try std.testing.expectError(error.RequestStopped, api.sendStream(route, stopped, "late", false));
+    try std.testing.expectError(error.RequestStopped, api.sendStream(route, stopped, &.{}, true));
+    try std.testing.expectEqual(@as(usize, 2), conn.queue.count);
+    try std.testing.expectEqual(sibling, try api.sendStream(route, sibling, "more", false));
+    // An unrelated failed write must not inherit the sibling's STOP.
+    try std.testing.expectError(error.SendFailed, api.sendStream(route, finished, "late", true));
+    const old = DirectTransport.makeHandle(conn.id, conn.generation - 1, DirectTransport.handleStreamId(finished));
+    try std.testing.expect(shared.enqueueControl(&conn.queue, old, .stop_sending));
+    try std.testing.expectError(error.SendFailed, api.sendStream(route, finished, "late", true));
+    try std.testing.expectError(error.Closed, api.sendStream(route, old, "late", false));
+    try std.testing.expect(conn.isReady());
+    try std.testing.expect(client_conn.isConnected());
+    try std.testing.expectEqual(raw, conn.cnx.?);
+    try std.testing.expectEqual(@as(usize, 0), shared.stats().pending_failures);
+
+    const data = (try api.receive()).?;
+    try std.testing.expectEqualStrings("prior response", data.data);
+    try std.testing.expectEqual(stopped, data.stream_id);
+    api.releaseRecv(data);
+    const stop = (try api.receive()).?;
+    try std.testing.expectEqual(backend_mod.RecvKind.stop_sending, stop.kind);
+    try std.testing.expectEqual(stopped, stop.stream_id);
+    // Once polled, even a borrowed STOP slot must no longer classify a failure.
+    try std.testing.expectError(error.SendFailed, api.sendStream(route, stopped, &.{}, true));
+    api.releaseRecv(stop);
+    const old_stop = (try api.receive()).?;
+    try std.testing.expectEqual(old, old_stop.stream_id);
+    api.releaseRecv(old_stop);
+    try std.testing.expect((try api.receive()) == null);
+
+    // STOP only shuts the request direction; the real response still arrives.
+    var server_conn = QUICConnection.fromRaw(probe.raw.?);
+    try server_conn.streamWrite(0, "response after STOP", true);
+    server.flushApplicationWrites();
+    attempts = 0;
+    while (conn.queue.count == 0 and attempts < 5000) : (attempts += 1) {
+        try loop.run(.no_wait);
+        try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const response = (try api.receive()) orelse return error.TestExpectedResponse;
+    defer api.releaseRecv(response);
+    try std.testing.expectEqual(backend_mod.RecvKind.data, response.kind);
+    try std.testing.expectEqual(stopped, response.stream_id);
+    try std.testing.expectEqualStrings("response after STOP", response.data);
+    try std.testing.expect(response.is_fin);
 }
 
 test "DirectTransport integration test (Real Server)" {
